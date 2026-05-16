@@ -261,7 +261,7 @@ git add internal/baidu/adapter.go internal/baidu/adapter_test.go internal/baidu/
 git commit -m "feat: add baidu adapter mapping layer"
 ```
 
-### 任务 4：实现本地凭证存储和认证刷新支架
+### 任务 4：实现本地凭证存储和 OAuth 认证支架
 
 **文件：**
 - 创建：`internal/auth/auth.go`
@@ -340,7 +340,7 @@ func (m *Manager) LoadToken() (Token, error) { return Token{}, nil }
 - [ ] **步骤 4：运行测试确认通过**
 
 运行：`go test ./internal/auth -v`
-预期：通过，后续再把加密和落盘接上。
+预期：通过，后续再把加密、落盘和 OAuth 换码逻辑接上。
 
 - [ ] **步骤 5：提交**
 
