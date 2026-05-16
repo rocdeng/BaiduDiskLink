@@ -1,87 +1,87 @@
-# BaiduDiskLink Design
+# BaiduDiskLink 设计方案
 
-## Goal
+## 目标
 
-BaiduDiskLink maps Baidu Netdisk into a Synology DSM local directory for video media library use. The first version is a read-only filesystem for Emby. It should avoid the WebDAV-to-share-folder workflow used by OpenList-style deployments and expose a direct local mount instead.
+BaiduDiskLink 将百度网盘映射为群晖 DSM 上的本地目录，用于视频媒体库场景。第一版面向 Emby，提供一个只读文件系统。它应避免 OpenList 这类部署中“先 WebDAV，再映射共享文件夹”的流程，而是直接暴露一个本地挂载点。
 
-The product is optimized for:
+产品优先服务这些目标：
 
-- Synology DSM, including Linux-based native execution and Docker deployment.
-- Video media libraries scanned and played by Emby.
-- Local-only credential storage.
-- Metadata caching without full file downloads.
+- 支持群晖 DSM，包括 Linux 原生运行和 Docker 部署。
+- 支持 Emby 扫描和播放视频媒体库。
+- 认证信息只保存在本机。
+- 只缓存元数据，不完整下载文件内容。
 
-## Non-Goals
+## 非目标
 
-The first version will not support:
+第一版不支持：
 
-- Uploading, deleting, renaming, or moving files.
-- WebDAV, SMB, or HTTP gateway output.
-- Full file mirroring or full video download cache.
-- Multi-user permission systems.
-- Cloud relay services.
-- Real-time bidirectional sync.
+- 上传、删除、重命名或移动文件。
+- WebDAV、SMB 或 HTTP 网关输出。
+- 完整文件镜像或完整视频下载缓存。
+- 多用户权限系统。
+- 云端中转服务。
+- 实时双向同步。
 
-## Architecture
+## 架构
 
-The system has four core modules:
+系统包含四个核心模块：
 
 1. Auth Manager
-   Handles login, credential refresh, and encrypted local credential storage.
+   负责登录、凭证刷新，以及本地加密保存必要凭证。
 
 2. Metadata Store
-   Stores directory and file metadata in SQLite. It does not store file content.
+   使用 SQLite 保存目录和文件元数据，不保存文件内容。
 
 3. FUSE Filesystem
-   Exposes Baidu Netdisk as a read-only local filesystem mounted on DSM.
+   将百度网盘暴露为 DSM 上的只读本地文件系统。
 
 4. Remote Fetcher
-   Reads file content on demand from Baidu Netdisk and serves FUSE read requests.
+   在需要读取文件内容时，从百度网盘按需拉取数据，并响应 FUSE 的读取请求。
 
-OpenList is used as a compatibility reference for Baidu Netdisk behavior, especially directory listing, metadata fields, download link acquisition, request headers, error handling, and large-file playback behavior. BaiduDiskLink should not copy OpenList's overall WebDAV/Web server architecture.
+OpenList 用作百度网盘行为的兼容性参考，重点参考目录列表、元数据字段、下载链接获取、请求头、错误处理和大文件播放行为。BaiduDiskLink 不复用 OpenList 的 WebDAV/Web 服务整体架构。
 
-## Deployment Model
+## 部署模型
 
-The recommended first deployment target is Docker on DSM.
+第一版推荐优先做 DSM 上的 Docker 部署。
 
-Docker is preferred for the MVP because it is faster to test, easier to distribute, and avoids early DSM package complexity. The container will need access to FUSE, likely through `/dev/fuse` and suitable container permissions. The mounted path will be bind-mounted to a DSM-visible directory, such as `/volume1/BaiduDisk`.
+Docker 更适合作为 MVP，因为它验证快、分发简单，也能避免早期投入 DSM 套件开发的复杂度。容器需要访问 FUSE，通常需要 `/dev/fuse` 和合适的容器权限。挂载点再通过 bind mount 暴露到 DSM 可见目录，例如 `/volume1/BaiduDisk`。
 
-A native DSM package can be considered after the Docker version proves stable.
+Docker 版本稳定后，再考虑制作原生 DSM 套件。
 
-## Metadata Store
+## 元数据存储
 
-SQLite stores the local view of the remote filesystem.
+SQLite 保存远端文件系统的本地视图。
 
-Suggested fields:
+建议字段：
 
-- `id`: local primary key.
-- `fs_id`: Baidu Netdisk file identifier.
-- `parent_fs_id`: parent directory identifier.
-- `path`: normalized absolute remote path.
-- `name`: file or directory name.
-- `is_dir`: directory flag.
-- `size`: byte size for files.
-- `mtime`: remote modified time.
-- `md5`: remote md5 when available.
-- `mime_type`: optional media type.
-- `etag` or `version`: remote change marker when available.
-- `last_sync_at`: local sync timestamp.
-- `expires_at`: cache expiry timestamp.
-- `negative`: marks short-lived negative cache entries.
+- `id`：本地主键。
+- `fs_id`：百度网盘文件标识。
+- `parent_fs_id`：父目录标识。
+- `path`：规范化后的远端绝对路径。
+- `name`：文件或目录名。
+- `is_dir`：是否为目录。
+- `size`：文件字节大小。
+- `mtime`：远端修改时间。
+- `md5`：远端提供的 md5，如可用。
+- `mime_type`：可选的媒体类型。
+- `etag` 或 `version`：远端变更标记，如可用。
+- `last_sync_at`：本地同步时间。
+- `expires_at`：缓存过期时间。
+- `negative`：标记短期负缓存记录。
 
-Metadata caching strategy:
+元数据缓存策略：
 
-- On first directory access, fetch the remote directory listing and persist it.
-- Subsequent directory reads use SQLite while the entry is fresh.
-- Stale directories are refreshed lazily or by a background worker.
-- Empty directories and missing paths use short-lived negative cache entries to reduce repeated remote calls during Emby scans.
-- The first version accepts eventual consistency. Stable scanning and playback are more important than instant cloud-side updates.
+- 首次访问某个目录时，拉取远端目录列表并持久化。
+- 后续目录读取在缓存新鲜时直接使用 SQLite。
+- 过期目录通过懒加载或后台任务刷新。
+- 空目录和不存在的路径使用短期负缓存，减少 Emby 扫描时对远端的重复请求。
+- 第一版接受最终一致性。稳定扫描和稳定播放比云端变化秒级同步更重要。
 
-## FUSE Behavior
+## FUSE 行为
 
-The filesystem is read-only.
+文件系统是只读的。
 
-Supported operations:
+支持操作：
 
 - `lookup`
 - `getattr`
@@ -90,7 +90,7 @@ Supported operations:
 - `read`
 - `release`
 
-Unsupported write operations should return read-only filesystem errors:
+不支持的写操作应返回只读文件系统错误：
 
 - `write`
 - `mkdir`
@@ -101,40 +101,40 @@ Unsupported write operations should return read-only filesystem errors:
 - `chown`
 - `truncate`
 
-Directory operations should primarily read from SQLite. If a directory is missing or stale, the FUSE layer asks the metadata service to refresh it.
+目录操作应优先读取 SQLite。如果目录缺失或过期，FUSE 层请求元数据服务刷新。
 
-File reads are forwarded to the Remote Fetcher.
+文件读取转发给 Remote Fetcher。
 
-## Video Read Path
+## 视频读取路径
 
-The read path must support Emby-style media access:
+读取路径必须支持 Emby 风格的媒体访问：
 
-- file probing
-- small header reads
-- random seek
-- continuous sequential playback
-- retry after transient network failures
+- 文件探测。
+- 小范围文件头读取。
+- 随机 seek。
+- 连续顺序播放。
+- 瞬时网络失败后的重试。
 
-The intended flow is:
+目标流程：
 
 ```text
 Emby
-  -> DSM local mount
+  -> DSM 本地挂载点
   -> FUSE read/open/seek
   -> Remote Fetcher
   -> Baidu Adapter
-  -> Baidu Netdisk download endpoint
+  -> 百度网盘下载端点
 ```
 
-The first version should not store complete files locally. It should use a small read buffer and optional block cache for recent byte ranges.
+第一版不应在本地保存完整文件。它应使用小型读缓冲，并可选地为最近读取的字节范围做块缓存。
 
-The Baidu Adapter should support range requests when available. Large video files may require specific request headers; OpenList's Baidu implementation should be used as the reference for these details.
+Baidu Adapter 应在可用时支持 Range 请求。大视频文件可能需要特定请求头；这些细节应参考 OpenList 的百度网盘实现。
 
 ## Baidu Adapter
 
-The Baidu Adapter hides all Baidu-specific behavior behind a small internal interface.
+Baidu Adapter 通过一个小型内部接口封装所有百度网盘相关行为。
 
-Suggested interface:
+建议接口：
 
 - `list(path or fs_id) -> []RemoteEntry`
 - `stat(path or fs_id) -> RemoteEntry`
@@ -142,100 +142,99 @@ Suggested interface:
 - `readRange(fs_id, offset, length) -> bytes`
 - `refreshAuth()`
 
-Reference areas from OpenList:
+参考 OpenList 的重点：
 
-- Directory listing request shape and pagination.
-- Metadata fields such as `fs_id`, `server_filename`, `path`, `size`, `md5`, `isdir`, `server_mtime`, and `local_mtime`.
-- Download link acquisition.
-- Required headers for large files and video playback.
-- Range request behavior.
-- Token, cookie, and session expiry handling.
-- Baidu error code mapping.
-- Retry and throttling behavior.
+- 目录列表请求结构和分页方式。
+- `fs_id`、`server_filename`、`path`、`size`、`md5`、`isdir`、`server_mtime`、`local_mtime` 等元数据字段。
+- 下载链接获取方式。
+- 大文件和视频播放所需请求头。
+- Range 请求行为。
+- token、cookie 和会话过期处理。
+- 百度错误码映射。
+- 重试和限流处理。
 
-Because OpenList is AGPL-3.0, BaiduDiskLink should treat it as a behavior reference unless the project intentionally adopts a compatible license.
+由于 OpenList 使用 AGPL-3.0 许可证，除非项目明确采用兼容许可证，否则 BaiduDiskLink 应只把它作为行为参考，而不是直接复制代码。
 
-## Auth And Security
+## 认证与安全
 
-Credentials must remain local to the DSM machine.
+凭证必须留在 DSM 本机。
 
-The first version should:
+第一版应做到：
 
-- Avoid storing the user's Baidu password.
-- Store only the minimum required token, cookie, or session data.
-- Encrypt credential storage where practical.
-- Provide a clear way to revoke or reset local credentials.
-- Avoid any cloud relay or third-party backend.
+- 不保存用户百度密码。
+- 只保存最低必要的 token、cookie 或会话数据。
+- 在可行范围内加密保存凭证。
+- 提供清晰的本地凭证撤销或重置方式。
+- 不使用云端中转或第三方后端。
 
-The exact login method should be chosen after validating current Baidu Netdisk API behavior. Preferred options are QR login, device-code-style login, or browser-assisted login that produces local session material.
+具体登录方式需要在验证当前百度网盘 API 行为后选择。优先考虑扫码登录、设备码式登录，或浏览器辅助登录后在本地生成会话材料。
 
-## Background Jobs
+## 后台任务
 
-The background worker handles:
+后台任务负责：
 
-- Periodic metadata refresh.
-- Retry of failed directory refreshes.
-- Optional hot-directory refresh for Emby library paths.
-- Cleanup of expired negative cache entries.
-- Cleanup of old read-buffer blocks if block caching is enabled.
+- 定期刷新元数据。
+- 重试失败的目录刷新。
+- 可选地刷新 Emby 媒体库所在热门目录。
+- 清理过期负缓存记录。
+- 如启用块缓存，清理旧的读取缓冲块。
 
-Background work should be conservative to avoid triggering Baidu rate limits.
+后台任务应保持保守，避免触发百度限流。
 
-## Configuration
+## 配置
 
-Initial configuration should be small:
+初始配置应尽量少：
 
-- Mount path.
-- Metadata database path.
-- Credential storage path.
-- Refresh interval.
-- Maximum read buffer or block cache size.
-- Remote root path to expose.
-- Log level.
+- 挂载路径。
+- 元数据库路径。
+- 凭证保存路径。
+- 刷新间隔。
+- 最大读缓冲或块缓存大小。
+- 要暴露的远端根路径。
+- 日志级别。
 
-For Emby-focused use, allowing the user to expose only selected media directories is better than mounting the entire netdisk by default.
+针对 Emby 场景，允许用户只暴露选定媒体目录，通常比默认挂载整个网盘更合适。
 
-## Testing Strategy
+## 测试策略
 
-Key test areas:
+关键测试范围：
 
-- Metadata normalization and path handling.
-- SQLite cache freshness and negative cache behavior.
-- FUSE read-only error behavior.
-- Directory listing for large folders.
-- File stat consistency for Emby scanning.
-- Range read correctness.
-- Retry behavior for transient remote failures.
-- Token/session expiry behavior.
+- 元数据规范化和路径处理。
+- SQLite 缓存新鲜度和负缓存行为。
+- FUSE 只读错误行为。
+- 大目录列表。
+- 面向 Emby 扫描的文件 stat 一致性。
+- Range 读取正确性。
+- 瞬时远端失败后的重试行为。
+- token 或会话过期行为。
 
-DSM integration tests should verify:
+DSM 集成测试应验证：
 
-- Docker container can mount through FUSE.
-- DSM can see the bind-mounted directory.
-- Emby can scan the mounted library.
-- Emby can start playback and seek within large video files.
+- Docker 容器可以通过 FUSE 完成挂载。
+- DSM 能看到 bind-mounted 目录。
+- Emby 能扫描挂载后的媒体库。
+- Emby 能播放大视频文件并 seek。
 
-## Open Questions
+## 待确认问题
 
-- Which login flow is most reliable for Baidu Netdisk today?
-- Which Baidu download endpoint should be the default for stable video playback?
-- How much local block caching is useful before it becomes unwanted downloading?
-- What DSM versions and CPU architectures should the first Docker image support?
-- Should the first version expose one configured remote root or multiple named roots?
+- 当前百度网盘最可靠的登录流程是哪一种？
+- 哪个百度下载端点最适合作为稳定视频播放的默认路径？
+- 本地块缓存多大才有用，又不会变成用户不想要的下载？
+- 第一版 Docker 镜像应支持哪些 DSM 版本和 CPU 架构？
+- 第一版应暴露单个配置好的远端根目录，还是支持多个命名根目录？
 
-## Recommended MVP
+## 推荐 MVP
 
-Build the first version as a Dockerized, read-only FUSE filesystem for DSM:
+第一版做成 DSM 上 Docker 化的只读 FUSE 文件系统：
 
-- Single Baidu account.
-- Single configured remote root.
-- SQLite metadata cache.
-- Lazy directory loading.
-- Short-lived negative cache.
-- Official or most stable Baidu download path.
-- Range reads for video playback.
-- Small bounded read buffer.
-- No WebDAV.
-- No write operations.
-- No full content cache.
-
+- 单个百度账号。
+- 单个配置好的远端根目录。
+- SQLite 元数据缓存。
+- 懒加载目录。
+- 短期负缓存。
+- 官方或最稳定的百度下载路径。
+- 支持视频播放所需的 Range 读取。
+- 小型有界读缓冲。
+- 不做 WebDAV。
+- 不做写操作。
+- 不做完整内容缓存。
