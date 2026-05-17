@@ -357,6 +357,9 @@ func (f *Filesystem) shouldRefresh(path string, children []store.Entry) bool {
 	if f.ttl <= 0 {
 		return true
 	}
+	if len(children) == 0 {
+		return true
+	}
 	if path == "" {
 		path = "/"
 	}
