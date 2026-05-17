@@ -43,6 +43,9 @@ func (f *Filesystem) OnAdd(ctx context.Context) {
 
 func (f *Filesystem) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = syscall.S_IFDIR | f.dirMode()
+	out.Mtime = uint64(time.Now().Unix())
+	out.Atime = out.Mtime
+	out.Ctime = out.Mtime
 	return 0
 }
 
@@ -181,6 +184,10 @@ func (f *Filesystem) newEntryInode(ctx context.Context, e store.Entry, out *fuse
 			perm = f.dirMode()
 		}
 		out.Mode = mode | perm
+		t := inodeTime(e.MTM)
+		out.Mtime = uint64(t.Unix())
+		out.Atime = out.Mtime
+		out.Ctime = out.Mtime
 		out.Size = uint64(e.Size)
 	}
 	return f.NewPersistentInode(ctx, node, stable)
@@ -215,9 +222,17 @@ var _ = (goFs.NodeReader)((*entryNode)(nil))
 func (n *entryNode) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if n.entry.IsDir {
 		out.Mode = syscall.S_IFDIR | n.Filesystem.dirMode()
+		t := inodeTime(n.entry.MTM)
+		out.Mtime = uint64(t.Unix())
+		out.Atime = out.Mtime
+		out.Ctime = out.Mtime
 		return 0
 	}
 	out.Mode = syscall.S_IFREG | n.Filesystem.fileMode()
+	t := inodeTime(n.entry.MTM)
+	out.Mtime = uint64(t.Unix())
+	out.Atime = out.Mtime
+	out.Ctime = out.Mtime
 	out.Size = uint64(n.entry.Size)
 	return 0
 }
@@ -436,4 +451,11 @@ func (f *Filesystem) fileMode() uint32 {
 		return 0640
 	}
 	return 0644
+}
+
+func inodeTime(mtm int64) time.Time {
+	if mtm > 0 {
+		return time.Unix(mtm, 0)
+	}
+	return time.Now()
 }
