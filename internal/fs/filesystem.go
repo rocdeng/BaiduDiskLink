@@ -46,6 +46,7 @@ func (f *Filesystem) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.
 	out.Mtime = uint64(time.Now().Unix())
 	out.Atime = out.Mtime
 	out.Ctime = out.Mtime
+	out.Size = 0
 	return 0
 }
 
@@ -189,6 +190,7 @@ func (f *Filesystem) newEntryInode(ctx context.Context, e store.Entry, out *fuse
 		out.Atime = out.Mtime
 		out.Ctime = out.Mtime
 		out.Size = uint64(e.Size)
+		out.Blocks = 0
 	}
 	return f.NewPersistentInode(ctx, node, stable)
 }
@@ -226,6 +228,8 @@ func (n *entryNode) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.A
 		out.Mtime = uint64(t.Unix())
 		out.Atime = out.Mtime
 		out.Ctime = out.Mtime
+		out.Size = 0
+		out.Blocks = 0
 		return 0
 	}
 	out.Mode = syscall.S_IFREG | n.Filesystem.fileMode()
@@ -234,6 +238,7 @@ func (n *entryNode) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.A
 	out.Atime = out.Mtime
 	out.Ctime = out.Mtime
 	out.Size = uint64(n.entry.Size)
+	out.Blocks = (uint64(n.entry.Size) + 511) / 512
 	return 0
 }
 
