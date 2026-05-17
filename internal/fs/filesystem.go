@@ -23,15 +23,20 @@ type Filesystem struct {
 	remote   *remote.Reader
 	negative *cache.NegativeCache
 	ttl      time.Duration
+	primaryGID uint32
 	gids     map[uint32]struct{}
 }
 
 func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32) *Filesystem {
 	out := make(map[uint32]struct{}, len(gids))
+	var primary uint32
 	for _, gid := range gids {
 		out[gid] = struct{}{}
+		if primary == 0 {
+			primary = gid
+		}
 	}
-	return &Filesystem{store: st, remote: r, ttl: time.Minute, gids: out}
+	return &Filesystem{store: st, remote: r, ttl: time.Minute, primaryGID: primary, gids: out}
 }
 
 func (f *Filesystem) OnAdd(ctx context.Context) {
@@ -43,6 +48,7 @@ func (f *Filesystem) OnAdd(ctx context.Context) {
 
 func (f *Filesystem) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = syscall.S_IFDIR | f.dirMode()
+	out.Gid = f.primaryGID
 	out.Mtime = uint64(time.Now().Unix())
 	out.Atime = out.Mtime
 	out.Ctime = out.Mtime
@@ -185,6 +191,7 @@ func (f *Filesystem) newEntryInode(ctx context.Context, e store.Entry, out *fuse
 			perm = f.dirMode()
 		}
 		out.Mode = mode | perm
+		out.Gid = f.primaryGID
 		t := inodeTime(e.MTM)
 		out.Mtime = uint64(t.Unix())
 		out.Atime = out.Mtime
@@ -224,6 +231,7 @@ var _ = (goFs.NodeReader)((*entryNode)(nil))
 func (n *entryNode) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if n.entry.IsDir {
 		out.Mode = syscall.S_IFDIR | n.Filesystem.dirMode()
+		out.Gid = n.Filesystem.primaryGID
 		t := inodeTime(n.entry.MTM)
 		out.Mtime = uint64(t.Unix())
 		out.Atime = out.Mtime
@@ -233,6 +241,7 @@ func (n *entryNode) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.A
 		return 0
 	}
 	out.Mode = syscall.S_IFREG | n.Filesystem.fileMode()
+	out.Gid = n.Filesystem.primaryGID
 	t := inodeTime(n.entry.MTM)
 	out.Mtime = uint64(t.Unix())
 	out.Atime = out.Mtime
