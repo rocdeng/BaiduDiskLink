@@ -300,9 +300,13 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 	if err := f.store.ReplaceChildren(fsid, mapped); err != nil {
 		return err
 	}
+	parent := "0"
+	if existing, err := f.store.GetByPath(dirPath); err == nil && existing != nil && existing.Parent != "" {
+		parent = existing.Parent
+	}
 	return f.store.UpsertEntry(store.Entry{
 		FSID:       fsid,
-		Parent:     "",
+		Parent:     parent,
 		Path:       dirPath,
 		Name:       path.Base(dirPath),
 		IsDir:      true,

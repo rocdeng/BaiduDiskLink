@@ -151,6 +151,41 @@ func TestRefreshDirReplacesExistingChildren(t *testing.T) {
 	}
 }
 
+func TestRefreshDirPreservesParentRelation(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{
+		FSID:   "1",
+		Parent: "0",
+		Path:   "/Videos",
+		Name:   "Videos",
+		IsDir:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/Videos": {{FSID: "2", ServerName: "Movie", Path: "/Videos/Movie", IsDir: true}},
+		},
+	})
+	fs := NewFilesystem(dbStore, remoteReader)
+	if err := fs.refreshDir(context.Background(), "/Videos", "1"); err != nil {
+		t.Fatal(err)
+	}
+	rootChildren, err := dbStore.ListChildren("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rootChildren) != 1 || rootChildren[0].Name != "Videos" {
+		t.Fatalf("expected Videos to remain under root, got %#v", rootChildren)
+	}
+}
+
 func TestLookupUsesNegativeCacheForMissingEntries(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {
