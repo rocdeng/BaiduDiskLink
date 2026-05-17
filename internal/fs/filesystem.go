@@ -370,9 +370,6 @@ func (f *Filesystem) shouldRefresh(path string, children []store.Entry) bool {
 	if time.Unix(current.ExpiresAt, 0).Before(time.Now()) {
 		return true
 	}
-	if len(children) == 0 {
-		return false
-	}
 	return false
 }
 
