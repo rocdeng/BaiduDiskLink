@@ -106,6 +106,51 @@ func TestRefreshDirLoadsNestedEntries(t *testing.T) {
 	}
 }
 
+func TestRefreshDirReplacesExistingChildren(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{
+		FSID:   "1",
+		Parent: "0",
+		Path:   "/movies",
+		Name:   "movies",
+		IsDir:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{
+		FSID:   "2",
+		Parent: "1",
+		Path:   "/movies/old.mkv",
+		Name:   "old.mkv",
+		Size:   9,
+		IsDir:  false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/movies": {{FSID: "3", ServerName: "new.mkv", Path: "/movies/new.mkv", Size: 10, IsDir: false}},
+		},
+	})
+	fs := NewFilesystem(dbStore, remoteReader)
+	if err := fs.refreshDir(context.Background(), "/movies", "1"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dbStore.ListChildren("/movies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "new.mkv" {
+		t.Fatalf("expected refreshed children to replace old ones, got %#v", got)
+	}
+}
+
 func TestLookupUsesNegativeCacheForMissingEntries(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {

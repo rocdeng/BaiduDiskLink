@@ -22,10 +22,11 @@ type Filesystem struct {
 	store    *store.Store
 	remote   *remote.Reader
 	negative *cache.NegativeCache
+	ttl      time.Duration
 }
 
 func NewFilesystem(st *store.Store, r *remote.Reader) *Filesystem {
-	return &Filesystem{store: st, remote: r}
+	return &Filesystem{store: st, remote: r, ttl: time.Minute}
 }
 
 func (f *Filesystem) OnAdd(ctx context.Context) {
@@ -52,7 +53,7 @@ func (f *Filesystem) Readdir(ctx context.Context) (goFs.DirStream, syscall.Errno
 	if err != nil {
 		return nil, syscall.EIO
 	}
-	if len(children) == 0 && f.remote != nil {
+	if f.shouldRefreshRoot(children) {
 		if err := f.refreshRoot(ctx); err != nil {
 			return nil, syscall.EIO
 		}
@@ -75,7 +76,7 @@ func (f *Filesystem) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	if err != nil {
 		return nil, syscall.EIO
 	}
-	if len(children) == 0 && f.remote != nil {
+	if f.shouldRefreshRoot(children) {
 		if err := f.refreshRoot(ctx); err != nil {
 			f.markMissing("/" + name)
 			return nil, syscall.ENOENT
@@ -110,17 +111,30 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 	mapped := make([]store.Entry, 0, len(entries))
 	for _, entry := range entries {
 		mapped = append(mapped, store.Entry{
-			FSID:   entry.FSID,
-			Parent: "0",
-			Path:   entry.Path,
-			Name:   entry.ServerName,
-			Size:   entry.Size,
-			IsDir:  entry.IsDir,
-			MTM:    entry.ServerMTime,
-			MD5:    entry.MD5,
+			FSID:      entry.FSID,
+			Parent:    "0",
+			Path:      entry.Path,
+			Name:      entry.ServerName,
+			Size:      entry.Size,
+			IsDir:     entry.IsDir,
+			MTM:       entry.ServerMTime,
+			MD5:       entry.MD5,
+			ExpiresAt: time.Now().Add(f.ttl).Unix(),
+			LastSyncAt: time.Now().Unix(),
 		})
 	}
-	return f.store.UpsertEntries(mapped)
+	if err := f.store.ReplaceChildren("0", mapped); err != nil {
+		return err
+	}
+	return f.store.UpsertEntry(store.Entry{
+		FSID:       "0",
+		Parent:     "",
+		Path:       "/",
+		Name:       "",
+		IsDir:      true,
+		LastSyncAt:  time.Now().Unix(),
+		ExpiresAt:   time.Now().Add(f.ttl).Unix(),
+	})
 }
 
 func (f *Filesystem) populate(ctx context.Context) {
@@ -206,7 +220,7 @@ func (n *entryNode) Readdir(ctx context.Context) (goFs.DirStream, syscall.Errno)
 	if err != nil {
 		return nil, syscall.EIO
 	}
-	if len(children) == 0 && n.Filesystem.remote != nil && n.entry.IsDir {
+	if n.Filesystem.shouldRefreshDir(n.entry.Path, children) && n.Filesystem.remote != nil && n.entry.IsDir {
 		if err := n.Filesystem.refreshDir(ctx, n.entry.Path, n.entry.FSID); err != nil {
 			return nil, syscall.EIO
 		}
@@ -226,7 +240,7 @@ func (n *entryNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	if err != nil {
 		return nil, syscall.EIO
 	}
-	if len(children) == 0 && n.Filesystem.remote != nil && n.entry.IsDir {
+	if n.Filesystem.shouldRefreshDir(n.entry.Path, children) && n.Filesystem.remote != nil && n.entry.IsDir {
 		if err := n.Filesystem.refreshDir(ctx, n.entry.Path, n.entry.FSID); err != nil {
 			return nil, syscall.ENOENT
 		}
@@ -254,32 +268,45 @@ func (n *entryNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	return nil, syscall.ENOENT
 }
 
-func (f *Filesystem) refreshDir(ctx context.Context, path string, fsid string) error {
+func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string) error {
 	if f == nil || f.store == nil || f.remote == nil {
 		return nil
 	}
-	entries, err := f.remote.List(path)
+	entries, err := f.remote.List(dirPath)
 	if err != nil {
 		return err
 	}
 	if len(entries) == 0 {
-		f.markMissing(path)
+		f.markMissing(dirPath)
 		return nil
 	}
 	mapped := make([]store.Entry, 0, len(entries))
 	for _, entry := range entries {
 		mapped = append(mapped, store.Entry{
-			FSID:   entry.FSID,
-			Parent: fsid,
-			Path:   entry.Path,
-			Name:   entry.ServerName,
-			Size:   entry.Size,
-			IsDir:  entry.IsDir,
-			MTM:    entry.ServerMTime,
-			MD5:    entry.MD5,
+			FSID:       entry.FSID,
+			Parent:     fsid,
+			Path:       entry.Path,
+			Name:       entry.ServerName,
+			Size:       entry.Size,
+			IsDir:      entry.IsDir,
+			MTM:        entry.ServerMTime,
+			MD5:        entry.MD5,
+			ExpiresAt:   time.Now().Add(f.ttl).Unix(),
+			LastSyncAt:  time.Now().Unix(),
 		})
 	}
-	return f.store.UpsertEntries(mapped)
+	if err := f.store.ReplaceChildren(fsid, mapped); err != nil {
+		return err
+	}
+	return f.store.UpsertEntry(store.Entry{
+		FSID:       fsid,
+		Parent:     "",
+		Path:       dirPath,
+		Name:       path.Base(dirPath),
+		IsDir:      true,
+		LastSyncAt: time.Now().Unix(),
+		ExpiresAt:  time.Now().Add(f.ttl).Unix(),
+	})
 }
 
 func (f *Filesystem) markMissing(path string) {
@@ -313,6 +340,40 @@ func (n *entryNode) Open(ctx context.Context, openFlags uint32) (fh goFs.FileHan
 		return nil, 0, syscall.EISDIR
 	}
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
+}
+
+func (f *Filesystem) shouldRefreshRoot(children []store.Entry) bool {
+	return f.shouldRefresh("/", children)
+}
+
+func (f *Filesystem) shouldRefreshDir(path string, children []store.Entry) bool {
+	return f.shouldRefresh(path, children)
+}
+
+func (f *Filesystem) shouldRefresh(path string, children []store.Entry) bool {
+	if f == nil || f.remote == nil {
+		return false
+	}
+	if f.ttl <= 0 {
+		return true
+	}
+	if path == "" {
+		path = "/"
+	}
+	current, err := f.store.GetByPath(path)
+	if err != nil || current == nil {
+		return true
+	}
+	if current.ExpiresAt == 0 {
+		return true
+	}
+	if time.Unix(current.ExpiresAt, 0).Before(time.Now()) {
+		return true
+	}
+	if len(children) == 0 {
+		return false
+	}
+	return false
 }
 
 func Mount(mountPath string, root *Filesystem) (*fuse.Server, error) {

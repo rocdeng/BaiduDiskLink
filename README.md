@@ -78,6 +78,12 @@ make check
    ./data/token.json
    ```
 
+   查看日志命令：
+
+   ```bash
+   docker-compose logs -f baidudisklink
+   ```
+
 7. 授权完成且挂载目录能看到百度网盘文件后，在 Emby 里添加 DSM 宿主机上的挂载目录：
 
    ```text
@@ -161,3 +167,5 @@ bash scripts/dsm-verify.sh
 这条检查会确认容器运行、`/dev/fuse` 可见、挂载目录存在、token 与元数据数据库已经落盘，列出挂载目录中的前几项内容，确认目录里至少有一个文件，然后读取第一个挂载文件的 1 字节来触发按需读取路径。
 如果失败，脚本退出时也会打印 `DSM verification summary` 和失败项列表，再看输出里最后一个 `checking:` 项即可定位卡在哪一步。
 文件读取探针默认超时是 `20s`，可通过 `BAIDUDISKLINK_VERIFY_READ_TIMEOUT` 调整。
+
+目录列表默认每 1 分钟重新向百度同步一次，所以百度网盘里对目录做重命名、删除或新增后，最晚通常 1 分钟内会在本地反映出来。

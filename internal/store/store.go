@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -211,6 +212,57 @@ func (s *Store) UpsertFromRemote(parent string, entries []Entry) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) ReplaceChildren(parentID string, entries []Entry) error {
+	if s == nil {
+		return errors.New("store is nil")
+	}
+	if s.db == nil {
+		return errors.New("db is required")
+	}
+	if _, err := s.db.Exec(`delete from entries where parent_fsid = ?`, parentID); err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(entries))
+	args := make([]any, 0, len(entries)*11)
+	for _, entry := range entries {
+		values = append(values, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		args = append(args,
+			entry.FSID,
+			entry.Parent,
+			entry.Path,
+			entry.Name,
+			entry.Size,
+			boolToInt(entry.IsDir),
+			entry.MTM,
+			entry.MD5,
+			entry.LastSyncAt,
+			entry.ExpiresAt,
+			boolToInt(entry.Negative),
+		)
+	}
+	query := fmt.Sprintf(`
+		insert into entries
+		(fsid, parent_fsid, path, name, size, is_dir, mtime, md5, last_sync_at, expires_at, negative)
+		values %s
+		on conflict(path) do update set
+			fsid=excluded.fsid,
+			parent_fsid=excluded.parent_fsid,
+			name=excluded.name,
+			size=excluded.size,
+			is_dir=excluded.is_dir,
+			mtime=excluded.mtime,
+			md5=excluded.md5,
+			last_sync_at=excluded.last_sync_at,
+			expires_at=excluded.expires_at,
+			negative=excluded.negative
+	`, strings.Join(values, ","))
+	_, err := s.db.Exec(query, args...)
+	return err
 }
 
 func (s *Store) migrate() error {
