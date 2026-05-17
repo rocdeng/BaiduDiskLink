@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -121,6 +122,9 @@ func New(cfg Config) (*App, error) {
 	fuseGIDs, err := resolveFuseGroupGIDs(cfg.FuseGroupName)
 	if err != nil {
 		return nil, err
+	}
+	if len(fuseGIDs) > 0 {
+		log.Printf("fuse group access enabled groups=%q gids=%v", cfg.FuseGroupName, fuseGIDs)
 	}
 	tokenStore := auth.NewFileStore(cfg.TokenPath)
 	mgr := auth.NewManager(tokenStore)

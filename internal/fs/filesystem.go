@@ -43,7 +43,6 @@ func (f *Filesystem) OnAdd(ctx context.Context) {
 
 func (f *Filesystem) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = syscall.S_IFDIR | f.dirMode()
-	out.Gid = f.firstGID()
 	return 0
 }
 
@@ -182,7 +181,6 @@ func (f *Filesystem) newEntryInode(ctx context.Context, e store.Entry, out *fuse
 			perm = f.dirMode()
 		}
 		out.Mode = mode | perm
-		out.Gid = f.firstGID()
 		out.Size = uint64(e.Size)
 	}
 	return f.NewPersistentInode(ctx, node, stable)
@@ -217,11 +215,9 @@ var _ = (goFs.NodeReader)((*entryNode)(nil))
 func (n *entryNode) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if n.entry.IsDir {
 		out.Mode = syscall.S_IFDIR | n.Filesystem.dirMode()
-		out.Gid = n.Filesystem.firstGID()
 		return 0
 	}
 	out.Mode = syscall.S_IFREG | n.Filesystem.fileMode()
-	out.Gid = n.Filesystem.firstGID()
 	out.Size = uint64(n.entry.Size)
 	return 0
 }
@@ -407,10 +403,13 @@ func Mount(mountPath string, root *Filesystem, opts MountOptions) (*fuse.Server,
 	if root == nil {
 		return nil, errors.New("root filesystem is required")
 	}
+	timeout := time.Second
 	mountOpts := &goFs.Options{
 		MountOptions: fuse.MountOptions{
 			AllowOther: opts.AllowOther,
 		},
+		AttrTimeout:  &timeout,
+		EntryTimeout: &timeout,
 	}
 	if len(opts.GIDs) > 0 {
 		mountOpts.GID = opts.GIDs[0]
@@ -437,14 +436,4 @@ func (f *Filesystem) fileMode() uint32 {
 		return 0640
 	}
 	return 0644
-}
-
-func (f *Filesystem) firstGID() uint32 {
-	if f == nil {
-		return 0
-	}
-	for gid := range f.gids {
-		return gid
-	}
-	return 0
 }
