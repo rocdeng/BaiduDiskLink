@@ -174,13 +174,16 @@ func resolveFuseGroupGIDs(name string) ([]uint32, error) {
 		if groupName == "" {
 			continue
 		}
-		group, err := user.LookupGroup(groupName)
+		gid, err := strconv.ParseUint(groupName, 10, 32)
 		if err != nil {
-			return nil, fmt.Errorf("lookup fuse group %q: %w", groupName, err)
-		}
-		gid, err := strconv.ParseUint(group.Gid, 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("parse gid for fuse group %q: %w", groupName, err)
+			group, lookupErr := user.LookupGroup(groupName)
+			if lookupErr != nil {
+				return nil, fmt.Errorf("lookup fuse group %q: %w", groupName, lookupErr)
+			}
+			gid, err = strconv.ParseUint(group.Gid, 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("parse gid for fuse group %q: %w", groupName, err)
+			}
 		}
 		uid := uint32(gid)
 		if _, ok := seen[uid]; ok {
