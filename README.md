@@ -58,8 +58,8 @@ make check
    BAIDUDISKLINK_CLIENT_ID=你的百度开放平台 App Key
    BAIDUDISKLINK_CLIENT_SECRET=你的百度开放平台 Client Secret
    BAIDUDISKLINK_REDIRECT_URI=http://DSM-IP:8765/callback
-   # 如果要给 Emby 读，填 DSM 上的组名，默认留空不额外放开
-   BAIDUDISKLINK_FUSE_GROUP_NAME=embysvr
+   # 如果要给多个 DSM 组读，逗号分隔，例如 embysvr,media
+   BAIDUDISKLINK_FUSE_GROUP_NAME=embysvr,media
    ```
 
 4. 在百度开放平台应用后台，把授权回调地址配置成同一个地址：
@@ -175,11 +175,11 @@ bash scripts/dsm-verify.sh
 
 ### 给 Emby 开放读取
 
-如果你希望 DSM 上的 Emby 服务直接读取挂载目录，不想手工逐个加 ACL，推荐把 `BAIDUDISKLINK_FUSE_GROUP_NAME` 设成 Emby 所在的 DSM 组名，常见就是 `embysvr`。
+如果你希望 DSM 上的 Emby 服务直接读取挂载目录，不想手工逐个加 ACL，推荐把 `BAIDUDISKLINK_FUSE_GROUP_NAME` 设成 Emby 所在的 DSM 组名，多个组就用逗号分隔，常见就是 `embysvr,media`。
 
 这会让 FUSE 挂载对该组可见，同时保持网盘内容只读。实际效果是：
 
-1. Emby 只要运行在这个组里，就能浏览媒体库
+1. Emby 只要运行在这些组之一里，就能浏览媒体库
 2. 其他普通用户不会因为这个挂载自动获得访问权
 3. 这仍然不是“完全无权限配置”，DSM 侧至少要保证 Emby 进程属于这个组
 

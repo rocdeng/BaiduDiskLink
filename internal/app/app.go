@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"baidudisklink/internal/auth"
 	"baidudisklink/internal/baidu"
@@ -38,6 +39,7 @@ type Config struct {
 
 type App struct {
 	cfg             Config
+	fuseGIDs        []uint32
 	auth            *auth.Manager
 	store           *store.Store
 	remote          *remote.Reader
@@ -116,17 +118,18 @@ func New(cfg Config) (*App, error) {
 	if err := metaStore.ExpirePath("/"); err != nil {
 		return nil, err
 	}
-	fuseGID, err := resolveFuseGroupGID(cfg.FuseGroupName)
+	fuseGIDs, err := resolveFuseGroupGIDs(cfg.FuseGroupName)
 	if err != nil {
 		return nil, err
 	}
 	tokenStore := auth.NewFileStore(cfg.TokenPath)
 	mgr := auth.NewManager(tokenStore)
 	return &App{
-		cfg:    cfg,
-		auth:   mgr,
-		store:  metaStore,
-		remote: remote.NewReader(&baidu.StaticClient{}),
+		cfg:      cfg,
+		fuseGIDs: fuseGIDs,
+		auth:     mgr,
+		store:    metaStore,
+		remote:   remote.NewReader(&baidu.StaticClient{}),
 		oauth: auth.NewOAuthServer(auth.OAuthConfig{
 			ClientID:         cfg.ClientID,
 			ClientSecret:     cfg.ClientSecret,
@@ -139,10 +142,10 @@ func New(cfg Config) (*App, error) {
 		clientFactory: func(token auth.Token) baidu.Client {
 			return baidu.NewAPIClientWithBaseURLs(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, nil)
 		},
-	mountFunc: func(mountPath string, root *fs.Filesystem) (*fakeMountServer, error) {
+		mountFunc: func(mountPath string, root *fs.Filesystem) (*fakeMountServer, error) {
 			server, err := fs.Mount(mountPath, root, fs.MountOptions{
 				AllowOther: true,
-				GID:        fuseGID,
+				GIDs:       fuseGIDs,
 			})
 			if err != nil {
 				return nil, err
@@ -155,19 +158,34 @@ func New(cfg Config) (*App, error) {
 	}, nil
 }
 
-func resolveFuseGroupGID(name string) (uint32, error) {
+func resolveFuseGroupGIDs(name string) ([]uint32, error) {
 	if name == "" {
-		return 0, nil
+		return nil, nil
 	}
-	group, err := user.LookupGroup(name)
-	if err != nil {
-		return 0, fmt.Errorf("lookup fuse group %q: %w", name, err)
+	parts := strings.Split(name, ",")
+	gids := make([]uint32, 0, len(parts))
+	seen := make(map[uint32]struct{}, len(parts))
+	for _, part := range parts {
+		groupName := strings.TrimSpace(part)
+		if groupName == "" {
+			continue
+		}
+		group, err := user.LookupGroup(groupName)
+		if err != nil {
+			return nil, fmt.Errorf("lookup fuse group %q: %w", groupName, err)
+		}
+		gid, err := strconv.ParseUint(group.Gid, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parse gid for fuse group %q: %w", groupName, err)
+		}
+		uid := uint32(gid)
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		gids = append(gids, uid)
 	}
-	gid, err := strconv.ParseUint(group.Gid, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("parse gid for fuse group %q: %w", name, err)
-	}
-	return uint32(gid), nil
+	return gids, nil
 }
 
 func (a *App) Run() error {
@@ -205,7 +223,7 @@ func (a *App) Run() error {
 	if err := a.bindRemoteClient(); err != nil {
 		return err
 	}
-	server, err := a.mountFunc(a.cfg.MountPath, fs.NewFilesystem(a.store, a.remote, 0))
+	server, err := a.mountFunc(a.cfg.MountPath, fs.NewFilesystem(a.store, a.remote, a.fuseGIDs))
 	if err != nil {
 		return err
 	}

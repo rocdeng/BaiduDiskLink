@@ -66,6 +66,16 @@ func TestNewAppRequiresClientID(t *testing.T) {
 	}
 }
 
+func TestResolveFuseGroupGIDsParsesCommaSeparatedList(t *testing.T) {
+	gids, err := resolveFuseGroupGIDs("staff, staff ,everyone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gids) != 2 {
+		t.Fatalf("expected deduplicated gids, got %#v", gids)
+	}
+}
+
 func TestNewAppReturnsRunnableApp(t *testing.T) {
 	a, err := New(Config{
 		MountPath:   "/tmp/mount",
