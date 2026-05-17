@@ -265,6 +265,17 @@ func (s *Store) ReplaceChildren(parentID string, entries []Entry) error {
 	return err
 }
 
+func (s *Store) ExpirePath(path string) error {
+	if s == nil {
+		return errors.New("store is nil")
+	}
+	if s.db == nil {
+		return errors.New("db is required")
+	}
+	_, err := s.db.Exec(`update entries set expires_at = 0 where path = ?`, path)
+	return err
+}
+
 func (s *Store) migrate() error {
 	if s.db == nil {
 		return errors.New("db is required")

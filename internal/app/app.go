@@ -110,6 +110,9 @@ func New(cfg Config) (*App, error) {
 	if err := metaStore.EnsureRoot(); err != nil {
 		return nil, err
 	}
+	if err := metaStore.ExpirePath("/"); err != nil {
+		return nil, err
+	}
 	tokenStore := auth.NewFileStore(cfg.TokenPath)
 	mgr := auth.NewManager(tokenStore)
 	return &App{

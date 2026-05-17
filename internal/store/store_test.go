@@ -149,3 +149,27 @@ func TestRootChildrenAreListedFromParentZero(t *testing.T) {
 		t.Fatalf("unexpected root listing: %#v", got)
 	}
 }
+
+func TestExpirePathClearsExpiry(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ExpirePath("/"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetByPath("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ExpiresAt != 0 {
+		t.Fatalf("expected root to expire, got %#v", got)
+	}
+}

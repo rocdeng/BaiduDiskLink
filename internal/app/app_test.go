@@ -106,6 +106,29 @@ func TestNewAppCreatesMountAndTokenDirs(t *testing.T) {
 	}
 }
 
+func TestNewAppExpiresRootOnStartup(t *testing.T) {
+	root := t.TempDir()
+	metaPath := root + "/meta.db"
+	a, err := New(Config{
+		MountPath:    root + "/mount",
+		TokenPath:    root + "/token.json",
+		MetaDBPath:   metaPath,
+		ClientID:     "client",
+		ClientSecret: "secret",
+		RedirectURI:  "http://127.0.0.1:8765/callback",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := a.store.GetByPath("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil || entry.ExpiresAt != 0 {
+		t.Fatalf("expected root to be expired on startup, got %#v", entry)
+	}
+}
+
 func TestNewAppWiresRemoteReader(t *testing.T) {
 	a, err := New(Config{
 		MountPath:   "/tmp/mount",
