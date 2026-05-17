@@ -1,0 +1,31 @@
+services:
+  baidudisklink:
+    build: .
+    container_name: baidudisklink
+    privileged: true
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - ./data:/data
+      - type: bind
+        source: ./mnt
+        target: /mnt/baidu
+        bind:
+          propagation: rshared
+    environment:
+      BAIDUDISKLINK_MOUNT_PATH: /mnt/baidu
+      BAIDUDISKLINK_TOKEN_PATH: /data/token.json
+      BAIDUDISKLINK_META_DB_PATH: /data/meta.db
+      BAIDUDISKLINK_CLIENT_ID: ${BAIDUDISKLINK_CLIENT_ID}
+      BAIDUDISKLINK_CLIENT_SECRET: ${BAIDUDISKLINK_CLIENT_SECRET}
+      BAIDUDISKLINK_REDIRECT_URI: ${BAIDUDISKLINK_REDIRECT_URI}
+      BAIDUDISKLINK_OAUTH_SCOPE: ${BAIDUDISKLINK_OAUTH_SCOPE:-basic,netdisk}
+      BAIDUDISKLINK_OAUTH_STATE: ${BAIDUDISKLINK_OAUTH_STATE:-baidudisklink}
+      BAIDUDISKLINK_OAUTH_LISTEN_ADDR: ${BAIDUDISKLINK_OAUTH_LISTEN_ADDR:-0.0.0.0:8765}
+      BAIDUDISKLINK_AUTHORIZE_BASE_URL: ${BAIDUDISKLINK_AUTHORIZE_BASE_URL:-https://openapi.baidu.com/oauth/2.0/authorize}
+      BAIDUDISKLINK_TOKEN_BASE_URL: ${BAIDUDISKLINK_TOKEN_BASE_URL:-https://openapi.baidu.com/oauth/2.0/token}
+      BAIDUDISKLINK_API_BASE_URL: ${BAIDUDISKLINK_API_BASE_URL:-https://pan.baidu.com}
+    ports:
+      - "8765:8765"
