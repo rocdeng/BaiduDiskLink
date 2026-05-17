@@ -10,7 +10,7 @@ services:
     volumes:
       - ./data:/data
       - type: bind
-        source: ./mnt
+        source: ${BAIDUDISKLINK_HOST_MOUNT_PATH:-./mnt}
         target: /mnt/baidu
         bind:
           propagation: rshared

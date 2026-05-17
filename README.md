@@ -48,7 +48,8 @@ make check
    ```bash
    cd /volume1/@docker/BaiduDiskLink
    cp .env.example .env
-   mkdir -p data mnt
+   mkdir -p data
+   mkdir -p /volume1/video/BaiduDiskLink
    ```
 
 3. 编辑 `.env`，至少填写下面三项：
@@ -61,6 +62,8 @@ make check
    # 如果要给多个 DSM 组读，逗号分隔。优先推荐直接填数字 GID。
    # 例如：1024,1030
    BAIDUDISKLINK_FUSE_GROUP_NAME=1024,1030
+   # 给 DSM/Emby 看的宿主机目录，推荐放普通共享目录，不要放 @docker 下
+   BAIDUDISKLINK_HOST_MOUNT_PATH=/volume1/video/BaiduDiskLink
    ```
 
    这个变量必须通过 `docker-compose.yml` 传进容器才会生效，已经在仓库里配好。
@@ -93,7 +96,7 @@ make check
 7. 授权完成且挂载目录能看到百度网盘文件后，在 Emby 里添加 DSM 宿主机上的挂载目录：
 
    ```text
-   /volume1/@docker/BaiduDiskLink/mnt
+   /volume1/video/BaiduDiskLink
    ```
 
 8. 最后再运行 DSM 验收脚本：
@@ -118,17 +121,17 @@ mount --make-rshared /volume1
 
 如果你的 DSM 环境不接受对 `/volume1` 直接改 shared，可以改为对更小的实际挂载点处理，但原则一样：`./mnt` 所在的宿主目录必须在 shared 挂载树下，容器内的 FUSE 挂载才能回传给 DSM 和 Emby。
 
-如果重建容器时提示 `transport endpoint is not connected`，通常是宿主机上的 `mnt` 目录残留了一个断开的 FUSE 挂载。先把容器停掉，再卸载这个目录：
+如果重建容器时提示 `transport endpoint is not connected`，通常是宿主机上的挂载目录残留了一个断开的 FUSE 挂载。先把容器停掉，再卸载这个目录：
 
 ```bash
 docker-compose down
-umount /volume1/@docker/BaiduDiskLink/mnt
+umount /volume1/video/BaiduDiskLink
 ```
 
 如果普通卸载失败，再试惰性卸载：
 
 ```bash
-umount -l /volume1/@docker/BaiduDiskLink/mnt
+umount -l /volume1/video/BaiduDiskLink
 ```
 
 清掉残留挂载后再重新启动容器即可。
@@ -143,8 +146,8 @@ docker-compose build
 docker-compose up -d
 ```
 
-容器默认开启 `/dev/fuse`，并暴露 OAuth 回调端口 `8765`。挂载点是 `/mnt/baidu`，元数据与 token 保存在 `/data`。
-`./mnt` 采用 `rshared` 传播，这样容器内的 FUSE 挂载能让 DSM 宿主和 Emby 看到。
+容器默认开启 `/dev/fuse`，并暴露 OAuth 回调端口 `8765`。容器内挂载点是 `/mnt/baidu`，元数据与 token 保存在 `/data`。
+`BAIDUDISKLINK_HOST_MOUNT_PATH` 采用 `rshared` 传播，这样容器内的 FUSE 挂载能让 DSM 宿主和 Emby 看到。DSM 上推荐把它设为普通共享目录，例如 `/volume1/video/BaiduDiskLink`，不要放在 `/volume1/@docker` 下面给 Emby 读。
 
 DSM 场景建议：
 
