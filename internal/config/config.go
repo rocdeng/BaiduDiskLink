@@ -6,6 +6,7 @@ type Config struct {
 	MountPath        string
 	TokenPath        string
 	MetaDBPath       string
+	FuseGroupName    string
 	ClientID         string
 	ClientSecret     string
 	RedirectURI      string
@@ -22,6 +23,7 @@ func Load() Config {
 		MountPath:        os.Getenv("BAIDUDISKLINK_MOUNT_PATH"),
 		TokenPath:        os.Getenv("BAIDUDISKLINK_TOKEN_PATH"),
 		MetaDBPath:       os.Getenv("BAIDUDISKLINK_META_DB_PATH"),
+		FuseGroupName:    os.Getenv("BAIDUDISKLINK_FUSE_GROUP_NAME"),
 		ClientID:         os.Getenv("BAIDUDISKLINK_CLIENT_ID"),
 		ClientSecret:     os.Getenv("BAIDUDISKLINK_CLIENT_SECRET"),
 		RedirectURI:      os.Getenv("BAIDUDISKLINK_REDIRECT_URI"),

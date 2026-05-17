@@ -23,6 +23,7 @@ make check
 - `BAIDUDISKLINK_CLIENT_ID`
 - `BAIDUDISKLINK_CLIENT_SECRET`
 - `BAIDUDISKLINK_REDIRECT_URI`
+- `BAIDUDISKLINK_FUSE_GROUP_NAME`
 - `BAIDUDISKLINK_OAUTH_SCOPE`
 - `BAIDUDISKLINK_OAUTH_STATE`
 - `BAIDUDISKLINK_OAUTH_LISTEN_ADDR`
@@ -57,6 +58,8 @@ make check
    BAIDUDISKLINK_CLIENT_ID=你的百度开放平台 App Key
    BAIDUDISKLINK_CLIENT_SECRET=你的百度开放平台 Client Secret
    BAIDUDISKLINK_REDIRECT_URI=http://DSM-IP:8765/callback
+   # 如果要给 Emby 读，填 DSM 上的组名，默认留空不额外放开
+   BAIDUDISKLINK_FUSE_GROUP_NAME=embysvr
    ```
 
 4. 在百度开放平台应用后台，把授权回调地址配置成同一个地址：
@@ -169,3 +172,15 @@ bash scripts/dsm-verify.sh
 文件读取探针默认超时是 `20s`，可通过 `BAIDUDISKLINK_VERIFY_READ_TIMEOUT` 调整。
 
 目录列表默认每 1 分钟重新向百度同步一次；第一次遇到空目录会立刻刷新，所以百度网盘里对目录做重命名、删除或新增后，最晚通常 1 分钟内会在本地反映出来。
+
+### 给 Emby 开放读取
+
+如果你希望 DSM 上的 Emby 服务直接读取挂载目录，不想手工逐个加 ACL，推荐把 `BAIDUDISKLINK_FUSE_GROUP_NAME` 设成 Emby 所在的 DSM 组名，常见就是 `embysvr`。
+
+这会让 FUSE 挂载对该组可见，同时保持网盘内容只读。实际效果是：
+
+1. Emby 只要运行在这个组里，就能浏览媒体库
+2. 其他普通用户不会因为这个挂载自动获得访问权
+3. 这仍然不是“完全无权限配置”，DSM 侧至少要保证 Emby 进程属于这个组
+
+如果你已经有一个现成的 Emby 账号/服务用户，通常只要把它加入 `embysvr` 组即可，不需要给每个媒体目录单独补权限。

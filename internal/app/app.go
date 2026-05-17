@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 
 	"baidudisklink/internal/auth"
 	"baidudisklink/internal/baidu"
@@ -22,6 +24,7 @@ type Config struct {
 	MountPath        string
 	TokenPath        string
 	MetaDBPath       string
+	FuseGroupName    string
 	ClientID         string
 	ClientSecret     string
 	RedirectURI      string
@@ -113,6 +116,10 @@ func New(cfg Config) (*App, error) {
 	if err := metaStore.ExpirePath("/"); err != nil {
 		return nil, err
 	}
+	fuseGID, err := resolveFuseGroupGID(cfg.FuseGroupName)
+	if err != nil {
+		return nil, err
+	}
 	tokenStore := auth.NewFileStore(cfg.TokenPath)
 	mgr := auth.NewManager(tokenStore)
 	return &App{
@@ -132,8 +139,11 @@ func New(cfg Config) (*App, error) {
 		clientFactory: func(token auth.Token) baidu.Client {
 			return baidu.NewAPIClientWithBaseURLs(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, nil)
 		},
-		mountFunc: func(mountPath string, root *fs.Filesystem) (*fakeMountServer, error) {
-			server, err := fs.Mount(mountPath, root)
+	mountFunc: func(mountPath string, root *fs.Filesystem) (*fakeMountServer, error) {
+			server, err := fs.Mount(mountPath, root, fs.MountOptions{
+				AllowOther: true,
+				GID:        fuseGID,
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -143,6 +153,21 @@ func New(cfg Config) (*App, error) {
 			}, nil
 		},
 	}, nil
+}
+
+func resolveFuseGroupGID(name string) (uint32, error) {
+	if name == "" {
+		return 0, nil
+	}
+	group, err := user.LookupGroup(name)
+	if err != nil {
+		return 0, fmt.Errorf("lookup fuse group %q: %w", name, err)
+	}
+	gid, err := strconv.ParseUint(group.Gid, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("parse gid for fuse group %q: %w", name, err)
+	}
+	return uint32(gid), nil
 }
 
 func (a *App) Run() error {
@@ -180,7 +205,7 @@ func (a *App) Run() error {
 	if err := a.bindRemoteClient(); err != nil {
 		return err
 	}
-	server, err := a.mountFunc(a.cfg.MountPath, fs.NewFilesystem(a.store, a.remote))
+	server, err := a.mountFunc(a.cfg.MountPath, fs.NewFilesystem(a.store, a.remote, 0))
 	if err != nil {
 		return err
 	}

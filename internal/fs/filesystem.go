@@ -23,10 +23,11 @@ type Filesystem struct {
 	remote   *remote.Reader
 	negative *cache.NegativeCache
 	ttl      time.Duration
+	gid      uint32
 }
 
-func NewFilesystem(st *store.Store, r *remote.Reader) *Filesystem {
-	return &Filesystem{store: st, remote: r, ttl: time.Minute}
+func NewFilesystem(st *store.Store, r *remote.Reader, gid uint32) *Filesystem {
+	return &Filesystem{store: st, remote: r, ttl: time.Minute, gid: gid}
 }
 
 func (f *Filesystem) OnAdd(ctx context.Context) {
@@ -37,7 +38,8 @@ func (f *Filesystem) OnAdd(ctx context.Context) {
 }
 
 func (f *Filesystem) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	out.Mode = syscall.S_IFDIR | 0755
+	out.Mode = syscall.S_IFDIR | f.dirMode()
+	out.Gid = f.gid
 	return 0
 }
 
@@ -171,7 +173,12 @@ func (f *Filesystem) newEntryInode(ctx context.Context, e store.Entry, out *fuse
 		entry:      e,
 	}
 	if out != nil {
-		out.Mode = mode | 0755
+		perm := f.fileMode()
+		if e.IsDir {
+			perm = f.dirMode()
+		}
+		out.Mode = mode | perm
+		out.Gid = f.gid
 		out.Size = uint64(e.Size)
 	}
 	return f.NewPersistentInode(ctx, node, stable)
@@ -205,10 +212,12 @@ var _ = (goFs.NodeReader)((*entryNode)(nil))
 
 func (n *entryNode) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if n.entry.IsDir {
-		out.Mode = syscall.S_IFDIR | 0755
+		out.Mode = syscall.S_IFDIR | n.Filesystem.dirMode()
+		out.Gid = n.Filesystem.gid
 		return 0
 	}
-	out.Mode = syscall.S_IFREG | 0644
+	out.Mode = syscall.S_IFREG | n.Filesystem.fileMode()
+	out.Gid = n.Filesystem.gid
 	out.Size = uint64(n.entry.Size)
 	return 0
 }
@@ -382,15 +391,26 @@ func (f *Filesystem) shouldRefresh(path string, children []store.Entry) bool {
 	return false
 }
 
-func Mount(mountPath string, root *Filesystem) (*fuse.Server, error) {
+type MountOptions struct {
+	AllowOther bool
+	GID        uint32
+}
+
+func Mount(mountPath string, root *Filesystem, opts MountOptions) (*fuse.Server, error) {
 	if mountPath == "" {
 		return nil, errors.New("mount path is required")
 	}
 	if root == nil {
 		return nil, errors.New("root filesystem is required")
 	}
-	opts := &goFs.Options{}
-	return goFs.Mount(mountPath, root, opts)
+	root.gid = opts.GID
+	mountOpts := &goFs.Options{
+		MountOptions: fuse.MountOptions{
+			AllowOther: opts.AllowOther,
+		},
+		GID: opts.GID,
+	}
+	return goFs.Mount(mountPath, root, mountOpts)
 }
 
 func JoinPath(parent, name string) string {
@@ -398,4 +418,18 @@ func JoinPath(parent, name string) string {
 		return path.Join("/", name)
 	}
 	return path.Join(parent, name)
+}
+
+func (f *Filesystem) dirMode() uint32 {
+	if f != nil && f.gid != 0 {
+		return 0750
+	}
+	return 0755
+}
+
+func (f *Filesystem) fileMode() uint32 {
+	if f != nil && f.gid != 0 {
+		return 0640
+	}
+	return 0644
 }

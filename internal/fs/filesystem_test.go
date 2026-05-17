@@ -58,7 +58,7 @@ func TestRefreshRootLoadsRemoteEntriesIntoStore(t *testing.T) {
 			"/": {{FSID: "1", ServerName: "movies", Path: "/movies", IsDir: true}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader)
+	fs := NewFilesystem(dbStore, remoteReader, 0)
 	if err := fs.refreshRoot(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestRefreshDirLoadsNestedEntries(t *testing.T) {
 			"/movies": {{FSID: "2", ServerName: "test.mkv", Path: "/movies/test.mkv", Size: 9, IsDir: false}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader)
+	fs := NewFilesystem(dbStore, remoteReader, 0)
 	if err := fs.refreshDir(context.Background(), "/movies", "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestRefreshDirReplacesExistingChildren(t *testing.T) {
 			"/movies": {{FSID: "3", ServerName: "new.mkv", Path: "/movies/new.mkv", Size: 10, IsDir: false}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader)
+	fs := NewFilesystem(dbStore, remoteReader, 0)
 	if err := fs.refreshDir(context.Background(), "/movies", "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestRefreshDirPreservesParentRelation(t *testing.T) {
 			"/Videos": {{FSID: "2", ServerName: "Movie", Path: "/Videos/Movie", IsDir: true}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader)
+	fs := NewFilesystem(dbStore, remoteReader, 0)
 	if err := fs.refreshDir(context.Background(), "/Videos", "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestLookupUsesNegativeCacheForMissingEntries(t *testing.T) {
 	if err := dbStore.EnsureRoot(); err != nil {
 		t.Fatal(err)
 	}
-	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}))
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), 0)
 	fs.negative = cache.NewNegativeCache(30 * time.Second)
 	fs.markMissing("/missing")
 	if _, errno := fs.Lookup(context.Background(), "missing", nil); errno != syscall.ENOENT {
