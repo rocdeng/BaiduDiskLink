@@ -62,6 +62,8 @@ make check
    BAIDUDISKLINK_FUSE_GROUP_NAME=embysvr,media
    ```
 
+   这个变量必须通过 `docker-compose.yml` 传进容器才会生效，已经在仓库里配好。
+
 4. 在百度开放平台应用后台，把授权回调地址配置成同一个地址：
 
    ```text
