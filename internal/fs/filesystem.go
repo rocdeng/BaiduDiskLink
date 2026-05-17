@@ -104,6 +104,7 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	log.Printf("refresh root loaded %d entries", len(entries))
 	if len(entries) == 0 {
 		f.markMissing("/")
 		return nil
@@ -276,6 +277,7 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 	if err != nil {
 		return err
 	}
+	log.Printf("refresh dir %q loaded %d entries", dirPath, len(entries))
 	if len(entries) == 0 {
 		f.markMissing(dirPath)
 		return nil
