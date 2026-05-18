@@ -168,13 +168,13 @@ func (a *App) resolveRemoteEntry(fullPath string) (entryInfo, error) {
 		for _, child := range currentList {
 			if child.ServerName == part {
 				found = entryInfo{
-					FSID:    child.FSID,
-					Path:    child.Path,
-					Name:    child.ServerName,
-					Size:    child.Size,
-					IsDir:   child.IsDir,
-					MTM:     child.ServerMTime,
-					MD5:     child.MD5,
+					FSID:     child.FSID,
+					Path:     child.Path,
+					Name:     child.ServerName,
+					Size:     child.Size,
+					IsDir:    child.IsDir,
+					MTM:      child.ServerMTime,
+					MD5:      child.MD5,
 					FullPath: joinRemotePath(currentPath, child.ServerName),
 				}
 				break

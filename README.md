@@ -198,6 +198,7 @@ docker-compose run --rm baidudisklink bench --path /Videos/test.zip
 ```
 
 这个命令会复用 `data/token.json` 里的登录信息，按和挂载一致的方式去拿 `dlink` 并读取文件，然后输出读取字节数、耗时和平均速度。
+如果主容器已经在运行，更推荐用 `docker-compose exec baidudisklink baidudisklink bench --path /Videos/test.zip`，这样不会额外启动一个新容器去抢同一个元数据数据库。
 
 如果你想测挂载后的 FUSE 入口，就跑：
 
@@ -206,6 +207,7 @@ docker-compose run --rm baidudisklink bench-fuse --path /mnt/baidu/test.zip
 ```
 
 这个命令直接读本地挂载目录里的同一个文件，能和 `bench` 对比出 FUSE 这层多消耗了多少。
+同样，如果主容器已经运行，可以用 `docker-compose exec baidudisklink baidudisklink bench-fuse --path /mnt/baidu/test.zip`。
 
 ### 给 Emby 开放读取
 

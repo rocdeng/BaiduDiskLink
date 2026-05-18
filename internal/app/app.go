@@ -113,7 +113,7 @@ func New(cfg Config) (*App, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.TokenPath), 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", cfg.MetaDBPath)
+	db, err := sql.Open("sqlite", sqliteDSN(cfg.MetaDBPath))
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +215,16 @@ func resolveFuseGroupGIDs(name string) ([]uint32, error) {
 		gids = append(gids, uid)
 	}
 	return gids, nil
+}
+
+func sqliteDSN(path string) string {
+	if path == "" {
+		return ""
+	}
+	if strings.Contains(path, "?") {
+		return path + "&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	}
+	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 }
 
 func (a *App) Run() error {

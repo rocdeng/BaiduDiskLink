@@ -26,6 +26,10 @@ type cachedRead struct {
 	data   []byte
 }
 
+const (
+	prefetchBytes = 4 << 20
+)
+
 func NewReader(client baidu.Client) *Reader {
 	return &Reader{
 		client: client,
@@ -70,8 +74,8 @@ func (r *Reader) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 		return data, nil
 	}
 	fetchLength := length
-	if fetchLength < minPrefetchBytes {
-		fetchLength = minPrefetchBytes
+	if fetchLength < prefetchBytes {
+		fetchLength = prefetchBytes
 	}
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -85,8 +89,6 @@ func (r *Reader) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 	}
 	return nil, lastErr
 }
-
-const minPrefetchBytes int64 = 1024 * 1024
 
 func (r *Reader) readCached(fsid string, offset, length int64) ([]byte, bool) {
 	r.mu.RLock()

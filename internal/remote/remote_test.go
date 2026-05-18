@@ -15,7 +15,7 @@ type stubClient struct {
 }
 
 func (s *stubClient) List(path string) ([]baidu.RemoteEntry, error) { return nil, nil }
-func (s *stubClient) Stat(path string) (baidu.RemoteEntry, error) { return baidu.RemoteEntry{}, nil }
+func (s *stubClient) Stat(path string) (baidu.RemoteEntry, error)   { return baidu.RemoteEntry{}, nil }
 func (s *stubClient) GetDownloadLink(fsid string) (baidu.DownloadLink, error) {
 	s.downloadCalls++
 	return baidu.DownloadLink{URL: "https://example.invalid/" + fsid, ExpiresAt: time.Now().Add(time.Minute)}, nil

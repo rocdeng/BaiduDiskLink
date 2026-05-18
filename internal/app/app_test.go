@@ -76,6 +76,13 @@ func TestResolveFuseGroupGIDsParsesCommaSeparatedList(t *testing.T) {
 	}
 }
 
+func TestSQLiteDSNAddsBusyTimeoutAndWAL(t *testing.T) {
+	got := sqliteDSN("/tmp/meta.db")
+	if !strings.Contains(got, "_pragma=busy_timeout(5000)") || !strings.Contains(got, "_pragma=journal_mode(WAL)") {
+		t.Fatalf("expected sqlite pragmas in dsn, got %q", got)
+	}
+}
+
 func TestNewAppReturnsRunnableApp(t *testing.T) {
 	a, err := New(Config{
 		MountPath:   "/tmp/mount",
