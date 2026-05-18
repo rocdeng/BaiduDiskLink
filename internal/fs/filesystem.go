@@ -421,15 +421,8 @@ func (n *entryNode) Read(ctx context.Context, fh goFs.FileHandle, dest []byte, o
 	if n == nil || n.Filesystem == nil || n.Filesystem.remote == nil {
 		return fuse.ReadResultData(nil), 0
 	}
-	size := n.entry.Size
-	if size > 0 {
-		if off >= size {
-			return fuse.ReadResultData(nil), 0
-		}
-		remaining := size - off
-		if remaining < int64(len(dest)) {
-			dest = dest[:remaining]
-		}
+	if n.entry.Size > 0 && off >= n.entry.Size {
+		return fuse.ReadResultData(nil), 0
 	}
 	data, err := n.Filesystem.remote.ReadRange(n.entry.FSID, off, int64(len(dest)))
 	if err != nil {

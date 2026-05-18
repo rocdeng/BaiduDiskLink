@@ -48,7 +48,7 @@ func TestReaderReturnsRequestedLength(t *testing.T) {
 	}
 }
 
-func TestEntryReadClampsToFileSize(t *testing.T) {
+func TestEntryReadPassesThroughRequestedLength(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +65,7 @@ func TestEntryReadClampsToFileSize(t *testing.T) {
 	}
 	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
 	node := &entryNode{Filesystem: fs, entry: entry}
-	got, errno := node.Read(context.Background(), nil, make([]byte, 16), 4)
+	got, errno := node.Read(context.Background(), nil, make([]byte, 16), 0)
 	if errno != 0 {
 		t.Fatalf("expected read to succeed, got %v", errno)
 	}
@@ -73,8 +73,8 @@ func TestEntryReadClampsToFileSize(t *testing.T) {
 	if status != 0 {
 		t.Fatalf("expected read bytes to succeed, got %v", status)
 	}
-	if len(data) != 1 {
-		t.Fatalf("expected read to be clamped to 1 byte, got %d", len(data))
+	if len(data) != 16 {
+		t.Fatalf("expected read to pass through requested length, got %d", len(data))
 	}
 }
 
