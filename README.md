@@ -49,6 +49,7 @@ make check
    cd /volume1/@docker/BaiduDiskLink
    cp .env.example .env
    mkdir -p data
+   # 推荐新建一个 DSM 共享目录作为挂载出口，例如 /volume1/video/BaiduDiskLink
    mkdir -p /volume1/video/BaiduDiskLink
    ```
 
@@ -62,7 +63,9 @@ make check
    # 如果要给多个 DSM 组读，逗号分隔。优先推荐直接填数字 GID。
    # 例如：1024,1030
    BAIDUDISKLINK_FUSE_GROUP_NAME=1024,1030
-   # 给 DSM/Emby 看的宿主机目录，推荐放普通共享目录，不要放 @docker 下
+   # 给 DSM/Emby 看的宿主机挂载目录。这里是挂载点，不是源码目录。
+   # 默认 ./mnt 表示项目根目录下的 mnt 目录。
+   # 推荐新建一个 DSM 共享目录作为挂载出口，不要和项目源码目录混在一起。
    BAIDUDISKLINK_HOST_MOUNT_PATH=/volume1/video/BaiduDiskLink
    ```
 
@@ -147,7 +150,7 @@ docker-compose up -d
 ```
 
 容器默认开启 `/dev/fuse`，并暴露 OAuth 回调端口 `8765`。容器内挂载点是 `/mnt/baidu`，元数据与 token 保存在 `/data`。
-`BAIDUDISKLINK_HOST_MOUNT_PATH` 采用 `rshared` 传播，这样容器内的 FUSE 挂载能让 DSM 宿主和 Emby 看到。DSM 上推荐把它设为普通共享目录，例如 `/volume1/video/BaiduDiskLink`，不要放在 `/volume1/@docker` 下面给 Emby 读。
+`BAIDUDISKLINK_HOST_MOUNT_PATH` 是宿主机侧的挂载点路径，不是源码目录；默认值 `./mnt` 代表项目根目录下的 `mnt/`。它会采用 `rshared` 传播。DSM 上强烈建议新建一个普通共享目录，例如 `/volume1/video/BaiduDiskLink`，专门拿来做挂载出口，不要放在 `/volume1/@docker` 下面给 Emby 读，也不要和项目源码目录混用。你这次遇到的情况也说明了这一点：非共享目录即使 Linux 权限看着没问题，DSM 套件用户也可能还是访问不到。
 
 DSM 场景建议：
 
@@ -190,3 +193,13 @@ bash scripts/dsm-verify.sh
 3. 这仍然不是“完全无权限配置”，DSM 侧至少要保证 Emby 进程属于这个组
 
 如果你已经有一个现成的 Emby 账号/服务用户，通常只要把它加入 `embysvr` 组即可，不需要给每个媒体目录单独补权限。
+
+### 为什么推荐共享目录
+
+在 DSM 上，普通 Linux 权限和 DSM 共享目录权限不是一回事。实际部署里，最稳的做法是：
+
+1. 先新建一个独立共享目录，专门作为挂载出口
+2. 把这个共享目录的权限给到 `embysvr` 或对应服务用户
+3. 让 `BAIDUDISKLINK_HOST_MOUNT_PATH` 指向这个共享目录
+
+这样 Emby 和 DSM 自己的权限模型都能正常识别，少踩很多坑。不要把源码目录直接当成最终挂载目录，也不要把挂载点挂进一个没有共享语义的普通路径里。
