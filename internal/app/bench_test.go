@@ -1,0 +1,91 @@
+package app
+
+import (
+	"strings"
+	"testing"
+
+	"baidudisklink/internal/auth"
+	"baidudisklink/internal/baidu"
+)
+
+func TestBenchmarkUsesOfficialDlinkFlow(t *testing.T) {
+	a, err := New(Config{
+		MountPath:    t.TempDir() + "/mnt",
+		TokenPath:    t.TempDir() + "/token.json",
+		MetaDBPath:   t.TempDir() + "/meta.db",
+		ClientID:     "client",
+		ClientSecret: "secret",
+		RedirectURI:  "http://127.0.0.1:8765/callback",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.auth.SaveToken(auth.Token{AccessToken: "token", RefreshToken: "refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	a.clientFactory = func(token auth.Token) baidu.Client {
+		if token.AccessToken != "token" || token.RefreshToken != "refresh" {
+			t.Fatalf("unexpected token: %#v", token)
+		}
+		return &baidu.StaticClient{
+			Entries: map[string][]baidu.RemoteEntry{
+				"/Videos": {
+					{FSID: "1", ServerName: "test.zip", Path: "/Videos/test.zip", Size: 4},
+				},
+			},
+		}
+	}
+	if err := a.BindRemoteClient(); err != nil {
+		t.Fatal(err)
+	}
+	a.remote.SetClient(&mockBenchClient{
+		list: map[string][]baidu.RemoteEntry{
+			"/Videos": {
+				{FSID: "1", ServerName: "test.zip", Path: "/Videos/test.zip", Size: 4},
+			},
+		},
+		read: func(fsid string, offset, length int64) ([]byte, error) {
+			if fsid != "1" || offset != 0 || length != 4 {
+				t.Fatalf("unexpected read args: %s %d %d", fsid, offset, length)
+			}
+			return []byte("abcd"), nil
+		},
+	})
+	result, err := a.Benchmark("/Videos/test.zip", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Bytes != 4 || result.ThroughputMB <= 0 {
+		t.Fatalf("unexpected benchmark result: %#v", result)
+	}
+}
+
+type mockBenchClient struct {
+	list map[string][]baidu.RemoteEntry
+	read func(fsid string, offset, length int64) ([]byte, error)
+}
+
+func (m *mockBenchClient) List(path string) ([]baidu.RemoteEntry, error) {
+	return append([]baidu.RemoteEntry(nil), m.list[path]...), nil
+}
+
+func (m *mockBenchClient) Stat(path string) (baidu.RemoteEntry, error) {
+	items := m.list[path]
+	if len(items) == 0 {
+		return baidu.RemoteEntry{}, nil
+	}
+	return items[0], nil
+}
+
+func (m *mockBenchClient) GetDownloadLink(fsid string) (baidu.DownloadLink, error) {
+	return baidu.DownloadLink{URL: "https://download.example.invalid/" + fsid}, nil
+}
+
+func (m *mockBenchClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
+	if m.read != nil {
+		return m.read(fsid, offset, length)
+	}
+	return []byte(strings.Repeat("x", int(length))), nil
+}
+
+func (m *mockBenchClient) RefreshAuth() error { return nil }

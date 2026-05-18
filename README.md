@@ -88,6 +88,8 @@ make check
    docker-compose up -d
    ```
 
+   如果你拉了新代码，或者刚加了像 `bench` 这样的新命令，记得先重新 `build`，否则旧镜像里不会有新的二进制。
+
 6. 首次启动时查看容器日志，打开日志里打印的百度授权 URL，按页面提示登录并授权。授权成功后，程序会通过本地回调拿到 token，并保存到：
 
    ```text
@@ -186,6 +188,16 @@ bash scripts/dsm-verify.sh
 文件读取探针默认超时是 `20s`，可通过 `BAIDUDISKLINK_VERIFY_READ_TIMEOUT` 调整。
 
 目录会在挂载后先刷新 `BAIDUDISKLINK_REMOTE_ROOT_PATH` 指向的百度目录，之后每 1 分钟后台再刷新一轮该入口下的已知目录树；你手工浏览目录时也会按需再刷新一次。百度网盘里对目录做重命名、删除或新增后，通常最晚 1 分钟左右会在本地反映出来。
+
+### 性能测速
+
+如果你想测官方接口 + `dlink` 这条链路的真实下载速度，可以直接在容器里跑：
+
+```bash
+docker-compose run --rm baidudisklink bench --path /Videos/test.zip
+```
+
+这个命令会复用 `data/token.json` 里的登录信息，按和挂载一致的方式去拿 `dlink` 并读取文件，然后输出读取字节数、耗时和平均速度。
 
 ### 给 Emby 开放读取
 
