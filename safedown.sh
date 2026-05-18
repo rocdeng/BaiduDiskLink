@@ -1,2 +1,2 @@
 docker-compose down
-umount /volume1/@docker/BaiduDiskLink/mnt
+umount /volume2/baidu_videos

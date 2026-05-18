@@ -48,6 +48,36 @@ func TestReaderReturnsRequestedLength(t *testing.T) {
 	}
 }
 
+func TestEntryReadClampsToFileSize(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	entry := store.Entry{
+		FSID:  "1",
+		Path:  "/movie.mkv",
+		Name:  "movie.mkv",
+		Size:  5,
+		IsDir: false,
+	}
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
+	node := &entryNode{Filesystem: fs, entry: entry}
+	got, errno := node.Read(context.Background(), nil, make([]byte, 16), 4)
+	if errno != 0 {
+		t.Fatalf("expected read to succeed, got %v", errno)
+	}
+	data, status := got.Bytes(nil)
+	if status != 0 {
+		t.Fatalf("expected read bytes to succeed, got %v", status)
+	}
+	if len(data) != 1 {
+		t.Fatalf("expected read to be clamped to 1 byte, got %d", len(data))
+	}
+}
+
 func TestRefreshRootLoadsRemoteEntriesIntoStore(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {
