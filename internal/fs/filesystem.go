@@ -157,12 +157,14 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 	if err := f.store.ReplaceChildren("0", mapped); err != nil {
 		return err
 	}
+	mtm := f.existingMTime(f.rootPath)
 	return f.store.UpsertEntry(store.Entry{
 		FSID:       "0",
 		Parent:     "",
 		Path:       f.rootPath,
 		Name:       "",
 		IsDir:      true,
+		MTM:        mtm,
 		LastSyncAt: time.Now().Unix(),
 		ExpiresAt:  time.Now().Add(f.ttl).Unix(),
 	})
@@ -407,15 +409,28 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 	if existing, err := f.store.GetByPath(dirPath); err == nil && existing != nil && existing.Parent != "" {
 		parent = existing.Parent
 	}
+	mtm := f.existingMTime(dirPath)
 	return f.store.UpsertEntry(store.Entry{
 		FSID:       fsid,
 		Parent:     parent,
 		Path:       dirPath,
 		Name:       path.Base(dirPath),
 		IsDir:      true,
+		MTM:        mtm,
 		LastSyncAt: time.Now().Unix(),
 		ExpiresAt:  time.Now().Add(f.ttl).Unix(),
 	})
+}
+
+func (f *Filesystem) existingMTime(dirPath string) int64 {
+	if f == nil || f.store == nil {
+		return 0
+	}
+	existing, err := f.store.GetByPath(dirPath)
+	if err != nil || existing == nil {
+		return 0
+	}
+	return existing.MTM
 }
 
 func (f *Filesystem) markMissing(path string) {

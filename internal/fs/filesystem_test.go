@@ -167,6 +167,42 @@ func TestRefreshDirLoadsNestedEntries(t *testing.T) {
 	}
 }
 
+func TestRefreshDirPreservesExistingDirectoryMTime(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{
+		FSID:   "1",
+		Parent: "0",
+		Path:   "/movies",
+		Name:   "movies",
+		IsDir:  true,
+		MTM:    1710000000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/movies": {{FSID: "2", ServerName: "test.mkv", Path: "/movies/test.mkv", Size: 9, IsDir: false}},
+		},
+	})
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
+	if err := fs.refreshDir(context.Background(), "/movies", "1"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dbStore.GetByPath("/movies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.MTM != 1710000000 {
+		t.Fatalf("expected directory mtime to be preserved, got %#v", got)
+	}
+}
+
 func TestRefreshDirLoadsNewFileIntoExistingDirectory(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {
