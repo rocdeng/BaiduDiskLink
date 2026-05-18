@@ -6,6 +6,7 @@ import (
 	"log"
 	"path"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,15 +20,16 @@ import (
 
 type Filesystem struct {
 	goFs.Inode
-	store    *store.Store
-	remote   *remote.Reader
-	negative *cache.NegativeCache
-	ttl      time.Duration
+	store      *store.Store
+	remote     *remote.Reader
+	negative   *cache.NegativeCache
+	ttl        time.Duration
 	primaryGID uint32
-	gids     map[uint32]struct{}
+	gids       map[uint32]struct{}
+	rootPath   string
 }
 
-func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32) *Filesystem {
+func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath string) *Filesystem {
 	out := make(map[uint32]struct{}, len(gids))
 	var primary uint32
 	for _, gid := range gids {
@@ -36,7 +38,10 @@ func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32) *Filesystem
 			primary = gid
 		}
 	}
-	return &Filesystem{store: st, remote: r, ttl: time.Minute, primaryGID: primary, gids: out}
+	if rootPath == "" {
+		rootPath = "/"
+	}
+	return &Filesystem{store: st, remote: r, ttl: time.Minute, primaryGID: primary, gids: out, rootPath: rootPath}
 }
 
 func (f *Filesystem) OnAdd(ctx context.Context) {
@@ -67,7 +72,7 @@ func (f *Filesystem) Readdir(ctx context.Context) (goFs.DirStream, syscall.Errno
 	if f == nil || f.store == nil {
 		return goFs.NewListDirStream(nil), 0
 	}
-	children, err := f.store.ListChildren("/")
+	children, err := f.store.ListChildren(f.rootPath)
 	if err != nil {
 		return nil, syscall.EIO
 	}
@@ -75,7 +80,7 @@ func (f *Filesystem) Readdir(ctx context.Context) (goFs.DirStream, syscall.Errno
 		if err := f.refreshRoot(ctx); err != nil {
 			return nil, syscall.EIO
 		}
-		children, err = f.store.ListChildren("/")
+		children, err = f.store.ListChildren(f.rootPath)
 		if err != nil {
 			return nil, syscall.EIO
 		}
@@ -87,19 +92,19 @@ func (f *Filesystem) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	if f == nil || f.store == nil {
 		return nil, syscall.ENOENT
 	}
-	if f.negative != nil && f.negative.IsMissing("/"+name) {
+	if f.negative != nil && f.negative.IsMissing(JoinPath(f.rootPath, name)) {
 		return nil, syscall.ENOENT
 	}
-	children, err := f.store.ListChildren("/")
+	children, err := f.store.ListChildren(f.rootPath)
 	if err != nil {
 		return nil, syscall.EIO
 	}
 	if f.shouldRefreshRoot(children) {
 		if err := f.refreshRoot(ctx); err != nil {
-			f.markMissing("/" + name)
+			f.markMissing(JoinPath(f.rootPath, name))
 			return nil, syscall.ENOENT
 		}
-		children, err = f.store.ListChildren("/")
+		children, err = f.store.ListChildren(f.rootPath)
 		if err != nil {
 			return nil, syscall.EIO
 		}
@@ -110,7 +115,7 @@ func (f *Filesystem) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		}
 		return f.newEntryInode(ctx, child, out), 0
 	}
-	f.markMissing("/" + name)
+	f.markMissing(JoinPath(f.rootPath, name))
 	return nil, syscall.ENOENT
 }
 
@@ -118,27 +123,34 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 	if f == nil || f.store == nil || f.remote == nil {
 		return nil
 	}
-	entries, err := f.remote.List("/")
+	entries, err := f.remote.List(f.rootPath)
 	if err != nil {
 		return err
 	}
-	log.Printf("refresh root loaded %d entries", len(entries))
+	log.Printf("refresh root %q loaded %d entries", f.rootPath, len(entries))
 	if len(entries) == 0 {
-		f.markMissing("/")
+		f.markMissing(f.rootPath)
 		return nil
 	}
 	mapped := make([]store.Entry, 0, len(entries))
 	for _, entry := range entries {
+		relPath := trimRootPrefix(f.rootPath, entry.Path)
+		if relPath == "" {
+			relPath = entry.ServerName
+		}
+		if relPath != "" && !strings.HasPrefix(relPath, "/") {
+			relPath = "/" + relPath
+		}
 		mapped = append(mapped, store.Entry{
-			FSID:      entry.FSID,
-			Parent:    "0",
-			Path:      entry.Path,
-			Name:      entry.ServerName,
-			Size:      entry.Size,
-			IsDir:     entry.IsDir,
-			MTM:       entry.ServerMTime,
-			MD5:       entry.MD5,
-			ExpiresAt: time.Now().Add(f.ttl).Unix(),
+			FSID:       entry.FSID,
+			Parent:     "0",
+			Path:       path.Join(f.rootPath, relPath),
+			Name:       entry.ServerName,
+			Size:       entry.Size,
+			IsDir:      entry.IsDir,
+			MTM:        entry.ServerMTime,
+			MD5:        entry.MD5,
+			ExpiresAt:  time.Now().Add(f.ttl).Unix(),
 			LastSyncAt: time.Now().Unix(),
 		})
 	}
@@ -148,11 +160,11 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 	return f.store.UpsertEntry(store.Entry{
 		FSID:       "0",
 		Parent:     "",
-		Path:       "/",
+		Path:       f.rootPath,
 		Name:       "",
 		IsDir:      true,
-		LastSyncAt:  time.Now().Unix(),
-		ExpiresAt:   time.Now().Add(f.ttl).Unix(),
+		LastSyncAt: time.Now().Unix(),
+		ExpiresAt:  time.Now().Add(f.ttl).Unix(),
 	})
 }
 
@@ -164,7 +176,7 @@ func (f *Filesystem) RefreshAll(ctx context.Context) error {
 		return err
 	}
 	visited := make(map[string]struct{})
-	return f.refreshKnownDirectories(ctx, "/", visited)
+	return f.refreshKnownDirectories(ctx, f.rootPath, visited)
 }
 
 func (f *Filesystem) refreshKnownDirectories(ctx context.Context, current string, visited map[string]struct{}) error {
@@ -199,7 +211,7 @@ func (f *Filesystem) populate(ctx context.Context) {
 	if f == nil || f.store == nil {
 		return
 	}
-	entries, _ := f.store.ListChildren("/")
+	entries, _ := f.store.ListChildren(f.rootPath)
 	for _, e := range entries {
 		f.addEntry(ctx, e)
 	}
@@ -373,8 +385,8 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 			IsDir:      entry.IsDir,
 			MTM:        entry.ServerMTime,
 			MD5:        entry.MD5,
-			ExpiresAt:   time.Now().Add(f.ttl).Unix(),
-			LastSyncAt:  time.Now().Unix(),
+			ExpiresAt:  time.Now().Add(f.ttl).Unix(),
+			LastSyncAt: time.Now().Unix(),
 		})
 	}
 	if err := f.store.ReplaceChildren(fsid, mapped); err != nil {
@@ -429,7 +441,7 @@ func (n *entryNode) Open(ctx context.Context, openFlags uint32) (fh goFs.FileHan
 }
 
 func (f *Filesystem) shouldRefreshRoot(children []store.Entry) bool {
-	return f.shouldRefresh("/", children)
+	return f.shouldRefresh(f.rootPath, children)
 }
 
 func (f *Filesystem) shouldRefreshDir(path string, children []store.Entry) bool {
@@ -444,7 +456,7 @@ func (f *Filesystem) shouldRefresh(path string, children []store.Entry) bool {
 		return true
 	}
 	if path == "" {
-		path = "/"
+		path = f.rootPath
 	}
 	current, err := f.store.GetByPath(path)
 	if err != nil || current == nil {
@@ -457,6 +469,19 @@ func (f *Filesystem) shouldRefresh(path string, children []store.Entry) bool {
 		return true
 	}
 	return false
+}
+
+func trimRootPrefix(rootPath, fullPath string) string {
+	if rootPath == "" || rootPath == "/" {
+		return fullPath
+	}
+	if fullPath == rootPath {
+		return ""
+	}
+	if strings.HasPrefix(fullPath, rootPath+"/") {
+		return strings.TrimPrefix(fullPath, rootPath)
+	}
+	return fullPath
 }
 
 type MountOptions struct {

@@ -18,6 +18,7 @@ make check
 ## 环境变量
 
 - `BAIDUDISKLINK_MOUNT_PATH`
+- `BAIDUDISKLINK_REMOTE_ROOT_PATH`
 - `BAIDUDISKLINK_TOKEN_PATH`
 - `BAIDUDISKLINK_META_DB_PATH`
 - `BAIDUDISKLINK_CLIENT_ID`
@@ -67,9 +68,12 @@ make check
    # 默认 ./mnt 表示项目根目录下的 mnt 目录。
    # 推荐新建一个 DSM 共享目录作为挂载出口，不要和项目源码目录混在一起。
    BAIDUDISKLINK_HOST_MOUNT_PATH=/volume1/video/BaiduDiskLink
+   # 百度网盘里的入口目录。默认 /Videos，本地挂载根目录会直接显示 /Videos 下面的内容。
+   # 如果想挂载整个百度网盘，可以改成 /
+   BAIDUDISKLINK_REMOTE_ROOT_PATH=/Videos
    ```
 
-   这个变量必须通过 `docker-compose.yml` 传进容器才会生效，已经在仓库里配好。
+   这些变量必须通过 `docker-compose.yml` 传进容器才会生效，已经在仓库里配好。
 
 4. 在百度开放平台应用后台，把授权回调地址配置成同一个地址：
 
@@ -151,6 +155,7 @@ docker-compose up -d
 
 容器默认开启 `/dev/fuse`，并暴露 OAuth 回调端口 `8765`。容器内挂载点是 `/mnt/baidu`，元数据与 token 保存在 `/data`。
 `BAIDUDISKLINK_HOST_MOUNT_PATH` 是宿主机侧的挂载点路径，不是源码目录；默认值 `./mnt` 代表项目根目录下的 `mnt/`。它会采用 `rshared` 传播。DSM 上强烈建议新建一个普通共享目录，例如 `/volume1/video/BaiduDiskLink`，专门拿来做挂载出口，不要放在 `/volume1/@docker` 下面给 Emby 读，也不要和项目源码目录混用。你这次遇到的情况也说明了这一点：非共享目录即使 Linux 权限看着没问题，DSM 套件用户也可能还是访问不到。
+`BAIDUDISKLINK_REMOTE_ROOT_PATH` 是百度网盘侧的入口目录，默认是 `/Videos`。本地挂载根目录会直接显示这个目录下面的内容，所以 Emby 看到的是 `/volume1/video/BaiduDiskLink/TV`、`/volume1/video/BaiduDiskLink/Movie` 这种结构，而不是再多一层 `Videos`。如果你确实想暴露整个百度网盘，把它设成 `/` 即可。
 
 DSM 场景建议：
 
@@ -180,7 +185,7 @@ bash scripts/dsm-verify.sh
 如果失败，脚本退出时也会打印 `DSM verification summary` 和失败项列表，再看输出里最后一个 `checking:` 项即可定位卡在哪一步。
 文件读取探针默认超时是 `20s`，可通过 `BAIDUDISKLINK_VERIFY_READ_TIMEOUT` 调整。
 
-目录会在挂载后先做一次全量刷新，之后每 1 分钟后台再刷新一轮已知目录树；你手工浏览目录时也会按需再刷新一次。百度网盘里对目录做重命名、删除或新增后，通常最晚 1 分钟左右会在本地反映出来。
+目录会在挂载后先刷新 `BAIDUDISKLINK_REMOTE_ROOT_PATH` 指向的百度目录，之后每 1 分钟后台再刷新一轮该入口下的已知目录树；你手工浏览目录时也会按需再刷新一次。百度网盘里对目录做重命名、删除或新增后，通常最晚 1 分钟左右会在本地反映出来。
 
 ### 给 Emby 开放读取
 

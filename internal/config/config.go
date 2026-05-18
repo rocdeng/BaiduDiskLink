@@ -4,6 +4,7 @@ import "os"
 
 type Config struct {
 	MountPath        string
+	RemoteRootPath   string
 	TokenPath        string
 	MetaDBPath       string
 	FuseGroupName    string
@@ -21,6 +22,7 @@ type Config struct {
 func Load() Config {
 	return Config{
 		MountPath:        os.Getenv("BAIDUDISKLINK_MOUNT_PATH"),
+		RemoteRootPath:   os.Getenv("BAIDUDISKLINK_REMOTE_ROOT_PATH"),
 		TokenPath:        os.Getenv("BAIDUDISKLINK_TOKEN_PATH"),
 		MetaDBPath:       os.Getenv("BAIDUDISKLINK_META_DB_PATH"),
 		FuseGroupName:    os.Getenv("BAIDUDISKLINK_FUSE_GROUP_NAME"),

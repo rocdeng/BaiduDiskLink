@@ -139,6 +139,32 @@ func TestNewAppExpiresRootOnStartup(t *testing.T) {
 	}
 }
 
+func TestNewAppDefaultsAndNormalizesRemoteRootPath(t *testing.T) {
+	root := t.TempDir()
+	a, err := New(Config{
+		MountPath:      root + "/mount",
+		TokenPath:      root + "/token.json",
+		MetaDBPath:     root + "/meta.db",
+		ClientID:       "client",
+		ClientSecret:   "secret",
+		RedirectURI:    "http://127.0.0.1:8765/callback",
+		RemoteRootPath: "Videos/",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.cfg.RemoteRootPath != "/Videos" {
+		t.Fatalf("expected normalized remote root, got %q", a.cfg.RemoteRootPath)
+	}
+	entry, err := a.store.GetByPath("/Videos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry != nil && entry.ExpiresAt != 0 {
+		t.Fatalf("expected configured remote root to be expired on startup, got %#v", entry)
+	}
+}
+
 func TestNewAppWiresRemoteReader(t *testing.T) {
 	a, err := New(Config{
 		MountPath:   "/tmp/mount",

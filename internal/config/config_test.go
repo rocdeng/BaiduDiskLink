@@ -4,6 +4,7 @@ import "testing"
 
 func TestLoadReadsEnvironment(t *testing.T) {
 	t.Setenv("BAIDUDISKLINK_MOUNT_PATH", "/mnt")
+	t.Setenv("BAIDUDISKLINK_REMOTE_ROOT_PATH", "/Videos")
 	t.Setenv("BAIDUDISKLINK_TOKEN_PATH", "/token.json")
 	t.Setenv("BAIDUDISKLINK_META_DB_PATH", "/meta.db")
 	t.Setenv("BAIDUDISKLINK_FUSE_GROUP_NAME", "embysvr,media")
@@ -16,14 +17,14 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	t.Setenv("BAIDUDISKLINK_API_BASE_URL", "https://api.example.invalid")
 
 	got := Load()
-	if got.MountPath != "/mnt" || got.TokenPath != "/token.json" || got.FuseGroupName != "embysvr,media" || got.APIBaseURL != "https://api.example.invalid" {
+	if got.MountPath != "/mnt" || got.RemoteRootPath != "/Videos" || got.TokenPath != "/token.json" || got.FuseGroupName != "embysvr,media" || got.APIBaseURL != "https://api.example.invalid" {
 		t.Fatalf("unexpected config: %#v", got)
 	}
 }
 
 func TestLoadLeavesUnsetValuesEmpty(t *testing.T) {
 	got := Load()
-	if got.MountPath != "" || got.TokenPath != "" || got.RedirectURI != "" {
+	if got.MountPath != "" || got.RemoteRootPath != "" || got.TokenPath != "" || got.RedirectURI != "" {
 		t.Fatalf("expected empty config by default: %#v", got)
 	}
 }

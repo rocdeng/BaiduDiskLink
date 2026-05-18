@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/user"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 
 type Config struct {
 	MountPath        string
+	RemoteRootPath   string
 	TokenPath        string
 	MetaDBPath       string
 	FuseGroupName    string
@@ -85,6 +87,10 @@ func New(cfg Config) (*App, error) {
 	if cfg.MountPath == "" {
 		return nil, errors.New("mount path is required")
 	}
+	if cfg.RemoteRootPath == "" {
+		cfg.RemoteRootPath = "/Videos"
+	}
+	cfg.RemoteRootPath = normalizeRemoteRootPath(cfg.RemoteRootPath)
 	if cfg.TokenPath == "" {
 		return nil, errors.New("token path is required")
 	}
@@ -119,6 +125,9 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 	if err := metaStore.ExpirePath("/"); err != nil {
+		return nil, err
+	}
+	if err := metaStore.ExpirePath(cfg.RemoteRootPath); err != nil {
 		return nil, err
 	}
 	fuseGIDs, err := resolveFuseGroupGIDs(cfg.FuseGroupName)
@@ -162,6 +171,17 @@ func New(cfg Config) (*App, error) {
 			}, nil
 		},
 	}, nil
+}
+
+func normalizeRemoteRootPath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(value, "/") {
+		value = "/" + value
+	}
+	return path.Clean(value)
 }
 
 func resolveFuseGroupGIDs(name string) ([]uint32, error) {
@@ -232,7 +252,7 @@ func (a *App) Run() error {
 	if err := a.bindRemoteClient(); err != nil {
 		return err
 	}
-	a.filesystem = fs.NewFilesystem(a.store, a.remote, a.fuseGIDs)
+	a.filesystem = fs.NewFilesystem(a.store, a.remote, a.fuseGIDs, a.cfg.RemoteRootPath)
 	server, err := a.mountFunc(a.cfg.MountPath, a.filesystem)
 	if err != nil {
 		return err

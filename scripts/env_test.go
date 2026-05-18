@@ -20,6 +20,7 @@ func TestEnvExampleCoversRequiredDeploymentVariables(t *testing.T) {
 		"BAIDUDISKLINK_CLIENT_ID",
 		"BAIDUDISKLINK_CLIENT_SECRET",
 		"BAIDUDISKLINK_REDIRECT_URI",
+		"BAIDUDISKLINK_REMOTE_ROOT_PATH",
 		"BAIDUDISKLINK_OAUTH_LISTEN_ADDR",
 	} {
 		if !strings.Contains(string(envData), want) {

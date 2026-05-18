@@ -58,7 +58,7 @@ func TestRefreshRootLoadsRemoteEntriesIntoStore(t *testing.T) {
 			"/": {{FSID: "1", ServerName: "movies", Path: "/movies", IsDir: true}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader, nil)
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
 	if err := fs.refreshRoot(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +68,36 @@ func TestRefreshRootLoadsRemoteEntriesIntoStore(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != "movies" {
 		t.Fatalf("unexpected refresh result: %#v", got)
+	}
+}
+
+func TestRefreshRootUsesConfiguredRemoteRootAsLocalRoot(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/Videos": {{FSID: "2", ServerName: "TV", Path: "/Videos/TV", IsDir: true}},
+		},
+	})
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/Videos")
+	if err := fs.refreshRoot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dbStore.ListChildren("/Videos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "TV" || got[0].Path != "/Videos/TV" {
+		t.Fatalf("unexpected configured root result: %#v", got)
+	}
+	localRoot, err := dbStore.GetByPath("/Videos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if localRoot == nil || !localRoot.IsDir {
+		t.Fatalf("expected configured remote root to be stored as local root, got %#v", localRoot)
 	}
 }
 
@@ -93,7 +123,7 @@ func TestRefreshDirLoadsNestedEntries(t *testing.T) {
 			"/movies": {{FSID: "2", ServerName: "test.mkv", Path: "/movies/test.mkv", Size: 9, IsDir: false}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader, nil)
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
 	if err := fs.refreshDir(context.Background(), "/movies", "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +167,7 @@ func TestRefreshDirLoadsNewFileIntoExistingDirectory(t *testing.T) {
 			"/Videos/TV": {{FSID: "3", ServerName: "new.mkv", Path: "/Videos/TV/new.mkv", Size: 10, IsDir: false}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader, nil)
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
 	if err := fs.refreshDir(context.Background(), "/Videos/TV", "2"); err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +212,7 @@ func TestRefreshDirReplacesExistingChildren(t *testing.T) {
 			"/movies": {{FSID: "3", ServerName: "new.mkv", Path: "/movies/new.mkv", Size: 10, IsDir: false}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader, nil)
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
 	if err := fs.refreshDir(context.Background(), "/movies", "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +247,7 @@ func TestRefreshDirPreservesParentRelation(t *testing.T) {
 			"/Videos": {{FSID: "2", ServerName: "Movie", Path: "/Videos/Movie", IsDir: true}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader, nil)
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
 	if err := fs.refreshDir(context.Background(), "/Videos", "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -258,12 +288,12 @@ func TestRefreshAllRefreshesKnownDirectoryTree(t *testing.T) {
 	}
 	remoteReader := remote.NewReader(&baidu.StaticClient{
 		Entries: map[string][]baidu.RemoteEntry{
-			"/": {{FSID: "1", ServerName: "Videos", Path: "/Videos", IsDir: true}},
-			"/Videos": {{FSID: "2", ServerName: "TV", Path: "/Videos/TV", IsDir: true}},
+			"/":          {{FSID: "1", ServerName: "Videos", Path: "/Videos", IsDir: true}},
+			"/Videos":    {{FSID: "2", ServerName: "TV", Path: "/Videos/TV", IsDir: true}},
 			"/Videos/TV": {{FSID: "3", ServerName: "new.mkv", Path: "/Videos/TV/new.mkv", Size: 10, IsDir: false}},
 		},
 	})
-	fs := NewFilesystem(dbStore, remoteReader, nil)
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
 	if err := fs.RefreshAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +314,7 @@ func TestLookupUsesNegativeCacheForMissingEntries(t *testing.T) {
 	if err := dbStore.EnsureRoot(); err != nil {
 		t.Fatal(err)
 	}
-	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil)
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
 	fs.negative = cache.NewNegativeCache(30 * time.Second)
 	fs.markMissing("/missing")
 	if _, errno := fs.Lookup(context.Background(), "missing", nil); errno != syscall.ENOENT {
