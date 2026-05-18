@@ -11,6 +11,7 @@ import (
 	"baidudisklink/internal/cache"
 	"baidudisklink/internal/remote"
 	"baidudisklink/internal/store"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	_ "modernc.org/sqlite"
 )
 
@@ -352,6 +353,19 @@ func TestLookupUsesNegativeCacheForMissingEntries(t *testing.T) {
 	}
 	if !fs.negative.IsMissing("/missing") {
 		t.Fatal("expected missing entry to be cached")
+	}
+}
+
+func TestFillEntryOutUsesMtimeFromMetadata(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
+	var out fuse.EntryOut
+	fs.fillEntryOut(store.Entry{Size: 1024, MTM: 1710000000}, syscall.S_IFREG, &out)
+	if got := int64(out.Mtime); got != 1710000000 {
+		t.Fatalf("expected mtime from metadata, got %d", got)
 	}
 }
 

@@ -240,20 +240,32 @@ func (f *Filesystem) newEntryInode(ctx context.Context, e store.Entry, out *fuse
 		entry:      e,
 	}
 	if out != nil {
-		perm := f.fileMode()
-		if e.IsDir {
-			perm = f.dirMode()
-		}
-		out.Mode = mode | perm
-		out.Gid = f.primaryGID
-		t := inodeTime(e.MTM)
-		out.Mtime = uint64(t.Unix())
-		out.Atime = out.Mtime
-		out.Ctime = out.Mtime
-		out.Size = uint64(e.Size)
-		out.Blocks = 0
+		f.fillEntryOut(e, mode, out)
 	}
 	return f.NewPersistentInode(ctx, node, stable)
+}
+
+func (f *Filesystem) fillEntryOut(e store.Entry, mode uint32, out *fuse.EntryOut) {
+	if f == nil || out == nil {
+		return
+	}
+	perm := f.fileMode()
+	if e.IsDir {
+		perm = f.dirMode()
+	}
+	out.Mode = mode | perm
+	out.Gid = f.primaryGID
+	t := inodeTime(e.MTM)
+	out.Mtime = uint64(t.Unix())
+	out.Atime = out.Mtime
+	out.Ctime = out.Mtime
+	out.Size = uint64(e.Size)
+	if e.IsDir {
+		out.Size = 0
+		out.Blocks = 0
+		return
+	}
+	out.Blocks = (uint64(e.Size) + 511) / 512
 }
 
 func dirEntries(children []store.Entry) []fuse.DirEntry {
@@ -350,8 +362,7 @@ func (n *entryNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 		if child.IsDir {
 			mode = syscall.S_IFDIR
 		}
-		out.Mode = mode | 0755
-		out.Size = uint64(child.Size)
+		n.Filesystem.fillEntryOut(child, mode, out)
 		inode := n.NewPersistentInode(ctx, &entryNode{
 			Filesystem: n.Filesystem,
 			entry:      child,
