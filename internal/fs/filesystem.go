@@ -500,9 +500,12 @@ func Mount(mountPath string, root *Filesystem, opts MountOptions) (*fuse.Server,
 		return nil, errors.New("root filesystem is required")
 	}
 	timeout := time.Second
+	maxIO := 1 << 20
 	mountOpts := &goFs.Options{
 		MountOptions: fuse.MountOptions{
-			AllowOther: opts.AllowOther,
+			AllowOther:   opts.AllowOther,
+			MaxWrite:     maxIO,
+			MaxReadAhead: maxIO,
 		},
 		AttrTimeout:  &timeout,
 		EntryTimeout: &timeout,

@@ -3,6 +3,8 @@ package app
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -14,6 +16,35 @@ type BenchResult struct {
 	Bytes        int64
 	Elapsed      time.Duration
 	ThroughputMB float64
+}
+
+func BenchmarkLocalFile(localPath string, sampleSize int64) (BenchResult, error) {
+	if sampleSize <= 0 {
+		sampleSize = 16 * 1024 * 1024
+	}
+	file, err := os.Open(localPath)
+	if err != nil {
+		return BenchResult{}, err
+	}
+	defer file.Close()
+	start := time.Now()
+	data := make([]byte, sampleSize)
+	n, err := io.ReadFull(file, data)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return BenchResult{}, err
+	}
+	elapsed := time.Since(start)
+	bytesRead := int64(n)
+	throughput := 0.0
+	if elapsed > 0 {
+		throughput = float64(bytesRead) / elapsed.Seconds() / (1024 * 1024)
+	}
+	return BenchResult{
+		Path:         localPath,
+		Bytes:        bytesRead,
+		Elapsed:      elapsed,
+		ThroughputMB: throughput,
+	}, nil
 }
 
 func (a *App) BindRemoteClient() error {
@@ -165,6 +196,13 @@ func (a *App) resolveRemoteEntry(fullPath string) (entryInfo, error) {
 		}
 	}
 	return entryInfo{}, fmt.Errorf("path not found: %s", fullPath)
+}
+
+func (a *App) RemoteRootPath() string {
+	if a == nil {
+		return ""
+	}
+	return a.cfg.RemoteRootPath
 }
 
 type entryInfo struct {

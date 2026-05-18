@@ -62,3 +62,25 @@ func TestReadRangeCachesDownloadLinkAndRetries(t *testing.T) {
 		t.Fatalf("expected two read attempts, got %d", client.readCalls)
 	}
 }
+
+func TestReadRangePrefetchesAndReusesCachedWindow(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	got, err := r.ReadRange("fsid-1", 0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("expected 4 bytes, got %d", len(got))
+	}
+	got, err = r.ReadRange("fsid-1", 1024, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1024 {
+		t.Fatalf("expected 1024 bytes, got %d", len(got))
+	}
+	if client.readCalls != 1 {
+		t.Fatalf("expected one backend read due to prefetch cache, got %d", client.readCalls)
+	}
+}

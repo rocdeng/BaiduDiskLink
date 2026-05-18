@@ -15,6 +15,10 @@ func main() {
 		runBench(cfg, os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "bench-fuse" {
+		runBenchFuse(cfg, os.Args[2:])
+		return
+	}
 	application, err := app.New(app.Config(cfg))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -49,4 +53,20 @@ func runBench(cfg config.Config, args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("path: %s\nfsid: %s\nbytes: %d\nelapsed: %s\nthroughput: %.2f MiB/s\n", result.Path, result.FSID, result.Bytes, result.Elapsed, result.ThroughputMB)
+}
+
+func runBenchFuse(cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("bench-fuse", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	localPath := fs.String("path", cfg.MountPath+"/test.zip", "local mount path to benchmark")
+	sampleSize := fs.Int64("bytes", 16*1024*1024, "bytes to read for benchmark")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+	result, err := app.BenchmarkLocalFile(*localPath, *sampleSize)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("path: %s\nbytes: %d\nelapsed: %s\nthroughput: %.2f MiB/s\n", result.Path, result.Bytes, result.Elapsed, result.ThroughputMB)
 }

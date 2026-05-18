@@ -199,6 +199,14 @@ docker-compose run --rm baidudisklink bench --path /Videos/test.zip
 
 这个命令会复用 `data/token.json` 里的登录信息，按和挂载一致的方式去拿 `dlink` 并读取文件，然后输出读取字节数、耗时和平均速度。
 
+如果你想测挂载后的 FUSE 入口，就跑：
+
+```bash
+docker-compose run --rm baidudisklink bench-fuse --path /mnt/baidu/test.zip
+```
+
+这个命令直接读本地挂载目录里的同一个文件，能和 `bench` 对比出 FUSE 这层多消耗了多少。
+
 ### 给 Emby 开放读取
 
 如果你希望 DSM 上的 Emby 服务直接读取挂载目录，不想手工逐个加 ACL，推荐把 `BAIDUDISKLINK_FUSE_GROUP_NAME` 设成对应的 DSM 组 GID，多个就用逗号分隔，例如 `1024,1030`。

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -41,14 +42,14 @@ func TestBenchmarkUsesOfficialDlinkFlow(t *testing.T) {
 	a.remote.SetClient(&mockBenchClient{
 		list: map[string][]baidu.RemoteEntry{
 			"/Videos": {
-				{FSID: "1", ServerName: "test.zip", Path: "/Videos/test.zip", Size: 4},
+				{FSID: "1", ServerName: "test.zip", Path: "/Videos/test.zip", Size: 2 * 1024 * 1024},
 			},
 		},
 		read: func(fsid string, offset, length int64) ([]byte, error) {
-			if fsid != "1" || offset != 0 || length != 4 {
+			if fsid != "1" || offset != 0 || length != 1024*1024 {
 				t.Fatalf("unexpected read args: %s %d %d", fsid, offset, length)
 			}
-			return []byte("abcd"), nil
+			return []byte(strings.Repeat("a", 1024*1024)), nil
 		},
 	})
 	result, err := a.Benchmark("/Videos/test.zip", 4)
@@ -57,6 +58,20 @@ func TestBenchmarkUsesOfficialDlinkFlow(t *testing.T) {
 	}
 	if result.Bytes != 4 || result.ThroughputMB <= 0 {
 		t.Fatalf("unexpected benchmark result: %#v", result)
+	}
+}
+
+func TestBenchmarkLocalFileReadsRequestedBytes(t *testing.T) {
+	path := t.TempDir() + "/test.zip"
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", 2*1024*1024)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := BenchmarkLocalFile(path, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Bytes != 1024*1024 {
+		t.Fatalf("unexpected local benchmark result: %#v", result)
 	}
 }
 
