@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"baidudisklink/internal/auth"
 	"baidudisklink/internal/baidu"
@@ -47,6 +48,7 @@ type App struct {
 	oauth           oauthFlow
 	tokenHTTPClient *http.Client
 	clientFactory   func(auth.Token) baidu.Client
+	filesystem      *fs.Filesystem
 	mountFunc       func(string, *fs.Filesystem) (*fakeMountServer, error)
 	server          interface {
 		Wait()
@@ -230,16 +232,40 @@ func (a *App) Run() error {
 	if err := a.bindRemoteClient(); err != nil {
 		return err
 	}
-	server, err := a.mountFunc(a.cfg.MountPath, fs.NewFilesystem(a.store, a.remote, a.fuseGIDs))
+	a.filesystem = fs.NewFilesystem(a.store, a.remote, a.fuseGIDs)
+	server, err := a.mountFunc(a.cfg.MountPath, a.filesystem)
 	if err != nil {
 		return err
 	}
+	stopRefresh := make(chan struct{})
+	defer close(stopRefresh)
+	a.startRefreshLoop(stopRefresh)
 	a.server = server
 	defer func() {
 		_ = a.server.Unmount()
 	}()
 	a.server.Wait()
 	return nil
+}
+
+func (a *App) startRefreshLoop(stop <-chan struct{}) {
+	if a == nil || a.filesystem == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := a.filesystem.RefreshAll(context.Background()); err != nil {
+					log.Printf("periodic refresh failed: %v", err)
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
 }
 
 func (a *App) saveOAuthToken(code string) error {

@@ -44,6 +44,9 @@ func (f *Filesystem) OnAdd(ctx context.Context) {
 		return
 	}
 	f.populate(ctx)
+	if err := f.RefreshAll(ctx); err != nil {
+		log.Printf("refresh all on mount failed: %v", err)
+	}
 }
 
 func (f *Filesystem) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -151,6 +154,45 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 		LastSyncAt:  time.Now().Unix(),
 		ExpiresAt:   time.Now().Add(f.ttl).Unix(),
 	})
+}
+
+func (f *Filesystem) RefreshAll(ctx context.Context) error {
+	if f == nil || f.store == nil || f.remote == nil {
+		return nil
+	}
+	if err := f.refreshRoot(ctx); err != nil {
+		return err
+	}
+	visited := make(map[string]struct{})
+	return f.refreshKnownDirectories(ctx, "/", visited)
+}
+
+func (f *Filesystem) refreshKnownDirectories(ctx context.Context, current string, visited map[string]struct{}) error {
+	if f == nil || f.store == nil || visited == nil {
+		return nil
+	}
+	if _, ok := visited[current]; ok {
+		return nil
+	}
+	visited[current] = struct{}{}
+	children, err := f.store.ListChildren(current)
+	if err != nil {
+		return err
+	}
+	for _, child := range children {
+		if !child.IsDir {
+			continue
+		}
+		if f.remote != nil {
+			if err := f.refreshDir(ctx, child.Path, child.FSID); err != nil {
+				return err
+			}
+		}
+		if err := f.refreshKnownDirectories(ctx, child.Path, visited); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (f *Filesystem) populate(ctx context.Context) {
@@ -399,9 +441,6 @@ func (f *Filesystem) shouldRefresh(path string, children []store.Entry) bool {
 		return false
 	}
 	if f.ttl <= 0 {
-		return true
-	}
-	if len(children) == 0 {
 		return true
 	}
 	if path == "" {

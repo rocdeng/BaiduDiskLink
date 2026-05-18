@@ -106,6 +106,50 @@ func TestRefreshDirLoadsNestedEntries(t *testing.T) {
 	}
 }
 
+func TestRefreshDirLoadsNewFileIntoExistingDirectory(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{
+		FSID:   "1",
+		Parent: "0",
+		Path:   "/Videos",
+		Name:   "Videos",
+		IsDir:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{
+		FSID:   "2",
+		Parent: "1",
+		Path:   "/Videos/TV",
+		Name:   "TV",
+		IsDir:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/Videos/TV": {{FSID: "3", ServerName: "new.mkv", Path: "/Videos/TV/new.mkv", Size: 10, IsDir: false}},
+		},
+	})
+	fs := NewFilesystem(dbStore, remoteReader, nil)
+	if err := fs.refreshDir(context.Background(), "/Videos/TV", "2"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dbStore.ListChildren("/Videos/TV")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "new.mkv" {
+		t.Fatalf("expected new file to appear in existing directory, got %#v", got)
+	}
+}
+
 func TestRefreshDirReplacesExistingChildren(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {
@@ -183,6 +227,52 @@ func TestRefreshDirPreservesParentRelation(t *testing.T) {
 	}
 	if len(rootChildren) != 1 || rootChildren[0].Name != "Videos" {
 		t.Fatalf("expected Videos to remain under root, got %#v", rootChildren)
+	}
+}
+
+func TestRefreshAllRefreshesKnownDirectoryTree(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{
+		FSID:   "1",
+		Parent: "0",
+		Path:   "/Videos",
+		Name:   "Videos",
+		IsDir:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{
+		FSID:   "2",
+		Parent: "1",
+		Path:   "/Videos/TV",
+		Name:   "TV",
+		IsDir:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/": {{FSID: "1", ServerName: "Videos", Path: "/Videos", IsDir: true}},
+			"/Videos": {{FSID: "2", ServerName: "TV", Path: "/Videos/TV", IsDir: true}},
+			"/Videos/TV": {{FSID: "3", ServerName: "new.mkv", Path: "/Videos/TV/new.mkv", Size: 10, IsDir: false}},
+		},
+	})
+	fs := NewFilesystem(dbStore, remoteReader, nil)
+	if err := fs.RefreshAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dbStore.ListChildren("/Videos/TV")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "new.mkv" {
+		t.Fatalf("expected deep refresh to load new file, got %#v", got)
 	}
 }
 
