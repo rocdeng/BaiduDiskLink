@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const benchmarkDefaultSampleSize int64 = 200 * 1024 * 1024
+
 type BenchResult struct {
 	Path         string
 	FSID         string
@@ -20,7 +22,7 @@ type BenchResult struct {
 
 func BenchmarkLocalFile(localPath string, sampleSize int64) (BenchResult, error) {
 	if sampleSize <= 0 {
-		sampleSize = 16 * 1024 * 1024
+		sampleSize = benchmarkDefaultSampleSize
 	}
 	file, err := os.Open(localPath)
 	if err != nil {
@@ -59,7 +61,7 @@ func (a *App) Benchmark(remotePath string, sampleSize int64) (BenchResult, error
 		return BenchResult{}, errors.New("remote reader is required")
 	}
 	if sampleSize <= 0 {
-		sampleSize = 16 * 1024 * 1024
+		sampleSize = benchmarkDefaultSampleSize
 	}
 	fullPath := a.benchmarkRemotePath(remotePath)
 	entry, err := a.resolveRemoteEntry(fullPath)

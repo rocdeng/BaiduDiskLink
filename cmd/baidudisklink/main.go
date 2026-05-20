@@ -34,7 +34,7 @@ func runBench(cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	remotePath := fs.String("path", "/Videos/test.zip", "remote path to benchmark")
-	sampleSize := fs.Int64("bytes", 16*1024*1024, "bytes to read for benchmark")
+	sampleSize := fs.Int64("bytes", 200*1024*1024, "bytes to read for benchmark")
 	concurrency := fs.Int("concurrency", cfg.DownloadConcurrency, "parallel chunk reads")
 	chunkSize := fs.Int64("chunk-size", cfg.DownloadChunkSize, "chunk size for each read")
 	if err := fs.Parse(args); err != nil {
@@ -62,7 +62,7 @@ func runBenchFuse(cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("bench-fuse", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	localPath := fs.String("path", cfg.MountPath+"/test.zip", "local mount path to benchmark")
-	sampleSize := fs.Int64("bytes", 16*1024*1024, "bytes to read for benchmark")
+	sampleSize := fs.Int64("bytes", 200*1024*1024, "bytes to read for benchmark")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}

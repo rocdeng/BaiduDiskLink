@@ -229,6 +229,8 @@ BAIDUDISKLINK_VERIFY_READ_TIMEOUT=60s bash scripts/dsm-verify.sh
 docker-compose exec baidudisklink baidudisklink bench --path /Videos/test.zip
 ```
 
+默认读取 200MiB，适合更稳定地观察真实吞吐。
+
 可以临时覆盖并发和分块大小：
 
 ```bash
