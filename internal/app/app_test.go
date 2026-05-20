@@ -530,7 +530,7 @@ func TestReplayableEndToEndPath(t *testing.T) {
 				body := `{"info":[{"fs_id":1,"server_filename":"movie.mkv","path":"/movies/movie.mkv","size":10,"isdir":0,"dlink":"https://download.example.invalid/file"}],"errno":0}`
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 			case strings.Contains(r.URL.String(), "download.example.invalid"):
-				return &http.Response{StatusCode: 206, Body: io.NopCloser(bytes.NewBufferString("abc")), Header: make(http.Header)}, nil
+				return &http.Response{StatusCode: 206, Body: io.NopCloser(bytes.NewBufferString("xabc")), Header: make(http.Header)}, nil
 			default:
 				t.Fatalf("unexpected request: %s", r.URL.String())
 				return nil, nil

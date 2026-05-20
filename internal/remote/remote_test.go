@@ -2,6 +2,7 @@ package remote
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,8 +10,11 @@ import (
 )
 
 type stubClient struct {
+	mu            sync.Mutex
 	downloadCalls int
 	readCalls     int
+	readStarted   chan struct{}
+	readRelease   chan struct{}
 	failRead      bool
 }
 
@@ -21,7 +25,18 @@ func (s *stubClient) GetDownloadLink(fsid string) (baidu.DownloadLink, error) {
 	return baidu.DownloadLink{URL: "https://example.invalid/" + fsid, ExpiresAt: time.Now().Add(time.Minute)}, nil
 }
 func (s *stubClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
+	s.mu.Lock()
 	s.readCalls++
+	if s.readStarted != nil {
+		select {
+		case s.readStarted <- struct{}{}:
+		default:
+		}
+	}
+	s.mu.Unlock()
+	if s.readRelease != nil {
+		<-s.readRelease
+	}
 	if s.failRead {
 		return nil, errors.New("transient read failure")
 	}
@@ -82,5 +97,63 @@ func TestReadRangePrefetchesAndReusesCachedWindow(t *testing.T) {
 	}
 	if client.readCalls != 1 {
 		t.Fatalf("expected one backend read due to prefetch cache, got %d", client.readCalls)
+	}
+}
+
+func TestReadRangeAlignsPrefetchWindow(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	got, err := r.ReadRange("fsid-1", 1024, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1024 {
+		t.Fatalf("expected 1024 bytes, got %d", len(got))
+	}
+	got, err = r.ReadRange("fsid-1", 2048, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1024 {
+		t.Fatalf("expected 1024 bytes, got %d", len(got))
+	}
+	client.mu.Lock()
+	readCalls := client.readCalls
+	client.mu.Unlock()
+	if readCalls != 1 {
+		t.Fatalf("expected aligned prefetch cache to reuse one backend read, got %d", readCalls)
+	}
+}
+
+func TestReadRangeCoalescesInflightWindow(t *testing.T) {
+	client := &stubClient{
+		readStarted: make(chan struct{}, 2),
+		readRelease: make(chan struct{}),
+	}
+	r := NewReader(client)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := r.ReadRange("fsid-1", 0, 1024)
+		firstDone <- err
+	}()
+	<-client.readStarted
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := r.ReadRange("fsid-1", 2048, 1024)
+		secondDone <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(client.readRelease)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	readCalls := client.readCalls
+	client.mu.Unlock()
+	if readCalls != 1 {
+		t.Fatalf("expected concurrent reads in one window to share one backend read, got %d", readCalls)
 	}
 }
