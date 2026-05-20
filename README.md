@@ -77,7 +77,15 @@ BAIDUDISKLINK_REMOTE_ROOT_PATH=/Videos
 
 # 可选：允许指定 DSM 组读取挂载内容。推荐填数字 GID，多个用逗号分隔。
 BAIDUDISKLINK_FUSE_GROUP_NAME=101
+
+# 可选：百度直链读取并发数。默认 1。
+BAIDUDISKLINK_DOWNLOAD_CONCURRENCY=1
+
+# 可选：每个分块读取大小。默认 4MiB。
+BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=4194304
 ```
+
+这两个参数建议先只在 `bench` 里试，确认效果稳定后再用于日常挂载。
 
 默认容器内路径由 `docker-compose.yml` 固定为：
 
@@ -219,6 +227,19 @@ BAIDUDISKLINK_VERIFY_READ_TIMEOUT=60s bash scripts/dsm-verify.sh
 
 ```bash
 docker-compose exec baidudisklink baidudisklink bench --path /Videos/test.zip
+```
+
+可以临时覆盖并发和分块大小：
+
+```bash
+docker-compose exec baidudisklink baidudisklink bench --path /Videos/test.zip --concurrency 4 --chunk-size 4194304
+```
+
+如果你想通过 `.env` 全局生效，也可以直接改：
+
+```dotenv
+BAIDUDISKLINK_DOWNLOAD_CONCURRENCY=4
+BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=4194304
 ```
 
 `bench-fuse` 测 FUSE 挂载后的实际读取速度：

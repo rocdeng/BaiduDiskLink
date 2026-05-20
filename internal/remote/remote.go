@@ -9,10 +9,12 @@ import (
 )
 
 type Reader struct {
-	mu     sync.RWMutex
-	client baidu.Client
-	links  map[string]cachedLink
-	cached cachedRead
+	mu          sync.RWMutex
+	client      baidu.Client
+	links       map[string]cachedLink
+	cached      cachedRead
+	concurrency int
+	chunkSize   int64
 }
 
 type cachedLink struct {
@@ -26,15 +28,32 @@ type cachedRead struct {
 	data   []byte
 }
 
-const (
-	prefetchBytes = 4 << 20
-)
+const prefetchBytes = 4 << 20
 
 func NewReader(client baidu.Client) *Reader {
 	return &Reader{
-		client: client,
-		links:  make(map[string]cachedLink),
+		client:      client,
+		links:       make(map[string]cachedLink),
+		concurrency: 1,
+		chunkSize:   4 << 20,
 	}
+}
+
+func (r *Reader) SetDownloadOptions(concurrency int, chunkSize int64) {
+	if r == nil {
+		return
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if chunkSize <= 0 {
+		chunkSize = 4 << 20
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.concurrency = concurrency
+	r.chunkSize = chunkSize
+	r.cached = cachedRead{}
 }
 
 func (r *Reader) SetClient(client baidu.Client) {
@@ -73,21 +92,7 @@ func (r *Reader) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
 	}
-	fetchLength := length
-	if fetchLength < prefetchBytes {
-		fetchLength = prefetchBytes
-	}
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		data, err := client.ReadRange(fsid, offset, fetchLength)
-		if err == nil {
-			r.storeCached(fsid, offset, data)
-			return sliceForRead(data, offset, length), nil
-		}
-		lastErr = err
-		_ = client.RefreshAuth()
-	}
-	return nil, lastErr
+	return r.readWithOptions(client, fsid, offset, length)
 }
 
 func (r *Reader) readCached(fsid string, offset, length int64) ([]byte, bool) {
@@ -126,6 +131,110 @@ func sliceForRead(data []byte, offset, length int64) []byte {
 		return data
 	}
 	return append([]byte(nil), data[:length]...)
+}
+
+func (r *Reader) readWithOptions(client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
+	r.mu.RLock()
+	concurrency := r.concurrency
+	chunkSize := r.chunkSize
+	r.mu.RUnlock()
+	if concurrency <= 1 {
+		return r.readSequential(client, fsid, offset, length, chunkSize)
+	}
+	return r.readConcurrent(client, fsid, offset, length, chunkSize, concurrency)
+}
+
+func (r *Reader) readSequential(client baidu.Client, fsid string, offset, length, chunkSize int64) ([]byte, error) {
+	fetchLength := length
+	if fetchLength < prefetchBytes {
+		fetchLength = prefetchBytes
+	}
+	if fetchLength < chunkSize {
+		fetchLength = chunkSize
+	}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		data, err := client.ReadRange(fsid, offset, fetchLength)
+		if err == nil {
+			r.storeCached(fsid, offset, data)
+			return sliceForRead(data, offset, length), nil
+		}
+		lastErr = err
+		_ = client.RefreshAuth()
+	}
+	return nil, lastErr
+}
+
+func (r *Reader) readConcurrent(client baidu.Client, fsid string, offset, length, chunkSize int64, concurrency int) ([]byte, error) {
+	if length <= 0 {
+		return []byte{}, nil
+	}
+	if chunkSize <= 0 {
+		chunkSize = 4 << 20
+	}
+	total := int((length + chunkSize - 1) / chunkSize)
+	if total <= 1 {
+		return r.readSequential(client, fsid, offset, length, chunkSize)
+	}
+	if concurrency > total {
+		concurrency = total
+	}
+	buf := make([]byte, length)
+	type result struct {
+		index int
+		data  []byte
+		err   error
+	}
+	jobs := make(chan int, total)
+	results := make(chan result, total)
+	for i := 0; i < total; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				start := offset + int64(index)*chunkSize
+				want := chunkSize
+				if remain := length - int64(index)*chunkSize; remain < want {
+					want = remain
+				}
+				var data []byte
+				var err error
+				for attempt := 0; attempt < 2; attempt++ {
+					data, err = client.ReadRange(fsid, start, want)
+					if err == nil {
+						break
+					}
+					_ = client.RefreshAuth()
+				}
+				results <- result{index: index, data: data, err: err}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	var firstErr error
+	for res := range results {
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+			continue
+		}
+		start := int64(res.index) * chunkSize
+		copy(buf[start:start+int64(len(res.data))], res.data)
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	r.storeCached(fsid, offset, buf)
+	return buf, nil
 }
 
 func (r *Reader) downloadLink(fsid string, client baidu.Client) (baidu.DownloadLink, error) {

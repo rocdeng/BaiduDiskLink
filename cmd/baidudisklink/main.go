@@ -35,6 +35,8 @@ func runBench(cfg config.Config, args []string) {
 	fs.SetOutput(os.Stderr)
 	remotePath := fs.String("path", "/Videos/test.zip", "remote path to benchmark")
 	sampleSize := fs.Int64("bytes", 16*1024*1024, "bytes to read for benchmark")
+	concurrency := fs.Int("concurrency", cfg.DownloadConcurrency, "parallel chunk reads")
+	chunkSize := fs.Int64("chunk-size", cfg.DownloadChunkSize, "chunk size for each read")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
@@ -43,6 +45,7 @@ func runBench(cfg config.Config, args []string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	application.Remote().SetDownloadOptions(*concurrency, *chunkSize)
 	if err := application.BindRemoteClient(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

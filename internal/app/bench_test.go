@@ -75,6 +75,25 @@ func TestBenchmarkLocalFileReadsRequestedBytes(t *testing.T) {
 	}
 }
 
+func TestBenchConcurrencyOptionsCanBeApplied(t *testing.T) {
+	a, err := New(Config{
+		MountPath:           t.TempDir() + "/mnt",
+		TokenPath:           t.TempDir() + "/token.json",
+		MetaDBPath:          t.TempDir() + "/meta.db",
+		ClientID:            "client",
+		ClientSecret:        "secret",
+		RedirectURI:         "http://127.0.0.1:8765/callback",
+		DownloadConcurrency: 4,
+		DownloadChunkSize:   4194304,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Remote() == nil {
+		t.Fatal("expected remote reader")
+	}
+}
+
 type mockBenchClient struct {
 	list map[string][]baidu.RemoteEntry
 	read func(fsid string, offset, length int64) ([]byte, error)

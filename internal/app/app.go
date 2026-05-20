@@ -25,20 +25,22 @@ import (
 )
 
 type Config struct {
-	MountPath        string
-	RemoteRootPath   string
-	TokenPath        string
-	MetaDBPath       string
-	FuseGroupName    string
-	ClientID         string
-	ClientSecret     string
-	RedirectURI      string
-	OAuthListenAddr  string
-	OAuthScope       string
-	OAuthState       string
-	AuthorizeBaseURL string
-	TokenBaseURL     string
-	APIBaseURL       string
+	MountPath           string
+	RemoteRootPath      string
+	TokenPath           string
+	MetaDBPath          string
+	FuseGroupName       string
+	DownloadConcurrency int
+	DownloadChunkSize   int64
+	ClientID            string
+	ClientSecret        string
+	RedirectURI         string
+	OAuthListenAddr     string
+	OAuthScope          string
+	OAuthState          string
+	AuthorizeBaseURL    string
+	TokenBaseURL        string
+	APIBaseURL          string
 }
 
 type App struct {
@@ -139,12 +141,15 @@ func New(cfg Config) (*App, error) {
 	}
 	tokenStore := auth.NewFileStore(cfg.TokenPath)
 	mgr := auth.NewManager(tokenStore)
+	remoteReader := remote.NewReader(&baidu.StaticClient{})
+	remoteReader.SetDownloadOptions(cfg.DownloadConcurrency, cfg.DownloadChunkSize)
+
 	return &App{
 		cfg:      cfg,
 		fuseGIDs: fuseGIDs,
 		auth:     mgr,
 		store:    metaStore,
-		remote:   remote.NewReader(&baidu.StaticClient{}),
+		remote:   remoteReader,
 		oauth: auth.NewOAuthServer(auth.OAuthConfig{
 			ClientID:         cfg.ClientID,
 			ClientSecret:     cfg.ClientSecret,
