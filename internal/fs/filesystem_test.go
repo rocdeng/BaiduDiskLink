@@ -3,6 +3,7 @@ package fs
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -115,6 +116,31 @@ func TestEntryReadUsesCachedWindowWhenAvailable(t *testing.T) {
 	}
 	if len(data) != 8 {
 		t.Fatalf("expected cached read to return requested length, got %d", len(data))
+	}
+}
+
+func TestEntryFileHandleReusesReadWindow(t *testing.T) {
+	client := &countingReadClient{}
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 16}
+	entry := store.Entry{
+		FSID: "1",
+		Path: "/movie.mkv",
+		Size: 64,
+	}
+	first, err := handle.read(context.Background(), remoteReader, entry, 0, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := handle.read(context.Background(), remoteReader, entry, 8, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 8 || len(second) != 8 {
+		t.Fatalf("unexpected read lengths: %d %d", len(first), len(second))
+	}
+	if client.reads != 1 {
+		t.Fatalf("expected one remote read for same handle window, got %d", client.reads)
 	}
 }
 
@@ -470,4 +496,29 @@ func testDB(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	return db
+}
+
+type countingReadClient struct {
+	reads int
+}
+
+func (c *countingReadClient) List(path string) ([]baidu.RemoteEntry, error) {
+	return nil, nil
+}
+
+func (c *countingReadClient) Stat(path string) (baidu.RemoteEntry, error) {
+	return baidu.RemoteEntry{}, nil
+}
+
+func (c *countingReadClient) GetDownloadLink(fsid string) (baidu.DownloadLink, error) {
+	return baidu.DownloadLink{}, nil
+}
+
+func (c *countingReadClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
+	c.reads++
+	return []byte(strings.Repeat("x", int(length))), nil
+}
+
+func (c *countingReadClient) RefreshAuth() error {
+	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,8 @@ type Filesystem struct {
 	rootPath   string
 	refreshMu  chan struct{}
 }
+
+const fuseReadWindowSize int64 = 16 << 20
 
 func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath string) *Filesystem {
 	out := make(map[uint32]struct{}, len(gids))
@@ -477,6 +480,14 @@ func (n *entryNode) Read(ctx context.Context, fh goFs.FileHandle, dest []byte, o
 	if n.entry.Size > 0 && off >= n.entry.Size {
 		return fuse.ReadResultData(nil), 0
 	}
+	if handle, ok := fh.(*entryFileHandle); ok {
+		data, err := handle.read(ctx, n.Filesystem.remote, n.entry, off, int64(len(dest)))
+		if err != nil {
+			log.Printf("fuse read failed path=%q fsid=%q offset=%d length=%d: %v", n.entry.Path, n.entry.FSID, off, len(dest), err)
+			return nil, syscall.EIO
+		}
+		return fuse.ReadResultData(data), 0
+	}
 	if n.entry.Size > 0 && len(dest) > 0 {
 		if data, ok := n.Filesystem.remote.ReadCachedWindow(n.entry.FSID, off, int64(len(dest))); ok {
 			return fuse.ReadResultData(data), 0
@@ -498,7 +509,7 @@ func (n *entryNode) Open(ctx context.Context, openFlags uint32) (fh goFs.FileHan
 	if n.entry.IsDir {
 		return nil, 0, syscall.EISDIR
 	}
-	return nil, fuse.FOPEN_KEEP_CACHE, 0
+	return &entryFileHandle{windowSize: fuseReadWindowSize}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 func (f *Filesystem) shouldRefreshRoot(children []store.Entry) bool {
@@ -600,4 +611,59 @@ func inodeTime(mtm int64) time.Time {
 		return time.Unix(mtm, 0)
 	}
 	return time.Now()
+}
+
+type entryFileHandle struct {
+	mu         sync.Mutex
+	window     []byte
+	windowOff  int64
+	windowSize int64
+}
+
+func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64) ([]byte, error) {
+	if h == nil || remote == nil {
+		return nil, nil
+	}
+	if length <= 0 {
+		return []byte{}, nil
+	}
+	if entry.Size > 0 && off >= entry.Size {
+		return []byte{}, nil
+	}
+	if h.windowSize <= 0 {
+		h.windowSize = fuseReadWindowSize
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.window) > 0 {
+		windowEnd := h.windowOff + int64(len(h.window))
+		if off >= h.windowOff && off+length <= windowEnd {
+			start := off - h.windowOff
+			end := start + length
+			return append([]byte(nil), h.window[start:end]...), nil
+		}
+	}
+	fetchOff := (off / h.windowSize) * h.windowSize
+	fetchLen := h.windowSize
+	if fetchLen < length {
+		fetchLen = length
+	}
+	if entry.Size > 0 && fetchOff+fetchLen > entry.Size {
+		fetchLen = entry.Size - fetchOff
+	}
+	data, err := remote.ReadRange(entry.FSID, fetchOff, fetchLen)
+	if err != nil {
+		return nil, err
+	}
+	h.windowOff = fetchOff
+	h.window = append(h.window[:0], data...)
+	if off < h.windowOff || off+length > h.windowOff+int64(len(h.window)) {
+		return []byte{}, nil
+	}
+	start := off - h.windowOff
+	end := start + length
+	if end > int64(len(h.window)) {
+		end = int64(len(h.window))
+	}
+	return append([]byte(nil), h.window[start:end]...), nil
 }
