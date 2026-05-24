@@ -27,6 +27,7 @@ type Filesystem struct {
 	primaryGID uint32
 	gids       map[uint32]struct{}
 	rootPath   string
+	refreshMu  chan struct{}
 }
 
 func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath string) *Filesystem {
@@ -41,7 +42,7 @@ func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath st
 	if rootPath == "" {
 		rootPath = "/"
 	}
-	return &Filesystem{store: st, remote: r, ttl: time.Minute, primaryGID: primary, gids: out, rootPath: rootPath}
+	return &Filesystem{store: st, remote: r, ttl: time.Minute, primaryGID: primary, gids: out, rootPath: rootPath, refreshMu: make(chan struct{}, 1)}
 }
 
 func (f *Filesystem) OnAdd(ctx context.Context) {
@@ -51,6 +52,28 @@ func (f *Filesystem) OnAdd(ctx context.Context) {
 	f.populate(ctx)
 	if err := f.RefreshAll(ctx); err != nil {
 		log.Printf("refresh all on mount failed: %v", err)
+	}
+}
+
+func (f *Filesystem) tryRefreshToken() bool {
+	if f == nil || f.refreshMu == nil {
+		return false
+	}
+	select {
+	case f.refreshMu <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (f *Filesystem) releaseRefreshToken() {
+	if f == nil || f.refreshMu == nil {
+		return
+	}
+	select {
+	case <-f.refreshMu:
+	default:
 	}
 }
 
@@ -174,6 +197,10 @@ func (f *Filesystem) RefreshAll(ctx context.Context) error {
 	if f == nil || f.store == nil || f.remote == nil {
 		return nil
 	}
+	if !f.tryRefreshToken() {
+		return nil
+	}
+	defer f.releaseRefreshToken()
 	if err := f.refreshRoot(ctx); err != nil {
 		return err
 	}
@@ -450,6 +477,11 @@ func (n *entryNode) Read(ctx context.Context, fh goFs.FileHandle, dest []byte, o
 	if n.entry.Size > 0 && off >= n.entry.Size {
 		return fuse.ReadResultData(nil), 0
 	}
+	if n.entry.Size > 0 && len(dest) > 0 {
+		if data, ok := n.Filesystem.remote.ReadCachedWindow(n.entry.FSID, off, int64(len(dest))); ok {
+			return fuse.ReadResultData(data), 0
+		}
+	}
 	data, err := n.Filesystem.remote.ReadRange(n.entry.FSID, off, int64(len(dest)))
 	if err != nil {
 		log.Printf("fuse read failed path=%q fsid=%q offset=%d length=%d: %v", n.entry.Path, n.entry.FSID, off, len(dest), err)
@@ -494,7 +526,7 @@ func (f *Filesystem) shouldRefresh(path string, children []store.Entry) bool {
 	if current.ExpiresAt == 0 {
 		return true
 	}
-	if time.Unix(current.ExpiresAt, 0).Before(time.Now()) {
+	if time.Until(time.Unix(current.ExpiresAt, 0)) <= 0 {
 		return true
 	}
 	return false

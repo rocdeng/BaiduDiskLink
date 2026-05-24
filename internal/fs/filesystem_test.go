@@ -79,6 +79,45 @@ func TestEntryReadPassesThroughRequestedLength(t *testing.T) {
 	}
 }
 
+func TestEntryReadUsesCachedWindowWhenAvailable(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	entry := store.Entry{
+		FSID:  "1",
+		Path:  "/movie.mkv",
+		Name:  "movie.mkv",
+		Size:  16,
+		IsDir: false,
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/": {{FSID: "1", ServerName: "movie.mkv", Path: "/movie.mkv", Size: 16}},
+		},
+	})
+	remoteReader.SetDownloadOptions(1, 16)
+	if _, err := remoteReader.ReadRange("1", 0, 16); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
+	node := &entryNode{Filesystem: fs, entry: entry}
+	got, errno := node.Read(context.Background(), nil, make([]byte, 8), 4)
+	if errno != 0 {
+		t.Fatalf("expected read to succeed, got %v", errno)
+	}
+	data, status := got.Bytes(nil)
+	if status != 0 {
+		t.Fatalf("expected read bytes to succeed, got %v", status)
+	}
+	if len(data) != 8 {
+		t.Fatalf("expected cached read to return requested length, got %d", len(data))
+	}
+}
+
 func TestRefreshRootLoadsRemoteEntriesIntoStore(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {
@@ -370,6 +409,25 @@ func TestRefreshAllRefreshesKnownDirectoryTree(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != "new.mkv" {
 		t.Fatalf("expected deep refresh to load new file, got %#v", got)
+	}
+}
+
+func TestRefreshAllSkipsConcurrentRefresh(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{})
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
+	if !fs.tryRefreshToken() {
+		t.Fatal("expected refresh token to be available")
+	}
+	defer fs.releaseRefreshToken()
+	if err := fs.RefreshAll(context.Background()); err != nil {
+		t.Fatalf("expected concurrent refresh to be skipped without error, got %v", err)
 	}
 }
 

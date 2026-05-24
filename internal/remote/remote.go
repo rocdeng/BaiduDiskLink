@@ -41,7 +41,7 @@ type inflightRead struct {
 	err  error
 }
 
-const prefetchBytes = 4 << 20
+const prefetchBytes = 8 << 20
 const maxCachedWindows = 8
 
 func NewReader(client baidu.Client) *Reader {
@@ -146,6 +146,15 @@ func (r *Reader) readCachedLocked(fsid string, offset, length int64) ([]byte, bo
 		return append([]byte(nil), cached.data[start:start+length]...), true
 	}
 	return nil, false
+}
+
+func (r *Reader) ReadCachedWindow(fsid string, offset, length int64) ([]byte, bool) {
+	if length <= 0 {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.readCachedLocked(fsid, offset, length)
 }
 
 func (r *Reader) storeCachedLocked(fsid string, offset int64, data []byte) {

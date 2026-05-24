@@ -190,6 +190,16 @@ Emby 里添加媒体库时，使用宿主机路径：
 /volume2/baidu_videos
 ```
 
+### 6. 直连播放代理
+
+如果你想绕开 FUSE 播放大文件，可以直接启动本地播放代理：
+
+```bash
+docker-compose exec baidudisklink baidudisklink playback --path /Videos/test.zip --listen 127.0.0.1:8787
+```
+
+它会在本机起一个支持 `Range` 的 HTTP 服务，播放器可以把它当成本地视频源使用。这个入口是给播放链路做直连验证的，不需要再经过 WebDAV 或二次映射。
+
 ## 验证和测试
 
 ### DSM 验收
