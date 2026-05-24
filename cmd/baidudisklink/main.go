@@ -19,6 +19,10 @@ func main() {
 		runBenchFuse(cfg, os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "playback" {
+		runPlayback(cfg, os.Args[2:])
+		return
+	}
 	application, err := app.New(app.Config(cfg))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -72,4 +76,23 @@ func runBenchFuse(cfg config.Config, args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("path: %s\nbytes: %d\nelapsed: %s\nthroughput: %.2f MiB/s\n", result.Path, result.Bytes, result.Elapsed, result.ThroughputMB)
+}
+
+func runPlayback(cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("playback", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	remotePath := fs.String("path", "/Videos/test.zip", "remote path to stream")
+	listenAddr := fs.String("listen", "127.0.0.1:8787", "listen address for playback proxy")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+	application, err := app.New(app.Config(cfg))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := application.ServePlayback(*remotePath, *listenAddr); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }

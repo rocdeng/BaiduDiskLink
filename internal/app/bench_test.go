@@ -46,10 +46,10 @@ func TestBenchmarkUsesOfficialDlinkFlow(t *testing.T) {
 			},
 		},
 		read: func(fsid string, offset, length int64) ([]byte, error) {
-			if fsid != "1" || offset != 0 || length != 4*1024*1024 {
+			if fsid != "1" || offset != 0 || length != 8*1024*1024 {
 				t.Fatalf("unexpected read args: %s %d %d", fsid, offset, length)
 			}
-			return []byte(strings.Repeat("a", 4*1024*1024)), nil
+			return []byte(strings.Repeat("a", 8*1024*1024)), nil
 		},
 	})
 	result, err := a.Benchmark("/Videos/test.zip", 4)
