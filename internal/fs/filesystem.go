@@ -636,11 +636,8 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if len(h.window) > 0 {
-		windowEnd := h.windowOff + int64(len(h.window))
-		if off >= h.windowOff && off+length <= windowEnd {
-			start := off - h.windowOff
-			end := start + length
-			return append([]byte(nil), h.window[start:end]...), nil
+		if data, ok := h.sliceWindow(off, length); ok {
+			return data, nil
 		}
 	}
 	fetchOff := (off / h.windowSize) * h.windowSize
@@ -657,13 +654,32 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	}
 	h.windowOff = fetchOff
 	h.window = append(h.window[:0], data...)
-	if off < h.windowOff || off+length > h.windowOff+int64(len(h.window)) {
-		return []byte{}, nil
+	return h.sliceWindowOrEmpty(off, length), nil
+}
+
+func (h *entryFileHandle) sliceWindowOrEmpty(off, length int64) []byte {
+	data, ok := h.sliceWindow(off, length)
+	if !ok {
+		return []byte{}
+	}
+	return data
+}
+
+func (h *entryFileHandle) sliceWindow(off, length int64) ([]byte, bool) {
+	if h == nil || len(h.window) == 0 || length <= 0 {
+		return nil, false
+	}
+	windowEnd := h.windowOff + int64(len(h.window))
+	if off < h.windowOff || off >= windowEnd {
+		return nil, false
 	}
 	start := off - h.windowOff
 	end := start + length
 	if end > int64(len(h.window)) {
 		end = int64(len(h.window))
 	}
-	return append([]byte(nil), h.window[start:end]...), nil
+	if end <= start {
+		return nil, false
+	}
+	return append([]byte(nil), h.window[start:end]...), true
 }
