@@ -509,7 +509,7 @@ func (n *entryNode) Open(ctx context.Context, openFlags uint32) (fh goFs.FileHan
 	if n.entry.IsDir {
 		return nil, 0, syscall.EISDIR
 	}
-	return &entryFileHandle{windowSize: fuseReadWindowSize}, fuse.FOPEN_KEEP_CACHE, 0
+	return &entryFileHandle{windowSize: fuseReadWindowSize, lastRead: -1}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 func (f *Filesystem) shouldRefreshRoot(children []store.Entry) bool {
@@ -618,6 +618,7 @@ type entryFileHandle struct {
 	window     []byte
 	windowOff  int64
 	windowSize int64
+	lastRead   int64
 }
 
 func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64) ([]byte, error) {
@@ -635,13 +636,24 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	jump := h.lastRead >= 0 && off > h.lastRead+int64(len(h.window)) && off-h.lastRead > h.windowSize
+	h.lastRead = off
 	if len(h.window) > 0 {
 		if data, ok := h.sliceWindow(off, length); ok {
 			return data, nil
 		}
 	}
-	fetchOff := (off / h.windowSize) * h.windowSize
 	fetchLen := h.windowSize
+	if jump {
+		fetchLen = min64(length*2, h.windowSize/2)
+		if fetchLen < length {
+			fetchLen = length
+		}
+	}
+	fetchOff := off
+	if !jump {
+		fetchOff = (off / h.windowSize) * h.windowSize
+	}
 	if fetchLen < length {
 		fetchLen = length
 	}
@@ -655,6 +667,13 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	h.windowOff = fetchOff
 	h.window = append(h.window[:0], data...)
 	return h.sliceWindowOrEmpty(off, length), nil
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (h *entryFileHandle) sliceWindowOrEmpty(off, length int64) []byte {

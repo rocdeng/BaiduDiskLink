@@ -111,6 +111,19 @@ func (r *Reader) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 	return r.readWithOptions(client, fsid, offset, length)
 }
 
+func (r *Reader) readWindow(client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
+	if length <= 0 {
+		return []byte{}, nil
+	}
+	if client == nil {
+		return []byte{}, nil
+	}
+	if data, ok := r.readCached(fsid, offset, length); ok {
+		return data, nil
+	}
+	return r.readWithOptions(client, fsid, offset, length)
+}
+
 func (r *Reader) readCached(fsid string, offset, length int64) ([]byte, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

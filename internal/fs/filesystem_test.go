@@ -122,7 +122,7 @@ func TestEntryReadUsesCachedWindowWhenAvailable(t *testing.T) {
 func TestEntryFileHandleReusesReadWindow(t *testing.T) {
 	client := &countingReadClient{}
 	remoteReader := remote.NewReader(client)
-	handle := &entryFileHandle{windowSize: 16}
+	handle := &entryFileHandle{windowSize: 16, lastRead: -1}
 	entry := store.Entry{
 		FSID: "1",
 		Path: "/movie.mkv",
@@ -141,6 +141,29 @@ func TestEntryFileHandleReusesReadWindow(t *testing.T) {
 	}
 	if client.reads != 1 {
 		t.Fatalf("expected one remote read for same handle window, got %d", client.reads)
+	}
+}
+
+func TestEntryFileHandleUsesSmallerWindowAfterLargeSeek(t *testing.T) {
+	client := &countingReadClient{}
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
+	entry := store.Entry{
+		FSID: "1",
+		Path: "/movie.mkv",
+		Size: 128 << 20,
+	}
+	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 4<<20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.read(context.Background(), remoteReader, entry, 80<<20, 4<<20); err != nil {
+		t.Fatal(err)
+	}
+	if client.reads != 2 {
+		t.Fatalf("expected second remote read after seek, got %d", client.reads)
+	}
+	if client.lengths[1] != 8<<20 {
+		t.Fatalf("expected smaller seek window, got %d", client.lengths[1])
 	}
 }
 
@@ -499,7 +522,8 @@ func testDB(t *testing.T) *sql.DB {
 }
 
 type countingReadClient struct {
-	reads int
+	reads   int
+	lengths []int64
 }
 
 func (c *countingReadClient) List(path string) ([]baidu.RemoteEntry, error) {
@@ -516,6 +540,7 @@ func (c *countingReadClient) GetDownloadLink(fsid string) (baidu.DownloadLink, e
 
 func (c *countingReadClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 	c.reads++
+	c.lengths = append(c.lengths, length)
 	return []byte(strings.Repeat("x", int(length))), nil
 }
 
