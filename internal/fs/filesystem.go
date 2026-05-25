@@ -219,6 +219,17 @@ func (f *Filesystem) RefreshAll(ctx context.Context) error {
 	return f.refreshKnownDirectories(ctx, f.rootPath, visited)
 }
 
+func (f *Filesystem) RefreshRootOnly(ctx context.Context) error {
+	if f == nil || f.store == nil || f.remote == nil {
+		return nil
+	}
+	if !f.tryRefreshToken() {
+		return nil
+	}
+	defer f.releaseRefreshToken()
+	return f.refreshRoot(ctx)
+}
+
 func (f *Filesystem) refreshKnownDirectories(ctx context.Context, current string, visited map[string]struct{}) error {
 	if f == nil || f.store == nil || visited == nil {
 		return nil

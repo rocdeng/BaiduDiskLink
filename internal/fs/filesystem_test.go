@@ -500,6 +500,42 @@ func TestRefreshAllSkipsConcurrentRefresh(t *testing.T) {
 	}
 }
 
+func TestRefreshRootOnlyDoesNotRefreshKnownDirectoryTree(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{
+		FSID:   "2",
+		Parent: "1",
+		Path:   "/Videos/TV",
+		Name:   "TV",
+		IsDir:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/Videos":    {{FSID: "2", ServerName: "TV", Path: "/Videos/TV", IsDir: true}},
+			"/Videos/TV": {{FSID: "3", ServerName: "new.mkv", Path: "/Videos/TV/new.mkv", Size: 10, IsDir: false}},
+		},
+	})
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/Videos")
+	if err := fs.RefreshRootOnly(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dbStore.ListChildren("/Videos/TV")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected root-only refresh to skip child directories, got %#v", got)
+	}
+}
+
 func TestLookupUsesNegativeCacheForMissingEntries(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {

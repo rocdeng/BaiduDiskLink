@@ -295,7 +295,7 @@ func (a *App) startRefreshLoop(stop <-chan struct{}) {
 		for {
 			select {
 			case <-ticker.C:
-				if err := a.filesystem.RefreshAll(context.Background()); err != nil {
+				if err := a.filesystem.RefreshRootOnly(context.Background()); err != nil {
 					log.Printf("periodic refresh failed: %v", err)
 				}
 			case <-stop:
