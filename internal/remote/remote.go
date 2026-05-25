@@ -111,17 +111,34 @@ func (r *Reader) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 	return r.readWithOptions(client, fsid, offset, length)
 }
 
-func (r *Reader) readWindow(client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
-	if length <= 0 {
-		return []byte{}, nil
+func (r *Reader) ReadExactRange(fsid string, offset, length int64) ([]byte, error) {
+	if length < 0 {
+		return nil, errors.New("length must be non-negative")
 	}
-	if client == nil {
-		return []byte{}, nil
+	if fsid == "" {
+		return nil, errors.New("fsid is required")
+	}
+	client := r.currentClient()
+	if r == nil || client == nil {
+		return make([]byte, length), nil
+	}
+	if _, err := r.downloadLink(fsid, client); err != nil {
+		return nil, err
 	}
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
 	}
-	return r.readWithOptions(client, fsid, offset, length)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		data, err := client.ReadRange(fsid, offset, length)
+		if err == nil {
+			r.storeCached(fsid, offset, data)
+			return data, nil
+		}
+		lastErr = err
+		_ = client.RefreshAuth()
+	}
+	return nil, lastErr
 }
 
 func (r *Reader) readCached(fsid string, offset, length int64) ([]byte, bool) {

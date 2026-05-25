@@ -636,7 +636,8 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	jump := h.lastRead >= 0 && off > h.lastRead+int64(len(h.window)) && off-h.lastRead > h.windowSize
+	firstHighOffsetRead := h.lastRead < 0 && off >= h.windowSize
+	jump := firstHighOffsetRead || (h.lastRead >= 0 && off > h.lastRead+int64(len(h.window)) && off-h.lastRead > h.windowSize)
 	h.lastRead = off
 	if len(h.window) > 0 {
 		if data, ok := h.sliceWindow(off, length); ok {
@@ -660,7 +661,13 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	if entry.Size > 0 && fetchOff+fetchLen > entry.Size {
 		fetchLen = entry.Size - fetchOff
 	}
-	data, err := remote.ReadRange(entry.FSID, fetchOff, fetchLen)
+	var data []byte
+	var err error
+	if jump {
+		data, err = remote.ReadExactRange(entry.FSID, fetchOff, fetchLen)
+	} else {
+		data, err = remote.ReadRange(entry.FSID, fetchOff, fetchLen)
+	}
 	if err != nil {
 		return nil, err
 	}

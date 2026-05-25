@@ -167,6 +167,26 @@ func TestEntryFileHandleUsesSmallerWindowAfterLargeSeek(t *testing.T) {
 	}
 }
 
+func TestEntryFileHandleUsesSmallerWindowForInitialHighOffsetRead(t *testing.T) {
+	client := &countingReadClient{}
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
+	entry := store.Entry{
+		FSID: "1",
+		Path: "/movie.mkv",
+		Size: 128 << 20,
+	}
+	if _, err := handle.read(context.Background(), remoteReader, entry, 80<<20, 4<<20); err != nil {
+		t.Fatal(err)
+	}
+	if client.reads != 1 {
+		t.Fatalf("expected one remote read, got %d", client.reads)
+	}
+	if client.lengths[0] != 8<<20 {
+		t.Fatalf("expected smaller initial seek window, got %d", client.lengths[0])
+	}
+}
+
 func TestRefreshRootLoadsRemoteEntriesIntoStore(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {

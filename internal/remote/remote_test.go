@@ -63,6 +63,21 @@ func TestReadRangeRejectsNegativeLength(t *testing.T) {
 	}
 }
 
+func TestReadExactRangeDoesNotPrefetch(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	got, err := r.ReadExactRange("fsid-1", 64<<20, 4<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4<<20 {
+		t.Fatalf("expected exact length, got %d", len(got))
+	}
+	if client.readCalls != 1 {
+		t.Fatalf("expected one backend read, got %d", client.readCalls)
+	}
+}
+
 func TestReadRangeCachesDownloadLinkAndRetries(t *testing.T) {
 	client := &stubClient{failRead: true}
 	r := NewReader(client)
