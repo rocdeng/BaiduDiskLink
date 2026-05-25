@@ -260,6 +260,20 @@ BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=4194304
 docker-compose exec baidudisklink baidudisklink bench-fuse --path /mnt/baidu/test.zip
 ```
 
+如果需要诊断 Emby 拖动进度时是否真的触发了 FUSE 读取，可以临时打开读跟踪：
+
+```dotenv
+BAIDUDISKLINK_FUSE_TRACE_READS=1
+```
+
+然后重新构建并启动，再观察日志：
+
+```bash
+docker-compose logs -f baidudisklink
+```
+
+日志会打印每次 FUSE 读的文件、offset、请求长度、返回长度和读取策略。这个开关只建议排查问题时打开，正常使用时保持为空。
+
 如果主容器没有运行，也可以用 `run --rm`，但主容器运行时更推荐 `exec`，避免新容器同时打开同一个 SQLite 元数据库。
 
 ```bash

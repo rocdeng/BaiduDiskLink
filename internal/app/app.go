@@ -30,6 +30,7 @@ type Config struct {
 	TokenPath           string
 	MetaDBPath          string
 	FuseGroupName       string
+	FuseTraceReads      bool
 	DownloadConcurrency int
 	DownloadChunkSize   int64
 	ClientID            string
@@ -268,6 +269,7 @@ func (a *App) Run() error {
 		return err
 	}
 	a.filesystem = fs.NewFilesystem(a.store, a.remote, a.fuseGIDs, a.cfg.RemoteRootPath)
+	a.filesystem.SetTraceReads(a.cfg.FuseTraceReads)
 	server, err := a.mountFunc(a.cfg.MountPath, a.filesystem)
 	if err != nil {
 		return err

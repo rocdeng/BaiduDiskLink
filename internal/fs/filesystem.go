@@ -29,6 +29,7 @@ type Filesystem struct {
 	gids       map[uint32]struct{}
 	rootPath   string
 	refreshMu  chan struct{}
+	traceReads bool
 }
 
 const fuseReadWindowSize int64 = 16 << 20
@@ -46,6 +47,13 @@ func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath st
 		rootPath = "/"
 	}
 	return &Filesystem{store: st, remote: r, ttl: time.Minute, primaryGID: primary, gids: out, rootPath: rootPath, refreshMu: make(chan struct{}, 1)}
+}
+
+func (f *Filesystem) SetTraceReads(enabled bool) {
+	if f == nil {
+		return
+	}
+	f.traceReads = enabled
 }
 
 func (f *Filesystem) OnAdd(ctx context.Context) {
@@ -486,10 +494,12 @@ func (n *entryNode) Read(ctx context.Context, fh goFs.FileHandle, dest []byte, o
 			log.Printf("fuse read failed path=%q fsid=%q offset=%d length=%d: %v", n.entry.Path, n.entry.FSID, off, len(dest), err)
 			return nil, syscall.EIO
 		}
+		n.traceRead(off, len(dest), len(data), handle.lastStrategy)
 		return fuse.ReadResultData(data), 0
 	}
 	if n.entry.Size > 0 && len(dest) > 0 {
 		if data, ok := n.Filesystem.remote.ReadCachedWindow(n.entry.FSID, off, int64(len(dest))); ok {
+			n.traceRead(off, len(dest), len(data), "global-cache")
 			return fuse.ReadResultData(data), 0
 		}
 	}
@@ -498,7 +508,15 @@ func (n *entryNode) Read(ctx context.Context, fh goFs.FileHandle, dest []byte, o
 		log.Printf("fuse read failed path=%q fsid=%q offset=%d length=%d: %v", n.entry.Path, n.entry.FSID, off, len(dest), err)
 		return nil, syscall.EIO
 	}
+	n.traceRead(off, len(dest), len(data), "node-range")
 	return fuse.ReadResultData(data), 0
+}
+
+func (n *entryNode) traceRead(off int64, requested, returned int, strategy string) {
+	if n == nil || n.Filesystem == nil || !n.Filesystem.traceReads {
+		return
+	}
+	log.Printf("fuse read path=%q fsid=%q offset=%d requested=%d returned=%d strategy=%s", n.entry.Path, n.entry.FSID, off, requested, returned, strategy)
 }
 
 func (n *entryNode) Opendir(ctx context.Context) syscall.Errno {
@@ -619,6 +637,7 @@ type entryFileHandle struct {
 	windowOff  int64
 	windowSize int64
 	lastRead   int64
+	lastStrategy string
 }
 
 func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64) ([]byte, error) {
@@ -641,6 +660,7 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	h.lastRead = off
 	if len(h.window) > 0 {
 		if data, ok := h.sliceWindow(off, length); ok {
+			h.lastStrategy = "handle-cache"
 			return data, nil
 		}
 	}
@@ -665,8 +685,10 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	var err error
 	if jump {
 		data, err = remote.ReadExactRange(entry.FSID, fetchOff, fetchLen)
+		h.lastStrategy = "seek-exact"
 	} else {
 		data, err = remote.ReadRange(entry.FSID, fetchOff, fetchLen)
+		h.lastStrategy = "window-prefetch"
 	}
 	if err != nil {
 		return nil, err

@@ -11,6 +11,7 @@ type Config struct {
 	TokenPath           string
 	MetaDBPath          string
 	FuseGroupName       string
+	FuseTraceReads      bool
 	DownloadConcurrency int
 	DownloadChunkSize   int64
 	ClientID            string
@@ -31,6 +32,7 @@ func Load() Config {
 		TokenPath:           os.Getenv("BAIDUDISKLINK_TOKEN_PATH"),
 		MetaDBPath:          os.Getenv("BAIDUDISKLINK_META_DB_PATH"),
 		FuseGroupName:       os.Getenv("BAIDUDISKLINK_FUSE_GROUP_NAME"),
+		FuseTraceReads:      parseBool(os.Getenv("BAIDUDISKLINK_FUSE_TRACE_READS")),
 		DownloadConcurrency: parseInt(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CONCURRENCY"), 1),
 		DownloadChunkSize:   parseInt64(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE"), 4<<20),
 		ClientID:            os.Getenv("BAIDUDISKLINK_CLIENT_ID"),
@@ -63,4 +65,13 @@ func parseInt64(value string, fallback int64) int64 {
 		return n
 	}
 	return fallback
+}
+
+func parseBool(value string) bool {
+	switch value {
+	case "1", "true", "TRUE", "yes", "YES", "on", "ON":
+		return true
+	default:
+		return false
+	}
 }
