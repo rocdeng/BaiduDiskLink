@@ -42,7 +42,8 @@ func (s *stubClient) ReadRange(fsid string, offset, length int64) ([]byte, error
 	}
 	return make([]byte, length), nil
 }
-func (s *stubClient) RefreshAuth() error { return nil }
+func (s *stubClient) Delete(paths []string) error { return nil }
+func (s *stubClient) RefreshAuth() error          { return nil }
 
 func TestReadRangeUsesRequestedLength(t *testing.T) {
 	r := NewReader(nil)

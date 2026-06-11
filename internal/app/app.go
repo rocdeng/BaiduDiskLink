@@ -31,6 +31,7 @@ type Config struct {
 	MetaDBPath          string
 	FuseGroupName       string
 	FuseTraceReads      bool
+	EnableDelete        bool
 	DownloadConcurrency int
 	DownloadChunkSize   int64
 	ClientID            string
@@ -294,6 +295,7 @@ func (a *App) mountAndWait() error {
 	}
 	a.filesystem = fs.NewFilesystem(a.store, a.remote, a.fuseGIDs, a.cfg.RemoteRootPath)
 	a.filesystem.SetTraceReads(a.cfg.FuseTraceReads)
+	a.filesystem.SetDeleteEnabled(a.cfg.EnableDelete)
 	server, err := a.mountFunc(a.cfg.MountPath, a.filesystem)
 	if err != nil {
 		return err

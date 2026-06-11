@@ -21,15 +21,16 @@ import (
 
 type Filesystem struct {
 	goFs.Inode
-	store      *store.Store
-	remote     *remote.Reader
-	negative   *cache.NegativeCache
-	ttl        time.Duration
-	primaryGID uint32
-	gids       map[uint32]struct{}
-	rootPath   string
-	refreshMu  chan struct{}
-	traceReads bool
+	store        *store.Store
+	remote       *remote.Reader
+	negative     *cache.NegativeCache
+	ttl          time.Duration
+	primaryGID   uint32
+	gids         map[uint32]struct{}
+	rootPath     string
+	refreshMu    chan struct{}
+	traceReads   bool
+	enableDelete bool
 }
 
 const fuseReadWindowSize int64 = 16 << 20
@@ -54,6 +55,13 @@ func (f *Filesystem) SetTraceReads(enabled bool) {
 		return
 	}
 	f.traceReads = enabled
+}
+
+func (f *Filesystem) SetDeleteEnabled(enabled bool) {
+	if f == nil {
+		return
+	}
+	f.enableDelete = enabled
 }
 
 func (f *Filesystem) OnAdd(ctx context.Context) {
@@ -100,6 +108,14 @@ func (f *Filesystem) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.
 
 func (f *Filesystem) Opendir(ctx context.Context) syscall.Errno {
 	return 0
+}
+
+func (f *Filesystem) Unlink(ctx context.Context, name string) syscall.Errno {
+	return f.deleteChild(ctx, f.rootPath, name, false)
+}
+
+func (f *Filesystem) Rmdir(ctx context.Context, name string) syscall.Errno {
+	return f.deleteChild(ctx, f.rootPath, name, true)
 }
 
 func (f *Filesystem) Readdir(ctx context.Context) (goFs.DirStream, syscall.Errno) {
@@ -344,6 +360,8 @@ var _ = (goFs.NodeGetattrer)((*entryNode)(nil))
 var _ = (goFs.NodeLookuper)((*entryNode)(nil))
 var _ = (goFs.NodeReaddirer)((*entryNode)(nil))
 var _ = (goFs.NodeReader)((*entryNode)(nil))
+var _ = (goFs.NodeUnlinker)((*entryNode)(nil))
+var _ = (goFs.NodeRmdirer)((*entryNode)(nil))
 
 func (n *entryNode) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if n.entry.IsDir {
@@ -421,6 +439,64 @@ func (n *entryNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 		return inode, 0
 	}
 	return nil, syscall.ENOENT
+}
+
+func (n *entryNode) Unlink(ctx context.Context, name string) syscall.Errno {
+	return n.deleteChild(ctx, name, false)
+}
+
+func (n *entryNode) Rmdir(ctx context.Context, name string) syscall.Errno {
+	return n.deleteChild(ctx, name, true)
+}
+
+func (n *entryNode) deleteChild(ctx context.Context, name string, wantDir bool) syscall.Errno {
+	if n == nil || n.Filesystem == nil || n.Filesystem.store == nil || n.Filesystem.remote == nil {
+		return syscall.EIO
+	}
+	return n.Filesystem.deleteChild(ctx, n.entry.Path, name, wantDir)
+}
+
+func (f *Filesystem) deleteChild(ctx context.Context, parentPath string, name string, wantDir bool) syscall.Errno {
+	if f == nil || f.store == nil || f.remote == nil {
+		return syscall.EIO
+	}
+	if !f.enableDelete {
+		return syscall.EROFS
+	}
+	children, err := f.store.ListChildren(parentPath)
+	if err != nil {
+		return syscall.EIO
+	}
+	var target *store.Entry
+	for _, child := range children {
+		if child.Name == name {
+			copy := child
+			target = &copy
+			break
+		}
+	}
+	if target == nil {
+		return syscall.ENOENT
+	}
+	if wantDir && !target.IsDir {
+		return syscall.ENOTDIR
+	}
+	if !wantDir && target.IsDir {
+		return syscall.EISDIR
+	}
+	if target.Path == "" || target.Path == f.rootPath || target.Path == "/" {
+		return syscall.EPERM
+	}
+	if err := f.remote.Delete([]string{target.Path}); err != nil {
+		log.Printf("fuse delete failed path=%q fsid=%q: %v", target.Path, target.FSID, err)
+		return syscall.EIO
+	}
+	if err := f.store.DeletePath(target.Path); err != nil {
+		log.Printf("delete metadata failed path=%q fsid=%q: %v", target.Path, target.FSID, err)
+		return syscall.EIO
+	}
+	log.Printf("fuse delete path=%q fsid=%q", target.Path, target.FSID)
+	return 0
 }
 
 func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string) error {
@@ -650,11 +726,11 @@ func inodeTime(mtm int64) time.Time {
 }
 
 type entryFileHandle struct {
-	mu         sync.Mutex
-	window     []byte
-	windowOff  int64
-	windowSize int64
-	lastRead   int64
+	mu           sync.Mutex
+	window       []byte
+	windowOff    int64
+	windowSize   int64
+	lastRead     int64
 	lastStrategy string
 }
 

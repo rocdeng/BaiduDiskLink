@@ -66,12 +66,12 @@ func (m *Manager) LoadToken() (Token, error) {
 }
 
 type OAuthConfig struct {
-	ClientID     string
-	ClientSecret string
-	RedirectURI  string
-	Scope        string
-	State        string
-	TokenBaseURL string
+	ClientID         string
+	ClientSecret     string
+	RedirectURI      string
+	Scope            string
+	State            string
+	TokenBaseURL     string
 	AuthorizeBaseURL string
 }
 

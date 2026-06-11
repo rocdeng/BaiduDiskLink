@@ -19,6 +19,8 @@ BaiduDiskLink 是一个把百度网盘目录只读挂载成本地目录的工具
 
 当前实现是只读挂载，不支持上传、删除、重命名。
 
+如果明确开启删除开关，BaiduDiskLink 可以通过 FUSE 删除百度网盘中的文件或目录；默认仍然禁止删除。
+
 ## 技术简介
 
 BaiduDiskLink 由 Go 编写，核心链路如下：
@@ -83,6 +85,9 @@ BAIDUDISKLINK_DOWNLOAD_CONCURRENCY=1
 
 # 可选：每个分块读取大小。默认 4MiB。
 BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=4194304
+
+# 可选：允许通过挂载目录删除百度网盘文件/目录。默认关闭。
+BAIDUDISKLINK_ENABLE_DELETE=
 ```
 
 这两个参数建议先只在 `bench` 里试，确认效果稳定后再用于日常挂载。
@@ -273,6 +278,22 @@ docker-compose logs -f baidudisklink
 ```
 
 日志会打印每次 FUSE 读的文件、offset、请求长度、返回长度和读取策略。这个开关只建议排查问题时打开，正常使用时保持为空。
+
+### 删除文件和目录
+
+默认情况下挂载目录仍然是防误删的只读模式。确实需要删除百度网盘里的文件或目录时，在 `.env` 中开启：
+
+```dotenv
+BAIDUDISKLINK_ENABLE_DELETE=1
+```
+
+然后重建容器让环境变量生效：
+
+```bash
+docker-compose up -d --force-recreate
+```
+
+开启后，从 DSM/Emby/SMB 对挂载目录执行删除，会调用百度网盘删除接口，并同步清理本地 SQLite 元数据缓存。删除是真实作用到百度网盘的操作，建议只在确认需要时开启。
 
 如果主容器没有运行，也可以用 `run --rm`，但主容器运行时更推荐 `exec`，避免新容器同时打开同一个 SQLite 元数据库。
 

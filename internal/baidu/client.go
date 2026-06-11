@@ -53,6 +53,12 @@ type apiFileMetaResponse struct {
 	ErrorMsg  string        `json:"error_msg"`
 }
 
+type apiFileManagerResponse struct {
+	ErrorCode int    `json:"errno"`
+	ErrorMsg  string `json:"errmsg"`
+	ErrorMsg2 string `json:"error_msg"`
+}
+
 type apiFileMeta struct {
 	FSID        int64  `json:"fs_id"`
 	ServerName  string `json:"server_filename"`
@@ -192,6 +198,43 @@ func (c *APIClient) GetDownloadLink(fsid string) (DownloadLink, error) {
 	out := DownloadLink{URL: finalURL, ExpiresAt: time.Now().Add(10 * time.Minute)}
 	c.cacheDownloadLink(fsid, out)
 	return out, nil
+}
+
+func (c *APIClient) Delete(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	payload, err := json.Marshal(paths)
+	if err != nil {
+		return err
+	}
+	values := url.Values{}
+	values.Set("method", "filemanager")
+	values.Set("opera", "delete")
+	values.Set("access_token", c.token())
+	form := url.Values{}
+	form.Set("async", "0")
+	form.Set("filelist", string(payload))
+	req, err := http.NewRequest(http.MethodPost, c.apiBaseURL+"/rest/2.0/xpan/file?"+values.Encode(), strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	var resp apiFileManagerResponse
+	if err := c.doJSON(req, &resp); err != nil {
+		return err
+	}
+	if resp.ErrorCode != 0 {
+		msg := resp.ErrorMsg
+		if msg == "" {
+			msg = resp.ErrorMsg2
+		}
+		if msg == "" {
+			msg = fmt.Sprintf("errno=%d", resp.ErrorCode)
+		}
+		return fmt.Errorf("baidu delete failed: %s", msg)
+	}
+	return nil
 }
 
 func (c *APIClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
@@ -334,6 +377,10 @@ func (c *APIClient) getJSON(rawurl string, out any) error {
 	if err != nil {
 		return err
 	}
+	return c.doJSON(req, out)
+}
+
+func (c *APIClient) doJSON(req *http.Request, out any) error {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err

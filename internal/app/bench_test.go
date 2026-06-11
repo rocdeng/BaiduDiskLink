@@ -115,6 +115,8 @@ func (m *mockBenchClient) GetDownloadLink(fsid string) (baidu.DownloadLink, erro
 	return baidu.DownloadLink{URL: "https://download.example.invalid/" + fsid}, nil
 }
 
+func (m *mockBenchClient) Delete(paths []string) error { return nil }
+
 func (m *mockBenchClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 	if m.read != nil {
 		return m.read(fsid, offset, length)

@@ -91,6 +91,14 @@ func (r *Reader) List(path string) ([]baidu.RemoteEntry, error) {
 	return client.List(path)
 }
 
+func (r *Reader) Delete(paths []string) error {
+	client := r.currentClient()
+	if r == nil || client == nil {
+		return nil
+	}
+	return client.Delete(paths)
+}
+
 func (r *Reader) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 	if length < 0 {
 		return nil, errors.New("length must be non-negative")

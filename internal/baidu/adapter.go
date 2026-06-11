@@ -32,6 +32,8 @@ func (c *StaticClient) GetDownloadLink(fsid string) (DownloadLink, error) {
 	return DownloadLink{URL: "https://example.invalid/" + fsid}, nil
 }
 
+func (c *StaticClient) Delete(paths []string) error { return nil }
+
 func (c *StaticClient) ReadRange(_ string, _ int64, length int64) ([]byte, error) {
 	return make([]byte, length), nil
 }

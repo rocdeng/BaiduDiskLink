@@ -626,6 +626,118 @@ func TestFillEntryOutUsesMtimeFromMetadata(t *testing.T) {
 	}
 }
 
+func TestUnlinkRejectsWhenDeleteDisabled(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "1", Parent: "0", Path: "/Videos", Name: "Videos", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "2", Parent: "1", Path: "/Videos/test.mkv", Name: "test.mkv"}); err != nil {
+		t.Fatal(err)
+	}
+	client := &deleteRecordingClient{}
+	fs := NewFilesystem(dbStore, remote.NewReader(client), nil, "/Videos")
+	if errno := fs.Unlink(context.Background(), "test.mkv"); errno != syscall.EROFS {
+		t.Fatalf("expected EROFS, got %v", errno)
+	}
+	if len(client.deleted) != 0 {
+		t.Fatalf("delete should not be called, got %#v", client.deleted)
+	}
+}
+
+func TestUnlinkDeletesRemoteFileAndMetadata(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "1", Parent: "0", Path: "/Videos", Name: "Videos", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "2", Parent: "1", Path: "/Videos/test.mkv", Name: "test.mkv"}); err != nil {
+		t.Fatal(err)
+	}
+	client := &deleteRecordingClient{}
+	fs := NewFilesystem(dbStore, remote.NewReader(client), nil, "/Videos")
+	fs.SetDeleteEnabled(true)
+	if errno := fs.Unlink(context.Background(), "test.mkv"); errno != 0 {
+		t.Fatalf("expected delete to succeed, got %v", errno)
+	}
+	if len(client.deleted) != 1 || client.deleted[0] != "/Videos/test.mkv" {
+		t.Fatalf("unexpected remote delete paths: %#v", client.deleted)
+	}
+	got, err := dbStore.GetByPath("/Videos/test.mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("expected metadata removed, got %#v", got)
+	}
+}
+
+func TestRmdirRejectsFile(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "1", Parent: "0", Path: "/Videos", Name: "Videos", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "2", Parent: "1", Path: "/Videos/test.mkv", Name: "test.mkv"}); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewFilesystem(dbStore, remote.NewReader(&deleteRecordingClient{}), nil, "/Videos")
+	fs.SetDeleteEnabled(true)
+	if errno := fs.Rmdir(context.Background(), "test.mkv"); errno != syscall.ENOTDIR {
+		t.Fatalf("expected ENOTDIR, got %v", errno)
+	}
+}
+
+func TestRmdirDeletesRemoteDirectoryAndMetadataSubtree(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	entries := []store.Entry{
+		{FSID: "1", Parent: "0", Path: "/Videos", Name: "Videos", IsDir: true},
+		{FSID: "2", Parent: "1", Path: "/Videos/Movie", Name: "Movie", IsDir: true},
+		{FSID: "3", Parent: "2", Path: "/Videos/Movie/test.mkv", Name: "test.mkv"},
+	}
+	for _, entry := range entries {
+		if err := dbStore.UpsertEntry(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := &deleteRecordingClient{}
+	fs := NewFilesystem(dbStore, remote.NewReader(client), nil, "/Videos")
+	fs.SetDeleteEnabled(true)
+	if errno := fs.Rmdir(context.Background(), "Movie"); errno != 0 {
+		t.Fatalf("expected directory delete to succeed, got %v", errno)
+	}
+	if len(client.deleted) != 1 || client.deleted[0] != "/Videos/Movie" {
+		t.Fatalf("unexpected remote delete paths: %#v", client.deleted)
+	}
+	if got, err := dbStore.GetByPath("/Videos/Movie"); err != nil || got != nil {
+		t.Fatalf("expected directory metadata removed, got %#v err=%v", got, err)
+	}
+	if got, err := dbStore.GetByPath("/Videos/Movie/test.mkv"); err != nil || got != nil {
+		t.Fatalf("expected child metadata removed, got %#v err=%v", got, err)
+	}
+}
+
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
@@ -652,6 +764,10 @@ func (c *countingReadClient) GetDownloadLink(fsid string) (baidu.DownloadLink, e
 	return baidu.DownloadLink{}, nil
 }
 
+func (c *countingReadClient) Delete(paths []string) error {
+	return nil
+}
+
 func (c *countingReadClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 	c.reads++
 	c.lengths = append(c.lengths, length)
@@ -659,5 +775,34 @@ func (c *countingReadClient) ReadRange(fsid string, offset, length int64) ([]byt
 }
 
 func (c *countingReadClient) RefreshAuth() error {
+	return nil
+}
+
+type deleteRecordingClient struct {
+	deleted []string
+}
+
+func (c *deleteRecordingClient) List(path string) ([]baidu.RemoteEntry, error) {
+	return nil, nil
+}
+
+func (c *deleteRecordingClient) Stat(path string) (baidu.RemoteEntry, error) {
+	return baidu.RemoteEntry{}, nil
+}
+
+func (c *deleteRecordingClient) GetDownloadLink(fsid string) (baidu.DownloadLink, error) {
+	return baidu.DownloadLink{}, nil
+}
+
+func (c *deleteRecordingClient) Delete(paths []string) error {
+	c.deleted = append(c.deleted, paths...)
+	return nil
+}
+
+func (c *deleteRecordingClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
+	return make([]byte, length), nil
+}
+
+func (c *deleteRecordingClient) RefreshAuth() error {
 	return nil
 }

@@ -142,6 +142,41 @@ func TestAPIClientCachesDownloadLinkForRangeReads(t *testing.T) {
 	}
 }
 
+func TestAPIClientDeleteUsesFileManager(t *testing.T) {
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			if r.Method != http.MethodPost {
+				t.Fatalf("unexpected method: %s", r.Method)
+			}
+			if !strings.Contains(r.URL.String(), "/rest/2.0/xpan/file") {
+				t.Fatalf("unexpected url: %s", r.URL.String())
+			}
+			if got := r.URL.Query().Get("method"); got != "filemanager" {
+				t.Fatalf("unexpected method query: %s", got)
+			}
+			if got := r.URL.Query().Get("opera"); got != "delete" {
+				t.Fatalf("unexpected opera query: %s", got)
+			}
+			if got := r.URL.Query().Get("access_token"); got != "token" {
+				t.Fatalf("unexpected token: %s", got)
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			if got := r.Form.Get("async"); got != "0" {
+				t.Fatalf("unexpected async: %s", got)
+			}
+			if got := r.Form.Get("filelist"); got != `["/Videos/test.mkv"]` {
+				t.Fatalf("unexpected filelist: %s", got)
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"errno":0}`)), Header: make(http.Header)}, nil
+		}},
+	})
+	if err := client.Delete([]string{"/Videos/test.mkv"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAPIClientRefreshAuth(t *testing.T) {
 	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
 		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {

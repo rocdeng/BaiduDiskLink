@@ -276,6 +276,20 @@ func (s *Store) ExpirePath(path string) error {
 	return err
 }
 
+func (s *Store) DeletePath(path string) error {
+	if s == nil {
+		return errors.New("store is nil")
+	}
+	if s.db == nil {
+		return errors.New("db is required")
+	}
+	if path == "" || path == "/" {
+		return errors.New("refuse to delete root")
+	}
+	_, err := s.db.Exec(`delete from entries where path = ? or path like ?`, path, strings.TrimRight(path, "/")+"/%")
+	return err
+}
+
 func (s *Store) migrate() error {
 	if s.db == nil {
 		return errors.New("db is required")

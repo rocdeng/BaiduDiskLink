@@ -173,3 +173,35 @@ func TestExpirePathClearsExpiry(t *testing.T) {
 		t.Fatalf("expected root to expire, got %#v", got)
 	}
 }
+
+func TestDeletePathRemovesEntrySubtree(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertEntry(Entry{FSID: "1", Parent: "0", Path: "/Videos", Name: "Videos", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertEntry(Entry{FSID: "2", Parent: "1", Path: "/Videos/Movie", Name: "Movie", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertEntry(Entry{FSID: "3", Parent: "2", Path: "/Videos/Movie/a.mkv", Name: "a.mkv"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeletePath("/Videos/Movie"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.GetByPath("/Videos/Movie"); err != nil || got != nil {
+		t.Fatalf("expected directory removed, got %#v err=%v", got, err)
+	}
+	if got, err := s.GetByPath("/Videos/Movie/a.mkv"); err != nil || got != nil {
+		t.Fatalf("expected child removed, got %#v err=%v", got, err)
+	}
+	if got, err := s.GetByPath("/Videos"); err != nil || got == nil {
+		t.Fatalf("expected parent preserved, got %#v err=%v", got, err)
+	}
+}
