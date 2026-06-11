@@ -184,7 +184,7 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 			IsDir:      entry.IsDir,
 			MTM:        entry.ServerMTime,
 			MD5:        entry.MD5,
-			ExpiresAt:  time.Now().Add(f.ttl).Unix(),
+			ExpiresAt:  f.childExpiresAt(entry.IsDir),
 			LastSyncAt: time.Now().Unix(),
 		})
 	}
@@ -447,7 +447,7 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 			IsDir:      entry.IsDir,
 			MTM:        entry.ServerMTime,
 			MD5:        entry.MD5,
-			ExpiresAt:  time.Now().Add(f.ttl).Unix(),
+			ExpiresAt:  f.childExpiresAt(entry.IsDir),
 			LastSyncAt: time.Now().Unix(),
 		})
 	}
@@ -469,6 +469,13 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 		LastSyncAt: time.Now().Unix(),
 		ExpiresAt:  time.Now().Add(f.ttl).Unix(),
 	})
+}
+
+func (f *Filesystem) childExpiresAt(isDir bool) int64 {
+	if isDir {
+		return 0
+	}
+	return time.Now().Add(f.ttl).Unix()
 }
 
 func (f *Filesystem) existingMTime(dirPath string) int64 {

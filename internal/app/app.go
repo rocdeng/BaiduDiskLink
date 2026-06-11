@@ -240,6 +240,15 @@ func (a *App) Run() error {
 	if _, err := os.Stat(a.cfg.MountPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	if err := a.bindRemoteClient(); err == nil {
+		if err := a.remoteHealthCheck(); err == nil {
+			return a.mountAndWait()
+		} else {
+			log.Printf("stored token is not usable, starting oauth flow: %v", err)
+		}
+	} else {
+		log.Printf("stored token is not available, starting oauth flow: %v", err)
+	}
 	if a.oauth == nil {
 		return errors.New("oauth server is required")
 	}
@@ -267,6 +276,21 @@ func (a *App) Run() error {
 	}
 	if err := a.bindRemoteClient(); err != nil {
 		return err
+	}
+	return a.mountAndWait()
+}
+
+func (a *App) remoteHealthCheck() error {
+	if a == nil || a.remote == nil {
+		return errors.New("remote reader is required")
+	}
+	_, err := a.remote.List(a.cfg.RemoteRootPath)
+	return err
+}
+
+func (a *App) mountAndWait() error {
+	if a == nil {
+		return errors.New("app is nil")
 	}
 	a.filesystem = fs.NewFilesystem(a.store, a.remote, a.fuseGIDs, a.cfg.RemoteRootPath)
 	a.filesystem.SetTraceReads(a.cfg.FuseTraceReads)

@@ -240,6 +240,64 @@ func TestRefreshRootUsesConfiguredRemoteRootAsLocalRoot(t *testing.T) {
 	}
 }
 
+func TestRefreshRootDoesNotMarkChildDirectoryContentsFresh(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/Videos": {{FSID: "2", ServerName: "Movie", Path: "/Videos/Movie", IsDir: true}},
+		},
+	})
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/Videos")
+	if err := fs.refreshRoot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	movie, err := dbStore.GetByPath("/Videos/Movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if movie == nil || !movie.IsDir {
+		t.Fatalf("expected Movie directory, got %#v", movie)
+	}
+	if movie.ExpiresAt != 0 {
+		t.Fatalf("expected child directory contents to remain stale, got expires_at=%d", movie.ExpiresAt)
+	}
+	if !fs.shouldRefreshDir("/Videos/Movie", nil) {
+		t.Fatal("expected child directory to refresh on demand")
+	}
+}
+
+func TestRefreshDirDoesNotMarkNestedDirectoryContentsFresh(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	remoteReader := remote.NewReader(&baidu.StaticClient{
+		Entries: map[string][]baidu.RemoteEntry{
+			"/Videos/Movie": {{FSID: "3", ServerName: "New Folder", Path: "/Videos/Movie/New Folder", IsDir: true}},
+		},
+	})
+	fs := NewFilesystem(dbStore, remoteReader, nil, "/Videos")
+	if err := fs.refreshDir(context.Background(), "/Videos/Movie", "2"); err != nil {
+		t.Fatal(err)
+	}
+	child, err := dbStore.GetByPath("/Videos/Movie/New Folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child == nil || !child.IsDir {
+		t.Fatalf("expected nested directory, got %#v", child)
+	}
+	if child.ExpiresAt != 0 {
+		t.Fatalf("expected nested directory contents to remain stale, got expires_at=%d", child.ExpiresAt)
+	}
+}
+
 func TestRefreshDirLoadsNestedEntries(t *testing.T) {
 	dbStore, err := store.Open(testDB(t))
 	if err != nil {

@@ -440,9 +440,6 @@ func TestRunUsesConfiguredOAuthListenAddr(t *testing.T) {
 	a.clientFactory = func(token auth.Token) baidu.Client {
 		return &baidu.StaticClient{}
 	}
-	if err := a.auth.SaveToken(auth.Token{AccessToken: "access", RefreshToken: "refresh"}); err != nil {
-		t.Fatal(err)
-	}
 	a.mountFunc = func(path string, root *fs.Filesystem) (*fakeMountServer, error) {
 		return &fakeMountServer{
 			waitFn:    func() { <-releaseMount },
@@ -467,6 +464,70 @@ func TestRunUsesConfiguredOAuthListenAddr(t *testing.T) {
 	close(releaseMount)
 	select {
 	case <-errCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("run did not exit")
+	}
+}
+
+func TestRunSkipsOAuthWhenStoredTokenIsUsable(t *testing.T) {
+	a, err := New(Config{
+		MountPath:    "/tmp/mount",
+		TokenPath:    t.TempDir() + "/token.json",
+		MetaDBPath:   t.TempDir() + "/meta.db",
+		ClientID:     "client",
+		ClientSecret: "secret",
+		RedirectURI:  "http://127.0.0.1:8765/callback",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.auth.SaveToken(auth.Token{AccessToken: "access", RefreshToken: "refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	oauthStarted := make(chan struct{}, 1)
+	a.oauth = &fakeOAuthFlow{
+		url: "https://openapi.baidu.com/oauth/2.0/authorize?client_id=client",
+		startFn: func(addr string) error {
+			oauthStarted <- struct{}{}
+			return nil
+		},
+	}
+	a.clientFactory = func(token auth.Token) baidu.Client {
+		return &baidu.StaticClient{
+			Entries: map[string][]baidu.RemoteEntry{
+				"/Videos": {{FSID: "1", ServerName: "Movie", Path: "/Videos/Movie", IsDir: true}},
+			},
+		}
+	}
+	releaseMount := make(chan struct{})
+	mountStarted := make(chan struct{}, 1)
+	a.mountFunc = func(path string, root *fs.Filesystem) (*fakeMountServer, error) {
+		mountStarted <- struct{}{}
+		return &fakeMountServer{
+			waitFn:    func() { <-releaseMount },
+			unmountFn: func() error { return nil },
+		}, nil
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- a.Run()
+	}()
+	select {
+	case <-mountStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("mount was not reached")
+	}
+	select {
+	case <-oauthStarted:
+		t.Fatal("oauth should not start when stored token is usable")
+	default:
+	}
+	close(releaseMount)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("run did not exit")
 	}
