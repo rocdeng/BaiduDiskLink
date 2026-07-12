@@ -51,6 +51,69 @@ func (s *stubClient) ReadRange(ctx context.Context, fsid string, offset int64, d
 func (s *stubClient) Delete(paths []string) error { return nil }
 func (s *stubClient) RefreshAuth() error          { return nil }
 
+func TestInflightLimiterSerializesOversizedWindows(t *testing.T) {
+	limiter := newByteLimiter(8)
+	if err := limiter.acquire(context.Background(), 6); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() { close(started); done <- limiter.acquire(context.Background(), 6) }()
+	<-started
+	select {
+	case err := <-done:
+		t.Fatalf("second reservation completed early: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	limiter.release(6)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	limiter.release(6)
+}
+
+func TestStatsTracksCacheAndDownloads(t *testing.T) {
+	r := NewReader(&stubClient{})
+	if _, err := r.ReadExactRange(context.Background(), "1", 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReadExactRange(context.Background(), "1", 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	stats := r.Stats()
+	if stats.CacheHits == 0 || stats.CacheMisses == 0 {
+		t.Fatalf("cache stats=%+v", stats)
+	}
+	if stats.PeakDownloads != 1 || stats.ActiveDownloads != 0 {
+		t.Fatalf("download stats=%+v", stats)
+	}
+}
+
+func TestExactReadsCoalesceSameWindow(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	client := &stubClient{readStarted: started, readRelease: release}
+	r := NewReader(client)
+	done := make(chan error, 2)
+	go func() { _, err := r.ReadExactRange(context.Background(), "1", 0, 4); done <- err }()
+	<-started
+	go func() { _, err := r.ReadExactRange(context.Background(), "1", 0, 4); done <- err }()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	reads := client.readCalls
+	client.mu.Unlock()
+	if reads != 1 {
+		t.Fatalf("coalesced exact reads=%d want=1", reads)
+	}
+}
+
 func TestReadCacheMaintainsFSIDIndex(t *testing.T) {
 	r := NewReader(&stubClient{})
 	r.cacheLimit = 6
