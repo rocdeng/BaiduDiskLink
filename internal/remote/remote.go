@@ -124,6 +124,26 @@ func (r *Reader) ReadRange(ctx context.Context, fsid string, offset, length int6
 	return r.readWithOptions(ctx, client, fsid, offset, length)
 }
 
+func (r *Reader) Prefetch(ctx context.Context, fsid string, offset, length int64) error {
+	if r == nil || length <= 0 {
+		return nil
+	}
+	if fsid == "" {
+		return errors.New("fsid is required")
+	}
+	if offset < 0 {
+		return errors.New("offset must be non-negative")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := r.readCached(fsid, offset, length); ok {
+		return nil
+	}
+	_, err := r.ReadExactRange(ctx, fsid, offset, length)
+	return err
+}
+
 func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length int64) ([]byte, error) {
 	if length < 0 {
 		return nil, errors.New("length must be non-negative")

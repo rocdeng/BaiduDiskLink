@@ -51,6 +51,26 @@ func (s *stubClient) ReadRange(ctx context.Context, fsid string, offset int64, d
 func (s *stubClient) Delete(paths []string) error { return nil }
 func (s *stubClient) RefreshAuth() error          { return nil }
 
+func TestPrefetchPopulatesCache(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	if err := r.Prefetch(context.Background(), "1", 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	before := client.readCalls
+	client.mu.Unlock()
+	if _, err := r.ReadExactRange(context.Background(), "1", 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	after := client.readCalls
+	client.mu.Unlock()
+	if after != before {
+		t.Fatalf("foreground read missed prefetched cache: before=%d after=%d", before, after)
+	}
+}
+
 func TestReadCacheEvictsByByteBudgetAndPromotesHits(t *testing.T) {
 	r := NewReader(&stubClient{})
 	r.cacheLimit = 10

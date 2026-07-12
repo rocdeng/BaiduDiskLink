@@ -726,12 +726,90 @@ func inodeTime(mtm int64) time.Time {
 }
 
 type entryFileHandle struct {
-	mu           sync.Mutex
-	window       []byte
-	windowOff    int64
-	windowSize   int64
-	lastRead     int64
-	lastStrategy string
+	mu              sync.Mutex
+	window          []byte
+	windowOff       int64
+	windowSize      int64
+	windowLevel     int
+	lastRead        int64
+	lastReadEnd     int64
+	lastProgressEnd int64
+	lastStrategy    string
+	prefetchCancel  context.CancelFunc
+	prefetchDone    chan struct{}
+	prefetchOff     int64
+	prefetchLen     int64
+	prefetchID      uint64
+	closed          bool
+}
+
+func (h *entryFileHandle) startPrefetch(remote *remote.Reader, entry store.Entry) {
+	if h == nil || remote == nil || h.closed || len(h.window) == 0 {
+		return
+	}
+	consumed := h.lastReadEnd - h.windowOff
+	if consumed < int64(len(h.window))/2 {
+		return
+	}
+	off := h.windowOff + int64(len(h.window))
+	length := [...]int64{4 << 20, 8 << 20, 16 << 20, 32 << 20}[h.windowLevel]
+	if entry.Size > 0 {
+		if off >= entry.Size {
+			return
+		}
+		if off+length > entry.Size {
+			length = entry.Size - off
+		}
+	}
+	if length <= 0 || h.prefetchDone != nil && h.prefetchOff == off && h.prefetchLen == length {
+		return
+	}
+	if h.prefetchCancel != nil {
+		h.prefetchCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	h.prefetchID++
+	id := h.prefetchID
+	h.prefetchCancel, h.prefetchDone = cancel, done
+	h.prefetchOff, h.prefetchLen = off, length
+	go func() {
+		_ = remote.Prefetch(ctx, entry.FSID, off, length)
+		close(done)
+		h.mu.Lock()
+		if h.prefetchID == id {
+			h.prefetchCancel = nil
+			h.prefetchDone = nil
+		}
+		h.mu.Unlock()
+	}()
+}
+
+func (h *entryFileHandle) Release(ctx context.Context) syscall.Errno {
+	if h == nil {
+		return 0
+	}
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return 0
+	}
+	h.closed = true
+	cancel := h.prefetchCancel
+	done := h.prefetchDone
+	h.prefetchCancel = nil
+	h.prefetchDone = nil
+	h.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}
+	return 0
 }
 
 func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64) ([]byte, error) {
@@ -744,30 +822,45 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	if entry.Size > 0 && off >= entry.Size {
 		return []byte{}, nil
 	}
-	if h.windowSize <= 0 {
-		h.windowSize = fuseReadWindowSize
-	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	firstHighOffsetRead := h.lastRead < 0 && off >= h.windowSize
-	jump := firstHighOffsetRead || (h.lastRead >= 0 && off > h.lastRead+int64(len(h.window)) && off-h.lastRead > h.windowSize)
-	h.lastRead = off
+	if h.lastReadEnd == 0 && h.lastRead < 0 {
+		h.lastReadEnd = -1
+	}
+	windowEnd := h.windowOff + int64(len(h.window))
+	seek := h.lastReadEnd >= 0 && (off < h.lastRead || off > windowEnd)
 	if len(h.window) > 0 {
 		if data, ok := h.sliceWindow(off, length); ok {
+			if off+int64(len(data)) > h.lastProgressEnd {
+				h.lastProgressEnd = off + int64(len(data))
+			}
+			h.lastRead, h.lastReadEnd = off, off+int64(len(data))
 			h.lastStrategy = "handle-cache"
+			h.startPrefetch(remote, entry)
 			return data, nil
 		}
 	}
-	fetchLen := h.windowSize
-	if jump {
-		fetchLen = min64(length*2, h.windowSize/2)
-		if fetchLen < length {
-			fetchLen = length
-		}
-	}
+	windows := [...]int64{4 << 20, 8 << 20, 16 << 20, 32 << 20}
+	fetchLen := windows[h.windowLevel]
 	fetchOff := off
-	if !jump {
-		fetchOff = (off / h.windowSize) * h.windowSize
+	if seek {
+		if h.prefetchCancel != nil {
+			h.prefetchCancel()
+			h.prefetchCancel = nil
+			h.prefetchDone = nil
+		}
+		fetchLen = length * 2
+		if fetchLen < 1<<20 {
+			fetchLen = 1 << 20
+		}
+		if fetchLen > 4<<20 {
+			fetchLen = 4 << 20
+		}
+		h.windowLevel = 0
+		h.lastProgressEnd = off
+	} else if h.lastReadEnd >= 0 && off >= h.lastReadEnd && h.windowLevel < len(windows)-1 {
+		h.windowLevel++
+		fetchLen = windows[h.windowLevel]
 	}
 	if fetchLen < length {
 		fetchLen = length
@@ -777,19 +870,25 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	}
 	var data []byte
 	var err error
-	if jump {
+	if seek {
 		data, err = remote.ReadExactRange(ctx, entry.FSID, fetchOff, fetchLen)
 		h.lastStrategy = "seek-exact"
 	} else {
-		data, err = remote.ReadRange(ctx, entry.FSID, fetchOff, fetchLen)
-		h.lastStrategy = "window-prefetch"
+		data, err = remote.ReadExactRange(ctx, entry.FSID, fetchOff, fetchLen)
+		h.lastStrategy = "adaptive-window"
 	}
 	if err != nil {
 		return nil, err
 	}
 	h.windowOff = fetchOff
 	h.window = data
-	return h.sliceWindowOrEmpty(off, length), nil
+	result := h.sliceWindowOrEmpty(off, length)
+	h.lastRead, h.lastReadEnd = off, off+int64(len(result))
+	if h.lastReadEnd > h.lastProgressEnd {
+		h.lastProgressEnd = h.lastReadEnd
+	}
+	h.startPrefetch(remote, entry)
+	return result, nil
 }
 
 func min64(a, b int64) int64 {
