@@ -120,23 +120,6 @@ func TestEntryReadUsesCachedWindowWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestPrefetchUsesNextAdaptiveWindowSize(t *testing.T) {
-	h := &entryFileHandle{window: make([]byte, 4<<20), windowOff: 0, windowLevel: 0, lastReadEnd: 3 << 20}
-	client := &countingReadClient{}
-	r := remote.NewReader(client)
-	h.startPrefetch(r, store.Entry{FSID: "1", Size: 64 << 20})
-	h.mu.Lock()
-	done := h.prefetchDone
-	h.mu.Unlock()
-	if done != nil {
-		<-done
-	}
-	lengths := client.readLengths()
-	if len(lengths) != 1 || lengths[0] != 8<<20 {
-		t.Fatalf("prefetch lengths=%v want 8MiB", lengths)
-	}
-}
-
 func TestEntryFileHandleReleaseCancelsPrefetch(t *testing.T) {
 	done := make(chan struct{})
 	h := &entryFileHandle{prefetchDone: done}

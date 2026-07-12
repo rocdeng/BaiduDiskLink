@@ -10,74 +10,18 @@ import (
 
 import "context"
 
-import "sync/atomic"
-
-type byteLimiter struct {
-	mu    sync.Mutex
-	used  int64
-	limit int64
-	wake  chan struct{}
-}
-
-func newByteLimiter(limit int64) *byteLimiter {
-	return &byteLimiter{limit: limit, wake: make(chan struct{})}
-}
-
-func (l *byteLimiter) acquire(ctx context.Context, n int64) error {
-	for {
-		l.mu.Lock()
-		allowed := l.used == 0 || n <= l.limit && l.used+n <= l.limit
-		if allowed {
-			l.used += n
-			l.mu.Unlock()
-			return nil
-		}
-		wake := l.wake
-		l.mu.Unlock()
-		select {
-		case <-wake:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func (l *byteLimiter) release(n int64) {
-	l.mu.Lock()
-	l.used -= n
-	if l.used < 0 {
-		l.used = 0
-	}
-	close(l.wake)
-	l.wake = make(chan struct{})
-	l.mu.Unlock()
-}
-
-type Stats struct {
-	CacheHits       uint64
-	CacheMisses     uint64
-	ActiveDownloads int64
-	PeakDownloads   int64
-}
-
 type Reader struct {
-	mu              sync.RWMutex
-	client          baidu.Client
-	links           map[string]cachedLink
-	cached          map[cacheKey]cachedRead
-	cacheByFSID     map[string]map[cacheKey]struct{}
-	cacheOrder      []cacheKey
-	cacheBytes      int64
-	cacheLimit      int64
-	inflight        map[cacheKey]*inflightRead
-	concurrency     int
-	chunkSize       int64
-	downloadSlots   chan struct{}
-	inflightLimiter *byteLimiter
-	cacheHits       atomic.Uint64
-	cacheMisses     atomic.Uint64
-	activeDownloads atomic.Int64
-	peakDownloads   atomic.Int64
+	mu          sync.RWMutex
+	client      baidu.Client
+	links       map[string]cachedLink
+	cached      map[cacheKey]cachedRead
+	cacheByFSID map[string]map[cacheKey]struct{}
+	cacheOrder  []cacheKey
+	cacheBytes  int64
+	cacheLimit  int64
+	inflight    map[cacheKey]*inflightRead
+	concurrency int
+	chunkSize   int64
 }
 
 type cacheKey struct {
@@ -107,36 +51,14 @@ const maxCachedWindows = 8
 
 func NewReader(client baidu.Client) *Reader {
 	return &Reader{
-		client:          client,
-		links:           make(map[string]cachedLink),
-		cached:          make(map[cacheKey]cachedRead),
-		cacheByFSID:     make(map[string]map[cacheKey]struct{}),
-		inflight:        make(map[cacheKey]*inflightRead),
-		cacheLimit:      64 << 20,
-		concurrency:     1,
-		chunkSize:       4 << 20,
-		downloadSlots:   make(chan struct{}, 1),
-		inflightLimiter: newByteLimiter(64 << 20),
-	}
-}
-
-func (r *Reader) Stats() Stats {
-	if r == nil {
-		return Stats{}
-	}
-	return Stats{
-		CacheHits:       r.cacheHits.Load(),
-		CacheMisses:     r.cacheMisses.Load(),
-		ActiveDownloads: r.activeDownloads.Load(),
-		PeakDownloads:   r.peakDownloads.Load(),
-	}
-}
-
-func updatePeak(value int64, peak *atomic.Int64) {
-	for current := peak.Load(); value > current; current = peak.Load() {
-		if peak.CompareAndSwap(current, value) {
-			return
-		}
+		client:      client,
+		links:       make(map[string]cachedLink),
+		cached:      make(map[cacheKey]cachedRead),
+		cacheByFSID: make(map[string]map[cacheKey]struct{}),
+		inflight:    make(map[cacheKey]*inflightRead),
+		cacheLimit:  64 << 20,
+		concurrency: 1,
+		chunkSize:   4 << 20,
 	}
 }
 
@@ -154,7 +76,6 @@ func (r *Reader) SetDownloadOptions(concurrency int, chunkSize int64) {
 	defer r.mu.Unlock()
 	r.concurrency = concurrency
 	r.chunkSize = chunkSize
-	r.downloadSlots = make(chan struct{}, concurrency)
 	r.clearReadCacheLocked()
 }
 
@@ -242,54 +163,31 @@ func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
 	}
-	inflight, owner := r.beginInflight(fsid, offset)
-	if !owner {
-		select {
-		case <-inflight.done:
-			return sliceForWindow(inflight.data, offset, offset, length), inflight.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	if err := r.reserveWindow(ctx, length); err != nil {
-		r.finishInflight(fsid, offset, inflight, nil, err)
-		return nil, err
-	}
-	defer r.releaseWindow(length)
 	data := make([]byte, length)
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		n, err := r.readClientRange(ctx, client, fsid, offset, data)
+		n, err := client.ReadRange(ctx, fsid, offset, data)
 		if err == nil {
 			data = data[:n]
 			r.storeCached(fsid, offset, data)
-			r.finishInflight(fsid, offset, inflight, data, nil)
 			return data, nil
 		}
 		lastErr = err
 		if ctx.Err() != nil {
-			r.finishInflight(fsid, offset, inflight, nil, ctx.Err())
 			return nil, ctx.Err()
 		}
 		_ = client.RefreshAuth()
 	}
-	r.finishInflight(fsid, offset, inflight, nil, lastErr)
 	return nil, lastErr
 }
 
 func (r *Reader) readCached(fsid string, offset, length int64) ([]byte, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if r == nil {
 		return nil, false
 	}
-	r.mu.RLock()
-	data, ok := r.readCachedLocked(fsid, offset, length)
-	r.mu.RUnlock()
-	if ok {
-		r.cacheHits.Add(1)
-	} else {
-		r.cacheMisses.Add(1)
-	}
-	return data, ok
+	return r.readCachedLocked(fsid, offset, length)
 }
 
 func (r *Reader) storeCached(fsid string, offset int64, data []byte) {
@@ -395,49 +293,6 @@ func sliceForRead(data []byte, offset, length int64) []byte {
 	return append([]byte(nil), data[:length]...)
 }
 
-func (r *Reader) reserveWindow(ctx context.Context, length int64) error {
-	if r == nil || length <= 0 {
-		return nil
-	}
-	return r.inflightLimiter.acquire(ctx, length)
-}
-
-func (r *Reader) releaseWindow(length int64) {
-	if r != nil && length > 0 {
-		r.inflightLimiter.release(length)
-	}
-}
-
-func (r *Reader) acquireDownload(ctx context.Context) error {
-	r.mu.RLock()
-	slots := r.downloadSlots
-	r.mu.RUnlock()
-	select {
-	case slots <- struct{}{}:
-		active := r.activeDownloads.Add(1)
-		updatePeak(active, &r.peakDownloads)
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (r *Reader) releaseDownload() {
-	r.mu.RLock()
-	slots := r.downloadSlots
-	r.mu.RUnlock()
-	<-slots
-	r.activeDownloads.Add(-1)
-}
-
-func (r *Reader) readClientRange(ctx context.Context, client baidu.Client, fsid string, offset int64, dst []byte) (int, error) {
-	if err := r.acquireDownload(ctx); err != nil {
-		return 0, err
-	}
-	defer r.releaseDownload()
-	return client.ReadRange(ctx, fsid, offset, dst)
-}
-
 func (r *Reader) readWithOptions(ctx context.Context, client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
 	r.mu.RLock()
 	concurrency := r.concurrency
@@ -479,7 +334,7 @@ func (r *Reader) readSequential(ctx context.Context, client baidu.Client, fsid s
 	data := make([]byte, fetchLength)
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		n, err := r.readClientRange(ctx, client, fsid, fetchOffset, data)
+		n, err := client.ReadRange(ctx, fsid, fetchOffset, data)
 		if err == nil {
 			data = data[:n]
 			r.finishInflight(fsid, fetchOffset, inflight, data, nil)
@@ -598,7 +453,7 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 				dst := buf[begin:end]
 				var err error
 				for attempt := 0; attempt < 2; attempt++ {
-					_, err = r.readClientRange(ctx, client, fsid, start, dst)
+					_, err = client.ReadRange(ctx, fsid, start, dst)
 					if err == nil {
 						break
 					}

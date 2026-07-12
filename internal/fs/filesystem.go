@@ -752,11 +752,7 @@ func (h *entryFileHandle) startPrefetch(remote *remote.Reader, entry store.Entry
 		return
 	}
 	off := h.windowOff + int64(len(h.window))
-	level := h.windowLevel + 1
-	if level > 3 {
-		level = 3
-	}
-	length := [...]int64{4 << 20, 8 << 20, 16 << 20, 32 << 20}[level]
+	length := [...]int64{4 << 20, 8 << 20, 16 << 20, 32 << 20}[h.windowLevel]
 	if entry.Size > 0 {
 		if off >= entry.Size {
 			return
