@@ -76,6 +76,9 @@ func (s *Store) upsertEntries(entries []Entry) error {
 	if s == nil || s.db == nil {
 		return errors.New("db is required")
 	}
+	if len(entries) == 0 {
+		return nil
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err

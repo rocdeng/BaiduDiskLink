@@ -19,16 +19,17 @@ import "context"
 import "net"
 
 type APIClient struct {
-	mu            sync.Mutex
-	accessToken   string
-	refreshToken  string
-	clientID      string
-	clientSecret  string
-	tokenURL      string
-	apiBaseURL    string
-	httpClient    *http.Client
-	onTokenUpdate func(accessToken, refreshToken string) error
-	links         map[string]DownloadLink
+	mu             sync.Mutex
+	accessToken    string
+	refreshToken   string
+	clientID       string
+	clientSecret   string
+	tokenURL       string
+	apiBaseURL     string
+	metadataClient *http.Client
+	downloadClient *http.Client
+	onTokenUpdate  func(accessToken, refreshToken string) error
+	links          map[string]DownloadLink
 }
 
 type apiListResponse struct {
@@ -113,8 +114,15 @@ func NewAPIClientWithBaseURLs(accessToken, refreshToken, clientID, clientSecret,
 }
 
 func NewAPIClientWithBaseURLsAndCallback(accessToken, refreshToken, clientID, clientSecret, apiBaseURL, tokenURL string, httpClient *http.Client, onTokenUpdate func(accessToken, refreshToken string) error) *APIClient {
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
+	return NewAPIClientWithHTTPClients(accessToken, refreshToken, clientID, clientSecret, apiBaseURL, tokenURL, httpClient, httpClient, onTokenUpdate)
+}
+
+func NewAPIClientWithHTTPClients(accessToken, refreshToken, clientID, clientSecret, apiBaseURL, tokenURL string, metadataClient, downloadClient *http.Client, onTokenUpdate func(accessToken, refreshToken string) error) *APIClient {
+	if metadataClient == nil {
+		metadataClient = NewMetadataHTTPClient()
+	}
+	if downloadClient == nil {
+		downloadClient = metadataClient
 	}
 	if apiBaseURL == "" {
 		apiBaseURL = "https://pan.baidu.com"
@@ -123,15 +131,16 @@ func NewAPIClientWithBaseURLsAndCallback(accessToken, refreshToken, clientID, cl
 		tokenURL = "https://openapi.baidu.com/oauth/2.0/token"
 	}
 	return &APIClient{
-		accessToken:   accessToken,
-		refreshToken:  refreshToken,
-		clientID:      clientID,
-		clientSecret:  clientSecret,
-		tokenURL:      tokenURL,
-		apiBaseURL:    apiBaseURL,
-		httpClient:    httpClient,
-		onTokenUpdate: onTokenUpdate,
-		links:         make(map[string]DownloadLink),
+		accessToken:    accessToken,
+		refreshToken:   refreshToken,
+		clientID:       clientID,
+		clientSecret:   clientSecret,
+		tokenURL:       tokenURL,
+		apiBaseURL:     apiBaseURL,
+		metadataClient: metadataClient,
+		downloadClient: downloadClient,
+		onTokenUpdate:  onTokenUpdate,
+		links:          make(map[string]DownloadLink),
 	}
 }
 
@@ -318,7 +327,7 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	end := offset + int64(len(dst)) - 1
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
 	req.Header.Set("User-Agent", "pan.baidu.com")
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.downloadClient.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -334,6 +343,12 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	if start != offset {
 		return 0, fmt.Errorf("download content range starts at %d, want %d", start, offset)
 	}
+	if rangeEnd > end {
+		return 0, fmt.Errorf("download content range ends at %d, requested at most %d", rangeEnd, end)
+	}
+	if rangeEnd < end && !(total >= 0 && rangeEnd == total-1) {
+		return 0, fmt.Errorf("download content range ends at %d before requested end %d: %w", rangeEnd, end, io.ErrUnexpectedEOF)
+	}
 	limited := io.LimitReader(resp.Body, int64(len(dst))+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
@@ -342,9 +357,10 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	if len(data) > len(dst) {
 		return 0, fmt.Errorf("download range exceeded requested length %d", len(dst))
 	}
+	want := rangeEnd - start + 1
 	n := copy(dst, data)
-	if n < len(dst) && !(total >= 0 && rangeEnd == total-1) {
-		return n, io.ErrUnexpectedEOF
+	if int64(n) != want {
+		return n, fmt.Errorf("download range body length %d, declared %d: %w", n, want, io.ErrUnexpectedEOF)
 	}
 	return n, nil
 }
@@ -359,7 +375,7 @@ func (c *APIClient) resolveDownloadURL(link string) (string, error) {
 	q.Set("access_token", c.token())
 	req.URL.RawQuery = q.Encode()
 
-	client := *c.httpClient
+	client := *c.metadataClient
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
@@ -394,7 +410,7 @@ func (c *APIClient) RefreshAuth() error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.metadataClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -464,7 +480,7 @@ func (c *APIClient) getJSON(rawurl string, out any) error {
 }
 
 func (c *APIClient) doJSON(req *http.Request, out any) error {
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.metadataClient.Do(req)
 	if err != nil {
 		return err
 	}

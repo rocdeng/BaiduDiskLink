@@ -2,6 +2,8 @@ package remote
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -182,8 +184,8 @@ func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length
 }
 
 func (r *Reader) readCached(fsid string, offset, length int64) ([]byte, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r == nil {
 		return nil, false
 	}
@@ -228,8 +230,8 @@ func (r *Reader) ReadCachedWindow(fsid string, offset, length int64) ([]byte, bo
 	if length <= 0 {
 		return nil, false
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.readCachedLocked(fsid, offset, length)
 }
 
@@ -316,7 +318,7 @@ func (r *Reader) readSequential(ctx context.Context, client baidu.Client, fsid s
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
 	}
-	if data, err, waited := r.waitInflight(fsid, fetchOffset, offset, length); waited {
+	if data, err, waited := r.waitInflight(ctx, fsid, fetchOffset, offset, length); waited {
 		return data, err
 	}
 	inflight, owner := r.beginInflight(fsid, fetchOffset)
@@ -373,8 +375,7 @@ func sliceForWindow(data []byte, windowOffset, offset, length int64) []byte {
 	}
 	return append([]byte(nil), data[start:end]...)
 }
-
-func (r *Reader) waitInflight(fsid string, windowOffset, offset, length int64) ([]byte, error, bool) {
+func (r *Reader) waitInflight(ctx context.Context, fsid string, windowOffset, offset, length int64) ([]byte, error, bool) {
 	key := cacheKey{fsid: fsid, offset: windowOffset}
 	r.mu.RLock()
 	inflight := r.inflight[key]
@@ -382,11 +383,15 @@ func (r *Reader) waitInflight(fsid string, windowOffset, offset, length int64) (
 	if inflight == nil {
 		return nil, nil, false
 	}
-	<-inflight.done
-	if inflight.err != nil {
-		return nil, inflight.err, true
+	select {
+	case <-inflight.done:
+		if inflight.err != nil {
+			return nil, inflight.err, true
+		}
+		return sliceForWindow(inflight.data, windowOffset, offset, length), nil, true
+	case <-ctx.Done():
+		return nil, ctx.Err(), true
 	}
-	return sliceForWindow(inflight.data, windowOffset, offset, length), nil, true
 }
 
 func (r *Reader) beginInflight(fsid string, windowOffset int64) (*inflightRead, bool) {
@@ -453,7 +458,11 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 				dst := buf[begin:end]
 				var err error
 				for attempt := 0; attempt < 2; attempt++ {
-					_, err = client.ReadRange(ctx, fsid, start, dst)
+					var n int
+					n, err = client.ReadRange(ctx, fsid, start, dst)
+					if err == nil && n != len(dst) {
+						err = fmt.Errorf("read chunk at %d returned %d of %d bytes: %w", start, n, len(dst), io.ErrUnexpectedEOF)
+					}
 					if err == nil {
 						break
 					}

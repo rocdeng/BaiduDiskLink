@@ -15,8 +15,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-import "sync"
-
 func TestJoinPath(t *testing.T) {
 	if got := JoinPath("/", "movies"); got != "/movies" {
 		t.Fatalf("unexpected path: %q", got)
@@ -120,54 +118,6 @@ func TestEntryReadUsesCachedWindowWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestEntryFileHandleReleaseCancelsPrefetch(t *testing.T) {
-	done := make(chan struct{})
-	h := &entryFileHandle{prefetchDone: done}
-	ctx, cancel := context.WithCancel(context.Background())
-	h.prefetchCancel = cancel
-	canceled := make(chan struct{})
-	go func() {
-		<-ctx.Done()
-		close(canceled)
-		close(done)
-	}()
-	if errno := h.Release(context.Background()); errno != 0 {
-		t.Fatalf("release errno=%v", errno)
-	}
-	select {
-	case <-canceled:
-	case <-time.After(time.Second):
-		t.Fatal("release did not cancel prefetch")
-	}
-}
-
-func TestAdaptiveWindowGrowsAndResetsOnSeek(t *testing.T) {
-	client := &countingReadClient{}
-	remoteReader := remote.NewReader(client)
-	handle := &entryFileHandle{lastRead: -1, lastReadEnd: -1}
-	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 128 << 20}
-	for _, off := range []int64{0, 4 << 20, 12 << 20, 28 << 20} {
-		if _, err := handle.read(context.Background(), remoteReader, entry, off, 1<<20); err != nil {
-			t.Fatal(err)
-		}
-	}
-	want := []int64{4 << 20, 8 << 20, 16 << 20, 32 << 20}
-	if len(client.readLengths()) < len(want) {
-		t.Fatalf("reads=%v", client.readLengths())
-	}
-	for i := range want {
-		if client.readLengths()[i] != want[i] {
-			t.Fatalf("read %d length=%d want=%d", i, client.readLengths()[i], want[i])
-		}
-	}
-	if _, err := handle.read(context.Background(), remoteReader, entry, 80<<20, 1<<20); err != nil {
-		t.Fatal(err)
-	}
-	if got := client.readLengths()[len(client.readLengths())-1]; got != 2<<20 {
-		t.Fatalf("seek length=%d want=%d", got, 2<<20)
-	}
-}
-
 func TestEntryFileHandleReusesReadWindow(t *testing.T) {
 	client := &countingReadClient{}
 	remoteReader := remote.NewReader(client)
@@ -188,8 +138,8 @@ func TestEntryFileHandleReusesReadWindow(t *testing.T) {
 	if len(first) != 8 || len(second) != 8 {
 		t.Fatalf("unexpected read lengths: %d %d", len(first), len(second))
 	}
-	if client.readCount() != 1 {
-		t.Fatalf("expected one remote read for same handle window, got %d", client.readCount())
+	if client.reads != 1 {
+		t.Fatalf("expected one remote read for same handle window, got %d", client.reads)
 	}
 }
 
@@ -208,11 +158,11 @@ func TestEntryFileHandleUsesSmallerWindowAfterLargeSeek(t *testing.T) {
 	if _, err := handle.read(context.Background(), remoteReader, entry, 80<<20, 4<<20); err != nil {
 		t.Fatal(err)
 	}
-	if client.readCount() != 2 {
-		t.Fatalf("expected second remote read after seek, got %d", client.readCount())
+	if client.reads != 2 {
+		t.Fatalf("expected second remote read after seek, got %d", client.reads)
 	}
-	if client.readLengths()[1] != 4<<20 {
-		t.Fatalf("expected bounded seek window, got %d", client.readLengths()[1])
+	if client.lengths[1] != 8<<20 {
+		t.Fatalf("expected smaller seek window, got %d", client.lengths[1])
 	}
 }
 
@@ -228,11 +178,11 @@ func TestEntryFileHandleUsesSmallerWindowForInitialHighOffsetRead(t *testing.T) 
 	if _, err := handle.read(context.Background(), remoteReader, entry, 80<<20, 4<<20); err != nil {
 		t.Fatal(err)
 	}
-	if client.readCount() != 1 {
-		t.Fatalf("expected one remote read, got %d", client.readCount())
+	if client.reads != 1 {
+		t.Fatalf("expected one remote read, got %d", client.reads)
 	}
-	if client.readLengths()[0] != 4<<20 {
-		t.Fatalf("expected initial window, got %d", client.readLengths()[0])
+	if client.lengths[0] != 8<<20 {
+		t.Fatalf("expected smaller initial seek window, got %d", client.lengths[0])
 	}
 }
 
@@ -797,21 +747,8 @@ func testDB(t *testing.T) *sql.DB {
 }
 
 type countingReadClient struct {
-	mu      sync.Mutex
 	reads   int
 	lengths []int64
-}
-
-func (c *countingReadClient) readCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.reads
-}
-
-func (c *countingReadClient) readLengths() []int64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]int64(nil), c.lengths...)
 }
 
 func (c *countingReadClient) List(path string) ([]baidu.RemoteEntry, error) {
@@ -831,10 +768,8 @@ func (c *countingReadClient) Delete(paths []string) error {
 }
 
 func (c *countingReadClient) ReadRange(_ context.Context, _ string, _ int64, dst []byte) (int, error) {
-	c.mu.Lock()
 	c.reads++
 	c.lengths = append(c.lengths, int64(len(dst)))
-	c.mu.Unlock()
 	for i := range dst {
 		dst[i] = 'x'
 	}

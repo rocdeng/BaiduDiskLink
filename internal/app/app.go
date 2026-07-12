@@ -162,7 +162,7 @@ func New(cfg Config) (*App, error) {
 			AuthorizeBaseURL: cfg.AuthorizeBaseURL,
 		}, mgr),
 		clientFactory: func(token auth.Token) baidu.Client {
-			return baidu.NewAPIClientWithBaseURLs(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, baidu.NewDownloadHTTPClient(cfg.DownloadConcurrency))
+			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(cfg.DownloadConcurrency), nil)
 		},
 		mountFunc: func(mountPath string, root *fs.Filesystem) (*fakeMountServer, error) {
 			server, err := fs.Mount(mountPath, root, fs.MountOptions{
@@ -381,7 +381,7 @@ func (a *App) bindRemoteClient() error {
 	}
 	if a.clientFactory == nil {
 		a.clientFactory = func(token auth.Token) baidu.Client {
-			return baidu.NewAPIClientWithBaseURLsAndCallback(token.AccessToken, token.RefreshToken, a.cfg.ClientID, a.cfg.ClientSecret, a.cfg.APIBaseURL, a.cfg.TokenBaseURL, nil, func(accessToken, refreshToken string) error {
+			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, a.cfg.ClientID, a.cfg.ClientSecret, a.cfg.APIBaseURL, a.cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(a.cfg.DownloadConcurrency), func(accessToken, refreshToken string) error {
 				return a.auth.SaveToken(auth.Token{AccessToken: accessToken, RefreshToken: refreshToken})
 			})
 		}

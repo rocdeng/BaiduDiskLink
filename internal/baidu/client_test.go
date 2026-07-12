@@ -3,6 +3,7 @@ package baidu
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -41,6 +42,33 @@ func TestNewMetadataHTTPClientHasBoundedTimeout(t *testing.T) {
 	client := NewMetadataHTTPClient()
 	if client.Timeout != 30*time.Second {
 		t.Fatalf("unexpected metadata timeout: %v", client.Timeout)
+	}
+}
+
+func TestAPIClientSeparatesMetadataAndDownloadClients(t *testing.T) {
+	metadataCalls := 0
+	downloadCalls := 0
+	metadataClient := &http.Client{Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+		metadataCalls++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"list":[],"has_more":0,"next_mark":0,"error_code":0}`)), Header: make(http.Header)}, nil
+	}}}
+	downloadClient := &http.Client{Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+		downloadCalls++
+		header := make(http.Header)
+		header.Set("Content-Range", "bytes 0-2/3")
+		return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("abc")), Header: header}, nil
+	}}}
+	client := NewAPIClientWithHTTPClients("token", "refresh", "client", "secret", "", "", metadataClient, downloadClient, nil)
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+
+	if _, err := client.List("/"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3)); err != nil {
+		t.Fatal(err)
+	}
+	if metadataCalls != 1 || downloadCalls != 1 {
+		t.Fatalf("calls metadata=%d download=%d", metadataCalls, downloadCalls)
 	}
 }
 
@@ -110,6 +138,54 @@ func TestAPIClientDownloadLinkAndReadRange(t *testing.T) {
 	}
 	if n != 3 || string(dst) != "abc" || !downloadHit || !headHit {
 		t.Fatalf("unexpected range result: n=%d data=%q downloadHit=%v headHit=%v", n, dst, downloadHit, headHit)
+	}
+}
+
+func TestAPIClientReadRangeRejectsTruncatedBody(t *testing.T) {
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set("Content-Range", "bytes 0-3/4")
+			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("ab")), Header: header}, nil
+		}},
+	})
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+
+	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
+	if err == nil {
+		t.Fatalf("expected truncated body error, got n=%d", n)
+	}
+}
+
+func TestAPIClientReadRangeRejectsShortRangeBeforeEOF(t *testing.T) {
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set("Content-Range", "bytes 0-1/10")
+			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("ab")), Header: header}, nil
+		}},
+	})
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+
+	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected non-EOF short range error, got n=%d err=%v", n, err)
+	}
+}
+
+func TestAPIClientReadRangeRejectsRangePastRequest(t *testing.T) {
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set("Content-Range", "bytes 0-4/10")
+			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("abcde")), Header: header}, nil
+		}},
+	})
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+
+	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
+	if err == nil {
+		t.Fatalf("expected oversized declared range error, got n=%d", n)
 	}
 }
 

@@ -2,6 +2,7 @@ package remote
 
 import (
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ type stubClient struct {
 	readStarted   chan struct{}
 	readRelease   chan struct{}
 	failRead      bool
+	shortRead     bool
 }
 
 func (s *stubClient) List(path string) ([]baidu.RemoteEntry, error) { return nil, nil }
@@ -45,6 +47,9 @@ func (s *stubClient) ReadRange(ctx context.Context, fsid string, offset int64, d
 	}
 	if s.failRead {
 		return 0, errors.New("transient read failure")
+	}
+	if s.shortRead && len(dst) > 0 {
+		return len(dst) - 1, nil
 	}
 	return len(dst), nil
 }
@@ -109,6 +114,27 @@ func TestReadCacheEvictsByByteBudgetAndPromotesHits(t *testing.T) {
 	}
 }
 
+func TestReadCacheConcurrentHits(t *testing.T) {
+	r := NewReader(&stubClient{})
+	r.storeCached("1", 0, []byte("12345678"))
+	r.storeCached("2", 0, []byte("abcdefgh"))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				if data, ok := r.readCached("1", 0, 4); !ok || string(data) != "1234" {
+					t.Errorf("cache miss or corrupt data: %q ok=%v", data, ok)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 func TestReadCacheSkipsOversizedWindow(t *testing.T) {
 	r := NewReader(&stubClient{})
 	r.cacheLimit = 4
@@ -137,6 +163,16 @@ func TestReadRangeRejectsNegativeLength(t *testing.T) {
 	_, err := r.ReadRange(context.Background(), "fsid-1", 10, -1)
 	if err == nil {
 		t.Fatal("expected error for negative length")
+	}
+}
+
+func TestReadConcurrentRejectsShortChunk(t *testing.T) {
+	client := &stubClient{shortRead: true}
+	r := NewReader(client)
+	r.SetDownloadOptions(2, 4)
+
+	if _, err := r.ReadRange(context.Background(), "fsid-1", 0, 8); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected short read error, got %v", err)
 	}
 }
 
@@ -247,5 +283,39 @@ func TestReadRangeCoalescesInflightWindow(t *testing.T) {
 	client.mu.Unlock()
 	if readCalls != 1 {
 		t.Fatalf("expected concurrent reads in one window to share one backend read, got %d", readCalls)
+	}
+}
+
+func TestReadRangeCancelsInflightWaiter(t *testing.T) {
+	client := &stubClient{
+		readStarted: make(chan struct{}, 1),
+		readRelease: make(chan struct{}),
+	}
+	r := NewReader(client)
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, err := r.ReadRange(context.Background(), "fsid-1", 0, 1024)
+		ownerDone <- err
+	}()
+	<-client.readStarted
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := r.ReadRange(ctx, "fsid-1", 2048, 1024)
+		waiterDone <- err
+	}()
+	cancel()
+	select {
+	case err := <-waiterDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected canceled waiter, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("inflight waiter ignored cancellation")
+	}
+	close(client.readRelease)
+	if err := <-ownerDone; err != nil {
+		t.Fatal(err)
 	}
 }

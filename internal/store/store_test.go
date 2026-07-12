@@ -60,6 +60,23 @@ func TestUpsertEntriesRollsBackOnFailure(t *testing.T) {
 	}
 }
 
+func TestUpsertEntriesEmptyBatchIsNoOp(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertEntries(nil); err != nil {
+		t.Fatalf("empty batch must remain a no-op: %v", err)
+	}
+}
+
 func TestUpsertFromRemoteFillsOnlyEmptyParent(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
