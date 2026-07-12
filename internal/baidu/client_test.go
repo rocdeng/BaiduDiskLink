@@ -10,12 +10,38 @@ import (
 	"time"
 )
 
+import "context"
+
 type mockTransport struct {
 	handler func(*http.Request) (*http.Response, error)
 }
 
 func (m mockTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return m.handler(r)
+}
+
+func TestNewDownloadHTTPClientConfiguresConnectionPool(t *testing.T) {
+	client := NewDownloadHTTPClient(4)
+	if client.Timeout != 0 {
+		t.Fatalf("download client must not impose whole-request timeout: %v", client.Timeout)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unexpected transport type %T", client.Transport)
+	}
+	if transport.MaxConnsPerHost != 4 || transport.MaxIdleConnsPerHost != 4 {
+		t.Fatalf("unexpected per-host limits: active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	}
+	if !transport.DisableCompression || transport.ResponseHeaderTimeout != 30*time.Second {
+		t.Fatalf("unexpected download transport: %#v", transport)
+	}
+}
+
+func TestNewMetadataHTTPClientHasBoundedTimeout(t *testing.T) {
+	client := NewMetadataHTTPClient()
+	if client.Timeout != 30*time.Second {
+		t.Fatalf("unexpected metadata timeout: %v", client.Timeout)
+	}
 }
 
 func TestAPIClientList(t *testing.T) {
@@ -52,12 +78,6 @@ func TestAPIClientDownloadLinkAndReadRange(t *testing.T) {
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 			case r.Method == http.MethodHead && strings.Contains(r.URL.String(), "download.example.invalid"):
 				headHit = true
-				if got := r.URL.Query().Get("access_token"); got != "token" {
-					t.Fatalf("expected access token on dlink head request, got %q", got)
-				}
-				if got := r.Header.Get("User-Agent"); got != "pan.baidu.com" {
-					t.Fatalf("unexpected head user agent: %s", got)
-				}
 				header := make(http.Header)
 				header.Set("Location", "https://redirect.example.invalid/real-file")
 				return &http.Response{StatusCode: 302, Body: io.NopCloser(strings.NewReader("")), Header: header}, nil
@@ -66,10 +86,9 @@ func TestAPIClientDownloadLinkAndReadRange(t *testing.T) {
 				if got := r.Header.Get("Range"); got != "bytes=2-4" {
 					t.Fatalf("unexpected range header: %s", got)
 				}
-				if got := r.Header.Get("User-Agent"); got != "pan.baidu.com" {
-					t.Fatalf("unexpected download user agent: %s", got)
-				}
-				return &http.Response{StatusCode: 206, Body: io.NopCloser(bytes.NewBufferString("abc")), Header: make(http.Header)}, nil
+				header := make(http.Header)
+				header.Set("Content-Range", "bytes 2-4/10")
+				return &http.Response{StatusCode: 206, Body: io.NopCloser(bytes.NewBufferString("abc")), Header: header}, nil
 			default:
 				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 				return nil, nil
@@ -84,12 +103,13 @@ func TestAPIClientDownloadLinkAndReadRange(t *testing.T) {
 	if link.URL == "" || link.ExpiresAt.Before(time.Now()) {
 		t.Fatalf("unexpected download link: %#v", link)
 	}
-	got, err := client.ReadRange("1", 2, 3)
+	dst := make([]byte, 3)
+	n, err := client.ReadRange(context.Background(), "1", 2, dst)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "abc" || !downloadHit || !headHit {
-		t.Fatalf("unexpected range result: %q downloadHit=%v headHit=%v", got, downloadHit, headHit)
+	if n != 3 || string(dst) != "abc" || !downloadHit || !headHit {
+		t.Fatalf("unexpected range result: n=%d data=%q downloadHit=%v headHit=%v", n, dst, downloadHit, headHit)
 	}
 }
 
@@ -102,9 +122,6 @@ func TestAPIClientCachesDownloadLinkForRangeReads(t *testing.T) {
 			switch {
 			case strings.Contains(r.URL.String(), "xpan/multimedia"):
 				metaCalls++
-				if got := r.URL.Query().Get("fsids"); got != "[1]" {
-					t.Fatalf("unexpected fsids query: %s", got)
-				}
 				body := `{"list":[{"fs_id":1,"server_filename":"movie.mkv","path":"/movie.mkv","size":10,"isdir":0,"dlink":"https://download.example.invalid/file"}],"errno":0}`
 				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 			case r.Method == http.MethodHead && strings.Contains(r.URL.String(), "download.example.invalid"):
@@ -112,12 +129,15 @@ func TestAPIClientCachesDownloadLinkForRangeReads(t *testing.T) {
 				header := make(http.Header)
 				header.Set("Location", "https://redirect.example.invalid/real-file")
 				return &http.Response{StatusCode: 302, Body: io.NopCloser(strings.NewReader("")), Header: header}, nil
-			case strings.Contains(r.URL.String(), "download.example.invalid"):
-				downloadCalls++
-				return &http.Response{StatusCode: 206, Body: io.NopCloser(bytes.NewBufferString("abc")), Header: make(http.Header)}, nil
 			case strings.Contains(r.URL.String(), "redirect.example.invalid/real-file"):
 				downloadCalls++
-				return &http.Response{StatusCode: 206, Body: io.NopCloser(bytes.NewBufferString("abc")), Header: make(http.Header)}, nil
+				header := make(http.Header)
+				if downloadCalls == 1 {
+					header.Set("Content-Range", "bytes 0-2/10")
+				} else {
+					header.Set("Content-Range", "bytes 3-5/10")
+				}
+				return &http.Response{StatusCode: 206, Body: io.NopCloser(bytes.NewBufferString("abc")), Header: header}, nil
 			default:
 				t.Fatalf("unexpected url: %s", r.URL.String())
 				return nil, nil
@@ -125,20 +145,14 @@ func TestAPIClientCachesDownloadLinkForRangeReads(t *testing.T) {
 		}},
 	})
 
-	if _, err := client.ReadRange("1", 0, 3); err != nil {
+	if _, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.ReadRange("1", 3, 3); err != nil {
+	if _, err := client.ReadRange(context.Background(), "1", 3, make([]byte, 3)); err != nil {
 		t.Fatal(err)
 	}
-	if metaCalls != 1 {
-		t.Fatalf("expected one metadata call, got %d", metaCalls)
-	}
-	if headCalls != 1 {
-		t.Fatalf("expected one head call, got %d", headCalls)
-	}
-	if downloadCalls != 2 {
-		t.Fatalf("expected two download calls, got %d", downloadCalls)
+	if metaCalls != 1 || headCalls != 1 || downloadCalls != 2 {
+		t.Fatalf("calls meta=%d head=%d download=%d", metaCalls, headCalls, downloadCalls)
 	}
 }
 

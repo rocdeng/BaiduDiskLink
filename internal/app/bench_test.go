@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -117,11 +118,18 @@ func (m *mockBenchClient) GetDownloadLink(fsid string) (baidu.DownloadLink, erro
 
 func (m *mockBenchClient) Delete(paths []string) error { return nil }
 
-func (m *mockBenchClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
+func (m *mockBenchClient) ReadRange(_ context.Context, fsid string, offset int64, dst []byte) (int, error) {
 	if m.read != nil {
-		return m.read(fsid, offset, length)
+		data, err := m.read(fsid, offset, int64(len(dst)))
+		if err != nil {
+			return 0, err
+		}
+		return copy(dst, data), nil
 	}
-	return []byte(strings.Repeat("x", int(length))), nil
+	for i := range dst {
+		dst[i] = 'x'
+	}
+	return len(dst), nil
 }
 
 func (m *mockBenchClient) RefreshAuth() error { return nil }

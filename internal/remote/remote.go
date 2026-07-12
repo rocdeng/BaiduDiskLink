@@ -8,12 +8,16 @@ import (
 	"baidudisklink/internal/baidu"
 )
 
+import "context"
+
 type Reader struct {
 	mu          sync.RWMutex
 	client      baidu.Client
 	links       map[string]cachedLink
 	cached      map[cacheKey]cachedRead
 	cacheOrder  []cacheKey
+	cacheBytes  int64
+	cacheLimit  int64
 	inflight    map[cacheKey]*inflightRead
 	concurrency int
 	chunkSize   int64
@@ -50,6 +54,7 @@ func NewReader(client baidu.Client) *Reader {
 		links:       make(map[string]cachedLink),
 		cached:      make(map[cacheKey]cachedRead),
 		inflight:    make(map[cacheKey]*inflightRead),
+		cacheLimit:  64 << 20,
 		concurrency: 1,
 		chunkSize:   4 << 20,
 	}
@@ -99,7 +104,7 @@ func (r *Reader) Delete(paths []string) error {
 	return client.Delete(paths)
 }
 
-func (r *Reader) ReadRange(fsid string, offset, length int64) ([]byte, error) {
+func (r *Reader) ReadRange(ctx context.Context, fsid string, offset, length int64) ([]byte, error) {
 	if length < 0 {
 		return nil, errors.New("length must be non-negative")
 	}
@@ -116,10 +121,10 @@ func (r *Reader) ReadRange(fsid string, offset, length int64) ([]byte, error) {
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
 	}
-	return r.readWithOptions(client, fsid, offset, length)
+	return r.readWithOptions(ctx, client, fsid, offset, length)
 }
 
-func (r *Reader) ReadExactRange(fsid string, offset, length int64) ([]byte, error) {
+func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length int64) ([]byte, error) {
 	if length < 0 {
 		return nil, errors.New("length must be non-negative")
 	}
@@ -136,14 +141,19 @@ func (r *Reader) ReadExactRange(fsid string, offset, length int64) ([]byte, erro
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
 	}
+	data := make([]byte, length)
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		data, err := client.ReadRange(fsid, offset, length)
+		n, err := client.ReadRange(ctx, fsid, offset, data)
 		if err == nil {
+			data = data[:n]
 			r.storeCached(fsid, offset, data)
 			return data, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		_ = client.RefreshAuth()
 	}
 	return nil, lastErr
@@ -168,11 +178,9 @@ func (r *Reader) storeCached(fsid string, offset int64, data []byte) {
 }
 
 func (r *Reader) readCachedLocked(fsid string, offset, length int64) ([]byte, bool) {
-	for _, cached := range r.cached {
-		if len(cached.data) == 0 || cached.fsid != fsid {
-			continue
-		}
-		if offset < cached.offset {
+	for index, key := range r.cacheOrder {
+		cached, ok := r.cached[key]
+		if !ok || len(cached.data) == 0 || cached.fsid != fsid || offset < cached.offset {
 			continue
 		}
 		end := offset + length
@@ -180,8 +188,12 @@ func (r *Reader) readCachedLocked(fsid string, offset, length int64) ([]byte, bo
 		if end > cachedEnd {
 			continue
 		}
+		if index != len(r.cacheOrder)-1 {
+			copy(r.cacheOrder[index:], r.cacheOrder[index+1:])
+			r.cacheOrder[len(r.cacheOrder)-1] = key
+		}
 		start := offset - cached.offset
-		return append([]byte(nil), cached.data[start:start+length]...), true
+		return cached.data[start : start+length], true
 	}
 	return nil, false
 }
@@ -196,25 +208,36 @@ func (r *Reader) ReadCachedWindow(fsid string, offset, length int64) ([]byte, bo
 }
 
 func (r *Reader) storeCachedLocked(fsid string, offset int64, data []byte) {
+	if len(data) == 0 || int64(len(data)) > r.cacheLimit {
+		return
+	}
 	key := cacheKey{fsid: fsid, offset: offset}
-	if _, ok := r.cached[key]; !ok {
-		r.cacheOrder = append(r.cacheOrder, key)
+	if old, ok := r.cached[key]; ok {
+		r.cacheBytes -= int64(len(old.data))
+		for index, existing := range r.cacheOrder {
+			if existing == key {
+				r.cacheOrder = append(r.cacheOrder[:index], r.cacheOrder[index+1:]...)
+				break
+			}
+		}
 	}
-	r.cached[key] = cachedRead{
-		fsid:   fsid,
-		offset: offset,
-		data:   append([]byte(nil), data...),
-	}
-	for len(r.cacheOrder) > maxCachedWindows {
+	r.cached[key] = cachedRead{fsid: fsid, offset: offset, data: data}
+	r.cacheOrder = append(r.cacheOrder, key)
+	r.cacheBytes += int64(len(data))
+	for r.cacheBytes > r.cacheLimit && len(r.cacheOrder) > 0 {
 		oldest := r.cacheOrder[0]
 		r.cacheOrder = r.cacheOrder[1:]
-		delete(r.cached, oldest)
+		if old, ok := r.cached[oldest]; ok {
+			r.cacheBytes -= int64(len(old.data))
+			delete(r.cached, oldest)
+		}
 	}
 }
 
 func (r *Reader) clearReadCacheLocked() {
 	r.cached = make(map[cacheKey]cachedRead)
 	r.cacheOrder = nil
+	r.cacheBytes = 0
 	r.inflight = make(map[cacheKey]*inflightRead)
 }
 
@@ -225,18 +248,18 @@ func sliceForRead(data []byte, offset, length int64) []byte {
 	return append([]byte(nil), data[:length]...)
 }
 
-func (r *Reader) readWithOptions(client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
+func (r *Reader) readWithOptions(ctx context.Context, client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
 	r.mu.RLock()
 	concurrency := r.concurrency
 	chunkSize := r.chunkSize
 	r.mu.RUnlock()
 	if concurrency <= 1 {
-		return r.readSequential(client, fsid, offset, length, chunkSize)
+		return r.readSequential(ctx, client, fsid, offset, length, chunkSize)
 	}
-	return r.readConcurrent(client, fsid, offset, length, chunkSize, concurrency)
+	return r.readConcurrent(ctx, client, fsid, offset, length, chunkSize, concurrency)
 }
 
-func (r *Reader) readSequential(client baidu.Client, fsid string, offset, length, chunkSize int64) ([]byte, error) {
+func (r *Reader) readSequential(ctx context.Context, client baidu.Client, fsid string, offset, length, chunkSize int64) ([]byte, error) {
 	fetchLength := length
 	if fetchLength < prefetchBytes {
 		fetchLength = prefetchBytes
@@ -253,21 +276,31 @@ func (r *Reader) readSequential(client baidu.Client, fsid string, offset, length
 	}
 	inflight, owner := r.beginInflight(fsid, fetchOffset)
 	if !owner {
-		<-inflight.done
-		if inflight.err != nil {
-			return nil, inflight.err
+		select {
+		case <-inflight.done:
+			if inflight.err != nil {
+				return nil, inflight.err
+			}
+			return sliceForWindow(inflight.data, fetchOffset, offset, length), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		return sliceForWindow(inflight.data, fetchOffset, offset, length), nil
 	}
+	data := make([]byte, fetchLength)
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		data, err := client.ReadRange(fsid, fetchOffset, fetchLength)
+		n, err := client.ReadRange(ctx, fsid, fetchOffset, data)
 		if err == nil {
+			data = data[:n]
 			r.finishInflight(fsid, fetchOffset, inflight, data, nil)
 			r.storeCached(fsid, fetchOffset, data)
 			return sliceForWindow(data, fetchOffset, offset, length), nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			r.finishInflight(fsid, fetchOffset, inflight, nil, ctx.Err())
+			return nil, ctx.Err()
+		}
 		_ = client.RefreshAuth()
 	}
 	r.finishInflight(fsid, fetchOffset, inflight, nil, lastErr)
@@ -335,7 +368,7 @@ func (r *Reader) finishInflight(fsid string, windowOffset int64, inflight *infli
 	r.mu.Unlock()
 }
 
-func (r *Reader) readConcurrent(client baidu.Client, fsid string, offset, length, chunkSize int64, concurrency int) ([]byte, error) {
+func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid string, offset, length, chunkSize int64, concurrency int) ([]byte, error) {
 	if length <= 0 {
 		return []byte{}, nil
 	}
@@ -344,64 +377,76 @@ func (r *Reader) readConcurrent(client baidu.Client, fsid string, offset, length
 	}
 	total := int((length + chunkSize - 1) / chunkSize)
 	if total <= 1 {
-		return r.readSequential(client, fsid, offset, length, chunkSize)
+		return r.readSequential(ctx, client, fsid, offset, length, chunkSize)
 	}
 	if concurrency > total {
 		concurrency = total
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	buf := make([]byte, length)
-	type result struct {
-		index int
-		data  []byte
-		err   error
-	}
-	jobs := make(chan int, total)
-	results := make(chan result, total)
-	for i := 0; i < total; i++ {
-		jobs <- i
-	}
-	close(jobs)
+	jobs := make(chan int)
 	var wg sync.WaitGroup
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for index := range jobs {
-				start := offset + int64(index)*chunkSize
-				want := chunkSize
-				if remain := length - int64(index)*chunkSize; remain < want {
-					want = remain
+	var errMu sync.Mutex
+	var firstErr error
+	worker := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case index, ok := <-jobs:
+				if !ok {
+					return
 				}
-				var data []byte
+				start := offset + int64(index)*chunkSize
+				begin := int64(index) * chunkSize
+				end := begin + chunkSize
+				if end > length {
+					end = length
+				}
+				dst := buf[begin:end]
 				var err error
 				for attempt := 0; attempt < 2; attempt++ {
-					data, err = client.ReadRange(fsid, start, want)
+					_, err = client.ReadRange(ctx, fsid, start, dst)
 					if err == nil {
+						break
+					}
+					if ctx.Err() != nil {
 						break
 					}
 					_ = client.RefreshAuth()
 				}
-				results <- result{index: index, data: data, err: err}
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+						cancel()
+					}
+					errMu.Unlock()
+					return
+				}
 			}
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-	var firstErr error
-	for res := range results {
-		if res.err != nil {
-			if firstErr == nil {
-				firstErr = res.err
-			}
-			continue
 		}
-		start := int64(res.index) * chunkSize
-		copy(buf[start:start+int64(len(res.data))], res.data)
 	}
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go worker()
+	}
+	for index := 0; index < total; index++ {
+		select {
+		case jobs <- index:
+		case <-ctx.Done():
+			index = total
+		}
+	}
+	close(jobs)
+	wg.Wait()
 	if firstErr != nil {
 		return nil, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	r.storeCached(fsid, offset, buf)
 	return buf, nil

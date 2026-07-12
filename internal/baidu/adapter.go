@@ -1,5 +1,7 @@
 package baidu
 
+import "context"
+
 func MapRemoteEntry(r RemoteEntry) Entry {
 	return Entry{
 		FSID:  r.FSID,
@@ -34,8 +36,8 @@ func (c *StaticClient) GetDownloadLink(fsid string) (DownloadLink, error) {
 
 func (c *StaticClient) Delete(paths []string) error { return nil }
 
-func (c *StaticClient) ReadRange(_ string, _ int64, length int64) ([]byte, error) {
-	return make([]byte, length), nil
+func (c *StaticClient) ReadRange(_ context.Context, _ string, _ int64, dst []byte) (int, error) {
+	return len(dst), nil
 }
 
 func (c *StaticClient) RefreshAuth() error { return nil }

@@ -162,7 +162,7 @@ func New(cfg Config) (*App, error) {
 			AuthorizeBaseURL: cfg.AuthorizeBaseURL,
 		}, mgr),
 		clientFactory: func(token auth.Token) baidu.Client {
-			return baidu.NewAPIClientWithBaseURLs(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, nil)
+			return baidu.NewAPIClientWithBaseURLs(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, baidu.NewDownloadHTTPClient(cfg.DownloadConcurrency))
 		},
 		mountFunc: func(mountPath string, root *fs.Filesystem) (*fakeMountServer, error) {
 			server, err := fs.Mount(mountPath, root, fs.MountOptions{

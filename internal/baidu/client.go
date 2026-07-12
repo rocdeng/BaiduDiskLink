@@ -14,6 +14,10 @@ import (
 	"time"
 )
 
+import "context"
+
+import "net"
+
 type APIClient struct {
 	mu            sync.Mutex
 	accessToken   string
@@ -69,6 +73,35 @@ type apiFileMeta struct {
 	LocalMTime  int64  `json:"local_mtime"`
 	MD5         string `json:"md5"`
 	DLink       string `json:"dlink"`
+}
+
+func NewMetadataHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: newHTTPTransport(2, 15*time.Second),
+	}
+}
+
+func NewDownloadHTTPClient(concurrency int) *http.Client {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	return &http.Client{Transport: newHTTPTransport(concurrency, 30*time.Second)}
+}
+
+func newHTTPTransport(perHost int, responseHeaderTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          perHost * 2,
+		MaxIdleConnsPerHost:   perHost,
+		MaxConnsPerHost:       perHost,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		DisableCompression:    true,
+	}
 }
 
 func NewAPIClient(accessToken, refreshToken, clientID, clientSecret string, httpClient *http.Client) *APIClient {
@@ -237,33 +270,83 @@ func (c *APIClient) Delete(paths []string) error {
 	return nil
 }
 
-func (c *APIClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
-	if length < 0 {
-		return nil, errors.New("length must be non-negative")
+func parseContentRange(value string) (start, end, total int64, err error) {
+	if !strings.HasPrefix(value, "bytes ") {
+		return 0, 0, 0, fmt.Errorf("invalid content range %q", value)
+	}
+	parts := strings.SplitN(strings.TrimPrefix(value, "bytes "), "/", 2)
+	if len(parts) != 2 {
+		return 0, 0, 0, fmt.Errorf("invalid content range %q", value)
+	}
+	bounds := strings.SplitN(parts[0], "-", 2)
+	if len(bounds) != 2 {
+		return 0, 0, 0, fmt.Errorf("invalid content range %q", value)
+	}
+	start, err = strconv.ParseInt(bounds[0], 10, 64)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid content range %q", value)
+	}
+	end, err = strconv.ParseInt(bounds[1], 10, 64)
+	if err != nil || end < start {
+		return 0, 0, 0, fmt.Errorf("invalid content range %q", value)
+	}
+	if parts[1] == "*" {
+		return start, end, -1, nil
+	}
+	total, err = strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || total <= end {
+		return 0, 0, 0, fmt.Errorf("invalid content range %q", value)
+	}
+	return start, end, total, nil
+}
+
+func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, dst []byte) (int, error) {
+	if offset < 0 {
+		return 0, errors.New("offset must be non-negative")
+	}
+	if len(dst) == 0 {
+		return 0, nil
 	}
 	link, err := c.GetDownloadLink(fsid)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	req, err := http.NewRequest(http.MethodGet, link.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link.URL, nil)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	if length > 0 {
-		end := offset + length - 1
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
-	}
+	end := offset + int64(len(dst)) - 1
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
 	req.Header.Set("User-Agent", "pan.baidu.com")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode != http.StatusPartialContent {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("download failed: %s", strings.TrimSpace(string(body)))
+		return 0, fmt.Errorf("download range failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return io.ReadAll(resp.Body)
+	start, rangeEnd, total, err := parseContentRange(resp.Header.Get("Content-Range"))
+	if err != nil {
+		return 0, err
+	}
+	if start != offset {
+		return 0, fmt.Errorf("download content range starts at %d, want %d", start, offset)
+	}
+	limited := io.LimitReader(resp.Body, int64(len(dst))+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return 0, err
+	}
+	if len(data) > len(dst) {
+		return 0, fmt.Errorf("download range exceeded requested length %d", len(dst))
+	}
+	n := copy(dst, data)
+	if n < len(dst) && !(total >= 0 && rangeEnd == total-1) {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, nil
 }
 
 func (c *APIClient) resolveDownloadURL(link string) (string, error) {

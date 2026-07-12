@@ -597,7 +597,7 @@ func (n *entryNode) Read(ctx context.Context, fh goFs.FileHandle, dest []byte, o
 			return fuse.ReadResultData(data), 0
 		}
 	}
-	data, err := n.Filesystem.remote.ReadRange(n.entry.FSID, off, int64(len(dest)))
+	data, err := n.Filesystem.remote.ReadRange(ctx, n.entry.FSID, off, int64(len(dest)))
 	if err != nil {
 		log.Printf("fuse read failed path=%q fsid=%q offset=%d length=%d: %v", n.entry.Path, n.entry.FSID, off, len(dest), err)
 		return nil, syscall.EIO
@@ -778,17 +778,17 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	var data []byte
 	var err error
 	if jump {
-		data, err = remote.ReadExactRange(entry.FSID, fetchOff, fetchLen)
+		data, err = remote.ReadExactRange(ctx, entry.FSID, fetchOff, fetchLen)
 		h.lastStrategy = "seek-exact"
 	} else {
-		data, err = remote.ReadRange(entry.FSID, fetchOff, fetchLen)
+		data, err = remote.ReadRange(ctx, entry.FSID, fetchOff, fetchLen)
 		h.lastStrategy = "window-prefetch"
 	}
 	if err != nil {
 		return nil, err
 	}
 	h.windowOff = fetchOff
-	h.window = append(h.window[:0], data...)
+	h.window = data
 	return h.sliceWindowOrEmpty(off, length), nil
 }
 
@@ -823,5 +823,5 @@ func (h *entryFileHandle) sliceWindow(off, length int64) ([]byte, bool) {
 	if end <= start {
 		return nil, false
 	}
-	return append([]byte(nil), h.window[start:end]...), true
+	return h.window[start:end], true
 }

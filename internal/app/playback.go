@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -98,12 +99,12 @@ func (a *App) servePlaybackFile(w http.ResponseWriter, r *http.Request, entry en
 		}
 		w.WriteHeader(http.StatusOK)
 	}
-	if err := a.writePlaybackRange(w, entry, start, end); err != nil {
+	if err := a.writePlaybackRange(r.Context(), w, entry, start, end); err != nil {
 		log.Printf("playback proxy read failed path=%q fsid=%q start=%d end=%d: %v", entry.Path, entry.FSID, start, end, err)
 	}
 }
 
-func (a *App) writePlaybackRange(w http.ResponseWriter, entry entryInfo, start, end int64) error {
+func (a *App) writePlaybackRange(ctx context.Context, w http.ResponseWriter, entry entryInfo, start, end int64) error {
 	if entry.Size >= 0 && start >= entry.Size {
 		return nil
 	}
@@ -126,7 +127,7 @@ func (a *App) writePlaybackRange(w http.ResponseWriter, entry entryInfo, start, 
 		if remaining < want {
 			want = remaining
 		}
-		data, err := a.remote.ReadRange(entry.FSID, offset, want)
+		data, err := a.remote.ReadRange(ctx, entry.FSID, offset, want)
 		if err != nil {
 			return err
 		}

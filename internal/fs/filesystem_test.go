@@ -3,7 +3,6 @@ package fs
 import (
 	"context"
 	"database/sql"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -41,7 +40,7 @@ func TestDirEntriesAreSorted(t *testing.T) {
 
 func TestReaderReturnsRequestedLength(t *testing.T) {
 	r := remote.NewReader(nil)
-	data, err := r.ReadRange("fsid-1", 0, 8)
+	data, err := r.ReadRange(context.Background(), "fsid-1", 0, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +100,7 @@ func TestEntryReadUsesCachedWindowWhenAvailable(t *testing.T) {
 		},
 	})
 	remoteReader.SetDownloadOptions(1, 16)
-	if _, err := remoteReader.ReadRange("1", 0, 16); err != nil {
+	if _, err := remoteReader.ReadRange(context.Background(), "1", 0, 16); err != nil {
 		t.Fatal(err)
 	}
 	fs := NewFilesystem(dbStore, remoteReader, nil, "/")
@@ -768,10 +767,13 @@ func (c *countingReadClient) Delete(paths []string) error {
 	return nil
 }
 
-func (c *countingReadClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
+func (c *countingReadClient) ReadRange(_ context.Context, _ string, _ int64, dst []byte) (int, error) {
 	c.reads++
-	c.lengths = append(c.lengths, length)
-	return []byte(strings.Repeat("x", int(length))), nil
+	c.lengths = append(c.lengths, int64(len(dst)))
+	for i := range dst {
+		dst[i] = 'x'
+	}
+	return len(dst), nil
 }
 
 func (c *countingReadClient) RefreshAuth() error {
@@ -799,8 +801,8 @@ func (c *deleteRecordingClient) Delete(paths []string) error {
 	return nil
 }
 
-func (c *deleteRecordingClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
-	return make([]byte, length), nil
+func (c *deleteRecordingClient) ReadRange(_ context.Context, fsid string, offset int64, dst []byte) (int, error) {
+	return len(dst), nil
 }
 
 func (c *deleteRecordingClient) RefreshAuth() error {

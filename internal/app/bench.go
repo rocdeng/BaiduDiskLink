@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -75,7 +76,7 @@ func (a *App) Benchmark(remotePath string, sampleSize int64) (BenchResult, error
 		sampleSize = entry.Size
 	}
 	start := time.Now()
-	data, err := a.remote.ReadRange(entry.FSID, 0, sampleSize)
+	data, err := a.remote.ReadRange(context.Background(), entry.FSID, 0, sampleSize)
 	if err != nil {
 		return BenchResult{}, err
 	}

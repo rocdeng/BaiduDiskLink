@@ -555,67 +555,38 @@ func TestOAuthListenAddrDefaultsFromRedirectURI(t *testing.T) {
 }
 
 func TestReplayableEndToEndPath(t *testing.T) {
-	a, err := New(Config{
-		MountPath:        "/tmp/mount",
-		TokenPath:        t.TempDir() + "/token.json",
-		MetaDBPath:       t.TempDir() + "/meta.db",
-		ClientID:         "client",
-		ClientSecret:     "secret",
-		RedirectURI:      "http://127.0.0.1:8765/callback",
-		AuthorizeBaseURL: "https://auth.example.invalid/authorize",
-		TokenBaseURL:     "https://token.example.invalid",
-		APIBaseURL:       "https://api.example.invalid",
-	})
+	a, err := New(Config{MountPath: "/tmp/mount", TokenPath: t.TempDir() + "/token.json", MetaDBPath: t.TempDir() + "/meta.db", ClientID: "client", ClientSecret: "secret", RedirectURI: "http://127.0.0.1:8765/callback", AuthorizeBaseURL: "https://auth.example.invalid/authorize", TokenBaseURL: "https://token.example.invalid", APIBaseURL: "https://api.example.invalid"})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	a.oauth = &fakeOAuthFlow{
-		url:        "https://auth.example.invalid/authorize?client_id=client",
-		waitResult: auth.OAuthResult{Code: "oauth-code"},
-		waitFn: func() (auth.OAuthResult, error) {
-			return auth.OAuthResult{Code: "oauth-code"}, nil
-		},
-	}
-
+	a.oauth = &fakeOAuthFlow{url: "https://auth.example.invalid/authorize?client_id=client", waitResult: auth.OAuthResult{Code: "oauth-code"}, waitFn: func() (auth.OAuthResult, error) { return auth.OAuthResult{Code: "oauth-code"}, nil }}
 	var gotTokenExchange string
 	transportCalls := make([]string, 0, 4)
-	apiClient := baidu.NewAPIClientWithBaseURLs("access-end", "refresh-end", "client", "secret", "https://api.example.invalid", "https://token.example.invalid", &http.Client{
-		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			transportCalls = append(transportCalls, r.URL.String())
-			switch {
-			case strings.Contains(r.URL.String(), "xpan/file"):
-				body := `{"list":[{"fs_id":1,"server_filename":"movies","path":"/movies","size":0,"isdir":1}],"has_more":0,"next_mark":0,"error_code":0}`
-				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
-			case strings.Contains(r.URL.String(), "xpan/multimedia"):
-				body := `{"info":[{"fs_id":1,"server_filename":"movie.mkv","path":"/movies/movie.mkv","size":10,"isdir":0,"dlink":"https://download.example.invalid/file"}],"errno":0}`
-				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
-			case strings.Contains(r.URL.String(), "download.example.invalid"):
-				return &http.Response{StatusCode: 206, Body: io.NopCloser(bytes.NewBufferString("xabc")), Header: make(http.Header)}, nil
-			default:
-				t.Fatalf("unexpected request: %s", r.URL.String())
-				return nil, nil
-			}
-		}),
-	})
-	a.tokenHTTPClient = &http.Client{
-		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			gotTokenExchange = r.URL.String()
-			return &http.Response{
-				StatusCode: 200,
-				Body:       io.NopCloser(bytes.NewBufferString(`{"access_token":"access-end","refresh_token":"refresh-end"}`)),
-				Header:     make(http.Header),
-			}, nil
-		}),
-	}
-
-	a.clientFactory = func(token auth.Token) baidu.Client {
-		if token.AccessToken != "access-end" || token.RefreshToken != "refresh-end" {
-			t.Fatalf("unexpected token: %#v", token)
+	apiClient := baidu.NewAPIClientWithBaseURLs("access-end", "refresh-end", "client", "secret", "https://api.example.invalid", "https://token.example.invalid", &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		transportCalls = append(transportCalls, r.URL.String())
+		switch {
+		case strings.Contains(r.URL.String(), "xpan/file"):
+			body := `{"list":[{"fs_id":1,"server_filename":"movies","path":"/movies","size":0,"isdir":1}],"has_more":0,"next_mark":0,"error_code":0}`
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		case strings.Contains(r.URL.String(), "xpan/multimedia"):
+			body := `{"info":[{"fs_id":1,"server_filename":"movie.mkv","path":"/movies/movie.mkv","size":10,"isdir":0,"dlink":"https://download.example.invalid/file"}],"errno":0}`
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		case strings.Contains(r.URL.String(), "token.example.invalid"):
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"access_token":"access-end","refresh_token":"refresh-end"}`)), Header: make(http.Header)}, nil
+		case strings.Contains(r.URL.String(), "download.example.invalid"):
+			header := make(http.Header)
+			header.Set("Content-Range", "bytes 0-9/10")
+			return &http.Response{StatusCode: 206, Body: io.NopCloser(bytes.NewBufferString("xabcxxxxxx")), Header: header}, nil
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.String())
+			return nil, nil
 		}
-		return apiClient
-	}
-
+	})})
+	a.tokenHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		gotTokenExchange = r.URL.String()
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"access_token":"access-end","refresh_token":"refresh-end"}`)), Header: make(http.Header)}, nil
+	})}
+	a.clientFactory = func(token auth.Token) baidu.Client { return apiClient }
 	if err := a.saveOAuthToken("oauth-code"); err != nil {
 		t.Fatal(err)
 	}
@@ -635,7 +606,7 @@ func TestReplayableEndToEndPath(t *testing.T) {
 	if err := a.Store().UpsertEntry(authToStore(entries[0])); err != nil {
 		t.Fatal(err)
 	}
-	data, err := a.Remote().ReadRange("1", 1, 3)
+	data, err := a.Remote().ReadRange(context.Background(), "1", 1, 3)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,6 +2,8 @@ package baidu
 
 import "time"
 
+import "context"
+
 type RemoteEntry struct {
 	FSID        string
 	ServerName  string
@@ -33,6 +35,6 @@ type Client interface {
 	Stat(path string) (RemoteEntry, error)
 	Delete(paths []string) error
 	GetDownloadLink(fsid string) (DownloadLink, error)
-	ReadRange(fsid string, offset, length int64) ([]byte, error)
+	ReadRange(ctx context.Context, fsid string, offset int64, dst []byte) (int, error)
 	RefreshAuth() error
 }

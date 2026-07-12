@@ -9,6 +9,8 @@ import (
 	"baidudisklink/internal/baidu"
 )
 
+import "context"
+
 type stubClient struct {
 	mu            sync.Mutex
 	downloadCalls int
@@ -24,7 +26,7 @@ func (s *stubClient) GetDownloadLink(fsid string) (baidu.DownloadLink, error) {
 	s.downloadCalls++
 	return baidu.DownloadLink{URL: "https://example.invalid/" + fsid, ExpiresAt: time.Now().Add(time.Minute)}, nil
 }
-func (s *stubClient) ReadRange(fsid string, offset, length int64) ([]byte, error) {
+func (s *stubClient) ReadRange(ctx context.Context, fsid string, offset int64, dst []byte) (int, error) {
 	s.mu.Lock()
 	s.readCalls++
 	if s.readStarted != nil {
@@ -35,19 +37,56 @@ func (s *stubClient) ReadRange(fsid string, offset, length int64) ([]byte, error
 	}
 	s.mu.Unlock()
 	if s.readRelease != nil {
-		<-s.readRelease
+		select {
+		case <-s.readRelease:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
 	}
 	if s.failRead {
-		return nil, errors.New("transient read failure")
+		return 0, errors.New("transient read failure")
 	}
-	return make([]byte, length), nil
+	return len(dst), nil
 }
 func (s *stubClient) Delete(paths []string) error { return nil }
 func (s *stubClient) RefreshAuth() error          { return nil }
 
+func TestReadCacheEvictsByByteBudgetAndPromotesHits(t *testing.T) {
+	r := NewReader(&stubClient{})
+	r.cacheLimit = 10
+	r.storeCached("1", 0, []byte("123456"))
+	r.storeCached("2", 0, []byte("abcdef"))
+	if _, ok := r.readCached("1", 0, 1); ok {
+		t.Fatal("oldest window should be evicted by byte budget")
+	}
+	if got, ok := r.readCached("2", 0, 3); !ok || string(got) != "abc" {
+		t.Fatalf("newest window missing: %q ok=%v", got, ok)
+	}
+	r.storeCached("3", 0, []byte("XYZ"))
+	if _, ok := r.readCached("2", 0, 1); !ok {
+		t.Fatal("cache hit should promote window")
+	}
+	r.storeCached("4", 0, []byte("78901234"))
+	if _, ok := r.readCached("3", 0, 1); ok {
+		t.Fatal("least recently used window should be evicted")
+	}
+}
+
+func TestReadCacheSkipsOversizedWindow(t *testing.T) {
+	r := NewReader(&stubClient{})
+	r.cacheLimit = 4
+	r.storeCached("1", 0, []byte("12345"))
+	if _, ok := r.readCached("1", 0, 1); ok {
+		t.Fatal("oversized window must not be cached")
+	}
+	if r.cacheBytes != 0 {
+		t.Fatalf("unexpected cache bytes: %d", r.cacheBytes)
+	}
+}
+
 func TestReadRangeUsesRequestedLength(t *testing.T) {
 	r := NewReader(nil)
-	got, err := r.ReadRange("fsid-1", 10, 5)
+	got, err := r.ReadRange(context.Background(), "fsid-1", 10, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +97,7 @@ func TestReadRangeUsesRequestedLength(t *testing.T) {
 
 func TestReadRangeRejectsNegativeLength(t *testing.T) {
 	r := NewReader(nil)
-	_, err := r.ReadRange("fsid-1", 10, -1)
+	_, err := r.ReadRange(context.Background(), "fsid-1", 10, -1)
 	if err == nil {
 		t.Fatal("expected error for negative length")
 	}
@@ -67,7 +106,7 @@ func TestReadRangeRejectsNegativeLength(t *testing.T) {
 func TestReadExactRangeDoesNotPrefetch(t *testing.T) {
 	client := &stubClient{}
 	r := NewReader(client)
-	got, err := r.ReadExactRange("fsid-1", 64<<20, 4<<20)
+	got, err := r.ReadExactRange(context.Background(), "fsid-1", 64<<20, 4<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +121,7 @@ func TestReadExactRangeDoesNotPrefetch(t *testing.T) {
 func TestReadRangeCachesDownloadLinkAndRetries(t *testing.T) {
 	client := &stubClient{failRead: true}
 	r := NewReader(client)
-	_, err := r.ReadRange("fsid-1", 0, 8)
+	_, err := r.ReadRange(context.Background(), "fsid-1", 0, 8)
 	if err == nil {
 		t.Fatal("expected error from stub client")
 	}
@@ -97,14 +136,14 @@ func TestReadRangeCachesDownloadLinkAndRetries(t *testing.T) {
 func TestReadRangePrefetchesAndReusesCachedWindow(t *testing.T) {
 	client := &stubClient{}
 	r := NewReader(client)
-	got, err := r.ReadRange("fsid-1", 0, 4)
+	got, err := r.ReadRange(context.Background(), "fsid-1", 0, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 4 {
 		t.Fatalf("expected 4 bytes, got %d", len(got))
 	}
-	got, err = r.ReadRange("fsid-1", 1024, 1024)
+	got, err = r.ReadRange(context.Background(), "fsid-1", 1024, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,14 +158,14 @@ func TestReadRangePrefetchesAndReusesCachedWindow(t *testing.T) {
 func TestReadRangeAlignsPrefetchWindow(t *testing.T) {
 	client := &stubClient{}
 	r := NewReader(client)
-	got, err := r.ReadRange("fsid-1", 1024, 1024)
+	got, err := r.ReadRange(context.Background(), "fsid-1", 1024, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 1024 {
 		t.Fatalf("expected 1024 bytes, got %d", len(got))
 	}
-	got, err = r.ReadRange("fsid-1", 2048, 1024)
+	got, err = r.ReadRange(context.Background(), "fsid-1", 2048, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,13 +188,13 @@ func TestReadRangeCoalescesInflightWindow(t *testing.T) {
 	r := NewReader(client)
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := r.ReadRange("fsid-1", 0, 1024)
+		_, err := r.ReadRange(context.Background(), "fsid-1", 0, 1024)
 		firstDone <- err
 	}()
 	<-client.readStarted
 	secondDone := make(chan error, 1)
 	go func() {
-		_, err := r.ReadRange("fsid-1", 2048, 1024)
+		_, err := r.ReadRange(context.Background(), "fsid-1", 2048, 1024)
 		secondDone <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
