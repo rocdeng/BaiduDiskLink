@@ -7,6 +7,78 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func TestReplaceChildrenRollsBackOnInsertFailure(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertEntry(Entry{FSID: "old", Parent: "p", Path: "/old", Name: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`create trigger reject_bad before insert on entries when new.fsid = 'bad' begin select raise(abort, 'bad entry'); end`); err != nil {
+		t.Fatal(err)
+	}
+	err = st.ReplaceChildren("p", []Entry{{FSID: "bad", Parent: "p", Path: "/bad", Name: "bad"}})
+	if err == nil {
+		t.Fatal("expected insert failure")
+	}
+	children, err := st.GetChildrenByParent("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || children[0].FSID != "old" {
+		t.Fatalf("rollback lost old children: %#v", children)
+	}
+}
+
+func TestUpsertEntriesRollsBackOnFailure(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`create trigger reject_bad before insert on entries when new.fsid = 'bad' begin select raise(abort, 'bad entry'); end`); err != nil {
+		t.Fatal(err)
+	}
+	err = st.UpsertEntries([]Entry{{FSID: "good", Parent: "0", Path: "/good", Name: "good"}, {FSID: "bad", Parent: "0", Path: "/bad", Name: "bad"}})
+	if err == nil {
+		t.Fatal("expected batch failure")
+	}
+	entry, err := st.GetByPath("/good")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry != nil {
+		t.Fatalf("partial batch write remained: %#v", entry)
+	}
+}
+
+func TestUpsertFromRemoteFillsOnlyEmptyParent(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertFromRemote("fallback", []Entry{{FSID: "1", Path: "/one", Name: "one"}, {FSID: "2", Parent: "explicit", Path: "/two", Name: "two"}}); err != nil {
+		t.Fatal(err)
+	}
+	one, _ := st.GetByPath("/one")
+	two, _ := st.GetByPath("/two")
+	if one.Parent != "fallback" || two.Parent != "explicit" {
+		t.Fatalf("parents one=%q two=%q", one.Parent, two.Parent)
+	}
+}
+
 func TestUpsertAndListEntries(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {

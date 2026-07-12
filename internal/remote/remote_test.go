@@ -51,6 +51,23 @@ func (s *stubClient) ReadRange(ctx context.Context, fsid string, offset int64, d
 func (s *stubClient) Delete(paths []string) error { return nil }
 func (s *stubClient) RefreshAuth() error          { return nil }
 
+func TestReadCacheMaintainsFSIDIndex(t *testing.T) {
+	r := NewReader(&stubClient{})
+	r.cacheLimit = 6
+	r.storeCached("one", 0, []byte("1111"))
+	r.storeCached("two", 0, []byte("2222"))
+	if len(r.cacheByFSID["one"]) != 0 {
+		t.Fatalf("evicted FSID bucket remains: %#v", r.cacheByFSID)
+	}
+	if len(r.cacheByFSID["two"]) != 1 {
+		t.Fatalf("active FSID bucket missing: %#v", r.cacheByFSID)
+	}
+	r.clearReadCacheLocked()
+	if len(r.cacheByFSID) != 0 {
+		t.Fatalf("clear left stale FSID index: %#v", r.cacheByFSID)
+	}
+}
+
 func TestPrefetchPopulatesCache(t *testing.T) {
 	client := &stubClient{}
 	r := NewReader(client)

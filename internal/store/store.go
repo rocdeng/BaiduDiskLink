@@ -50,6 +50,50 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+const upsertEntrySQL = `
+	insert into entries
+	(fsid, parent_fsid, path, name, size, is_dir, mtime, md5, last_sync_at, expires_at, negative)
+	values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	on conflict(path) do update set
+		fsid=excluded.fsid,
+		parent_fsid=excluded.parent_fsid,
+		name=excluded.name,
+		size=excluded.size,
+		is_dir=excluded.is_dir,
+		mtime=excluded.mtime,
+		md5=excluded.md5,
+		last_sync_at=excluded.last_sync_at,
+		expires_at=excluded.expires_at,
+		negative=excluded.negative
+`
+
+func execEntry(stmt *sql.Stmt, entry Entry) error {
+	_, err := stmt.Exec(entry.FSID, entry.Parent, entry.Path, entry.Name, entry.Size, boolToInt(entry.IsDir), entry.MTM, entry.MD5, entry.LastSyncAt, entry.ExpiresAt, boolToInt(entry.Negative))
+	return err
+}
+
+func (s *Store) upsertEntries(entries []Entry) error {
+	if s == nil || s.db == nil {
+		return errors.New("db is required")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(upsertEntrySQL)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, entry := range entries {
+		if err := execEntry(stmt, entry); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) UpsertEntry(e Entry) error {
 	if s == nil {
 		return errors.New("store is nil")
@@ -162,12 +206,7 @@ func (s *Store) EnsureRoot() error {
 }
 
 func (s *Store) UpsertEntries(entries []Entry) error {
-	for _, entry := range entries {
-		if err := s.UpsertEntry(entry); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.upsertEntries(entries)
 }
 
 func (s *Store) GetChildrenByParent(parentID string) ([]Entry, error) {
@@ -203,66 +242,41 @@ func (s *Store) GetChildrenByParent(parentID string) ([]Entry, error) {
 }
 
 func (s *Store) UpsertFromRemote(parent string, entries []Entry) error {
-	for _, entry := range entries {
-		if entry.Parent == "" {
-			entry.Parent = parent
-		}
-		if err := s.UpsertEntry(entry); err != nil {
-			return err
+	prepared := make([]Entry, len(entries))
+	copy(prepared, entries)
+	for index := range prepared {
+		if prepared[index].Parent == "" {
+			prepared[index].Parent = parent
 		}
 	}
-	return nil
+	return s.upsertEntries(prepared)
 }
 
 func (s *Store) ReplaceChildren(parentID string, entries []Entry) error {
-	if s == nil {
-		return errors.New("store is nil")
-	}
-	if s.db == nil {
+	if s == nil || s.db == nil {
 		return errors.New("db is required")
 	}
-	if _, err := s.db.Exec(`delete from entries where parent_fsid = ?`, parentID); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	if len(entries) == 0 {
-		return nil
+	defer tx.Rollback()
+	if _, err := tx.Exec(`delete from entries where parent_fsid = ?`, parentID); err != nil {
+		return err
 	}
-	values := make([]string, 0, len(entries))
-	args := make([]any, 0, len(entries)*11)
-	for _, entry := range entries {
-		values = append(values, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		args = append(args,
-			entry.FSID,
-			entry.Parent,
-			entry.Path,
-			entry.Name,
-			entry.Size,
-			boolToInt(entry.IsDir),
-			entry.MTM,
-			entry.MD5,
-			entry.LastSyncAt,
-			entry.ExpiresAt,
-			boolToInt(entry.Negative),
-		)
+	if len(entries) > 0 {
+		stmt, err := tx.Prepare(upsertEntrySQL)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		for _, entry := range entries {
+			if err := execEntry(stmt, entry); err != nil {
+				return err
+			}
+		}
 	}
-	query := fmt.Sprintf(`
-		insert into entries
-		(fsid, parent_fsid, path, name, size, is_dir, mtime, md5, last_sync_at, expires_at, negative)
-		values %s
-		on conflict(path) do update set
-			fsid=excluded.fsid,
-			parent_fsid=excluded.parent_fsid,
-			name=excluded.name,
-			size=excluded.size,
-			is_dir=excluded.is_dir,
-			mtime=excluded.mtime,
-			md5=excluded.md5,
-			last_sync_at=excluded.last_sync_at,
-			expires_at=excluded.expires_at,
-			negative=excluded.negative
-	`, strings.Join(values, ","))
-	_, err := s.db.Exec(query, args...)
-	return err
+	return tx.Commit()
 }
 
 func (s *Store) ExpirePath(path string) error {
