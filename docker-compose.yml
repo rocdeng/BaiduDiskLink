@@ -1,6 +1,7 @@
 services:
   baidudisklink:
     build: .
+    image: baidudisklink:latest
     container_name: baidudisklink
     privileged: true
     devices:
