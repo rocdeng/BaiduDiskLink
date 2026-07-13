@@ -84,8 +84,8 @@ func NewMetadataHTTPClient() *http.Client {
 }
 
 func NewDownloadHTTPClient(concurrency int) *http.Client {
-	if concurrency < 1 {
-		concurrency = 1
+	if concurrency < 4 {
+		concurrency = 4
 	}
 	return &http.Client{Transport: newHTTPTransport(concurrency, 30*time.Second)}
 }

@@ -70,6 +70,28 @@ func TestNewDownloadHTTPClientConfiguresConnectionPool(t *testing.T) {
 	}
 }
 
+func TestNewDownloadHTTPClientKeepsMinimumConnectionPool(t *testing.T) {
+	client := NewDownloadHTTPClient(1)
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unexpected transport type %T", client.Transport)
+	}
+	if transport.MaxConnsPerHost != 4 || transport.MaxIdleConnsPerHost != 4 {
+		t.Fatalf("expected minimum four per-host connections, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	}
+}
+
+func TestNewDownloadHTTPClientPreservesHigherConcurrency(t *testing.T) {
+	client := NewDownloadHTTPClient(8)
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unexpected transport type %T", client.Transport)
+	}
+	if transport.MaxConnsPerHost != 8 || transport.MaxIdleConnsPerHost != 8 {
+		t.Fatalf("expected configured per-host connections, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	}
+}
+
 func TestNewMetadataHTTPClientHasBoundedTimeout(t *testing.T) {
 	client := NewMetadataHTTPClient()
 	if client.Timeout != 30*time.Second {
