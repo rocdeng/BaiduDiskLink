@@ -56,6 +56,31 @@ func (s *stubClient) ReadRange(ctx context.Context, fsid string, offset int64, d
 func (s *stubClient) Delete(paths []string) error { return nil }
 func (s *stubClient) RefreshAuth() error          { return nil }
 
+func sameBackingArray(a, b []byte) bool {
+	return len(a) > 0 && len(b) > 0 && &a[0] == &b[0]
+}
+
+func TestSliceForWindowSharesBackingArray(t *testing.T) {
+	window := []byte("abcdefgh")
+	got := sliceForWindow(window, 0, 0, 4)
+	if !sameBackingArray(got, window) {
+		t.Fatal("window slice copied backing storage")
+	}
+}
+
+func TestFinishInflightPublishesSameWindow(t *testing.T) {
+	r := NewReader(&stubClient{})
+	inflight, owner := r.beginInflight("1", 0)
+	if !owner {
+		t.Fatal("expected inflight ownership")
+	}
+	window := []byte("abcdefgh")
+	r.finishInflight("1", 0, inflight, window, nil)
+	if !sameBackingArray(inflight.data, window) {
+		t.Fatal("inflight publication copied backing storage")
+	}
+}
+
 func TestReadCacheMaintainsFSIDIndex(t *testing.T) {
 	r := NewReader(&stubClient{})
 	r.cacheLimit = 6

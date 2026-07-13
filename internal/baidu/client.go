@@ -349,18 +349,29 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	if rangeEnd < end && !(total >= 0 && rangeEnd == total-1) {
 		return 0, fmt.Errorf("download content range ends at %d before requested end %d: %w", rangeEnd, end, io.ErrUnexpectedEOF)
 	}
-	limited := io.LimitReader(resp.Body, int64(len(dst))+1)
-	data, err := io.ReadAll(limited)
-	if err != nil {
-		return 0, err
+	want := int(rangeEnd - start + 1)
+	n := 0
+	for n < want {
+		readN, readErr := resp.Body.Read(dst[n:want])
+		n += readN
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) && n == want {
+				break
+			}
+			if errors.Is(readErr, io.EOF) {
+				readErr = io.ErrUnexpectedEOF
+			}
+			return n, fmt.Errorf("download range body length %d, declared %d: %w", n, want, readErr)
+		}
+		if readN == 0 {
+			return n, fmt.Errorf("download range body length %d, declared %d: %w", n, want, io.ErrNoProgress)
+		}
 	}
-	if len(data) > len(dst) {
-		return 0, fmt.Errorf("download range exceeded requested length %d", len(dst))
-	}
-	want := rangeEnd - start + 1
-	n := copy(dst, data)
-	if int64(n) != want {
-		return n, fmt.Errorf("download range body length %d, declared %d: %w", n, want, io.ErrUnexpectedEOF)
+	var extra [1]byte
+	if extraN, extraErr := resp.Body.Read(extra[:]); extraN > 0 {
+		return n, fmt.Errorf("download range exceeded declared length %d", want)
+	} else if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		return n, extraErr
 	}
 	return n, nil
 }

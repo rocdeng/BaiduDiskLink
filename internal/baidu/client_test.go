@@ -21,6 +21,38 @@ func (m mockTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return m.handler(r)
 }
 
+type destinationTrackingReader struct {
+	dst    []byte
+	data   []byte
+	direct bool
+}
+
+func (r *destinationTrackingReader) Read(p []byte) (int, error) {
+	if len(p) > 0 && len(r.dst) > 0 && &p[0] == &r.dst[0] {
+		r.direct = true
+	}
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+type fullReadErrorReader struct {
+	data []byte
+	err  error
+}
+
+func (r *fullReadErrorReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, r.err
+}
+
 func TestNewDownloadHTTPClientConfiguresConnectionPool(t *testing.T) {
 	client := NewDownloadHTTPClient(4)
 	if client.Timeout != 0 {
@@ -141,6 +173,66 @@ func TestAPIClientDownloadLinkAndReadRange(t *testing.T) {
 	}
 }
 
+func TestAPIClientReadRangeReadsDirectlyIntoDestination(t *testing.T) {
+	dst := make([]byte, 3)
+	body := &destinationTrackingReader{dst: dst, data: []byte("abc")}
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set("Content-Range", "bytes 0-2/3")
+			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(body), Header: header}, nil
+		}},
+	})
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+
+	n, err := client.ReadRange(context.Background(), "1", 0, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(dst) || string(dst) != "abc" {
+		t.Fatalf("unexpected range result: n=%d data=%q", n, dst)
+	}
+	if !body.direct {
+		t.Fatal("response body was not read directly into destination")
+	}
+}
+
+func TestAPIClientReadRangePreservesFinalBodyError(t *testing.T) {
+	finalErr := errors.New("body failed")
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set("Content-Range", "bytes 0-2/3")
+			body := &fullReadErrorReader{data: []byte("abc"), err: finalErr}
+			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(body), Header: header}, nil
+		}},
+	})
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+
+	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
+	if n != 3 || !errors.Is(err, finalErr) {
+		t.Fatalf("expected final body error after 3 bytes, got n=%d err=%v", n, err)
+	}
+}
+
+func TestAPIClientReadRangeAcceptsEOFWithCompleteFinalRead(t *testing.T) {
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set("Content-Range", "bytes 0-2/3")
+			body := &fullReadErrorReader{data: []byte("abc"), err: io.EOF}
+			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(body), Header: header}, nil
+		}},
+	})
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+
+	dst := make([]byte, 3)
+	n, err := client.ReadRange(context.Background(), "1", 0, dst)
+	if err != nil || n != 3 || string(dst) != "abc" {
+		t.Fatalf("expected complete final read, got n=%d data=%q err=%v", n, dst, err)
+	}
+}
+
 func TestAPIClientReadRangeRejectsTruncatedBody(t *testing.T) {
 	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
 		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
@@ -154,6 +246,22 @@ func TestAPIClientReadRangeRejectsTruncatedBody(t *testing.T) {
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
 	if err == nil {
 		t.Fatalf("expected truncated body error, got n=%d", n)
+	}
+}
+
+func TestAPIClientReadRangeMapsEmptyBodyToUnexpectedEOF(t *testing.T) {
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set("Content-Range", "bytes 0-2/3")
+			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("")), Header: header}, nil
+		}},
+	})
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+
+	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
+	if n != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected empty body to be unexpected EOF, got n=%d err=%v", n, err)
 	}
 }
 

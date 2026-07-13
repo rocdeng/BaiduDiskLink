@@ -288,13 +288,6 @@ func (r *Reader) clearReadCacheLocked() {
 	r.inflight = make(map[cacheKey]*inflightRead)
 }
 
-func sliceForRead(data []byte, offset, length int64) []byte {
-	if length >= int64(len(data)) {
-		return data
-	}
-	return append([]byte(nil), data[:length]...)
-}
-
 func (r *Reader) readWithOptions(ctx context.Context, client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
 	r.mu.RLock()
 	concurrency := r.concurrency
@@ -373,7 +366,7 @@ func sliceForWindow(data []byte, windowOffset, offset, length int64) []byte {
 	if end > int64(len(data)) {
 		end = int64(len(data))
 	}
-	return append([]byte(nil), data[start:end]...)
+	return data[start:end]
 }
 func (r *Reader) waitInflight(ctx context.Context, fsid string, windowOffset, offset, length int64) ([]byte, error, bool) {
 	key := cacheKey{fsid: fsid, offset: windowOffset}
@@ -412,7 +405,7 @@ func (r *Reader) finishInflight(fsid string, windowOffset int64, inflight *infli
 	if r.inflight[key] == inflight {
 		delete(r.inflight, key)
 	}
-	inflight.data = append([]byte(nil), data...)
+	inflight.data = data
 	inflight.err = err
 	close(inflight.done)
 	r.mu.Unlock()
