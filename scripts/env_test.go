@@ -22,6 +22,7 @@ func TestEnvExampleCoversRequiredDeploymentVariables(t *testing.T) {
 		"BAIDUDISKLINK_REDIRECT_URI",
 		"BAIDUDISKLINK_REMOTE_ROOT_PATH",
 		"BAIDUDISKLINK_OAUTH_LISTEN_ADDR",
+		"TZ",
 	} {
 		if !strings.Contains(string(envData), want) {
 			t.Fatalf("expected %s in .env.example", want)

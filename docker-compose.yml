@@ -32,6 +32,6 @@ services:
       BAIDUDISKLINK_AUTHORIZE_BASE_URL: ${BAIDUDISKLINK_AUTHORIZE_BASE_URL:-https://openapi.baidu.com/oauth/2.0/authorize}
       BAIDUDISKLINK_TOKEN_BASE_URL: ${BAIDUDISKLINK_TOKEN_BASE_URL:-https://openapi.baidu.com/oauth/2.0/token}
       BAIDUDISKLINK_API_BASE_URL: ${BAIDUDISKLINK_API_BASE_URL:-https://pan.baidu.com}
-      TZ: Asia/Shanghai
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "8765:8765"

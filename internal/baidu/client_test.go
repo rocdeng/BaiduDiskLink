@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -55,8 +56,8 @@ func (r *fullReadErrorReader) Read(p []byte) (int, error) {
 
 func TestNewDownloadHTTPClientConfiguresConnectionPool(t *testing.T) {
 	client := NewDownloadHTTPClient(4)
-	if client.Timeout != 0 {
-		t.Fatalf("download client must not impose whole-request timeout: %v", client.Timeout)
+	if client.Timeout != downloadClientTimeout {
+		t.Fatalf("unexpected download client timeout: %v", client.Timeout)
 	}
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {
@@ -234,6 +235,35 @@ func TestAPIClientReadRangePreservesFinalBodyError(t *testing.T) {
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
 	if n != 3 || !errors.Is(err, finalErr) {
 		t.Fatalf("expected final body error after 3 bytes, got n=%d err=%v", n, err)
+	}
+}
+
+func TestAPIClientReadRangeTimesOutStalledBody(t *testing.T) {
+	oldTimeout := downloadRangeTimeout
+	downloadRangeTimeout = 50 * time.Millisecond
+	defer func() { downloadRangeTimeout = oldTimeout }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-2/3")
+		w.WriteHeader(http.StatusPartialContent)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{Timeout: time.Second})
+	client.links["1"] = DownloadLink{URL: server.URL, ExpiresAt: time.Now().Add(time.Minute)}
+	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
+	if err == nil {
+		t.Fatal("expected stalled body to time out")
+	}
+	if n != 0 {
+		t.Fatalf("expected no bytes from stalled body, got %d", n)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
 	}
 }
 

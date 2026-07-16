@@ -118,6 +118,42 @@ func TestPrefetchPopulatesCache(t *testing.T) {
 	}
 }
 
+func TestPrefetchUsesConfiguredDownloadConcurrency(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	r.SetDownloadOptions(2, 4)
+	if err := r.Prefetch(context.Background(), "1", 0, 8); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	readCalls := client.readCalls
+	client.mu.Unlock()
+	if readCalls != 2 {
+		t.Fatalf("expected two concurrent chunks, got %d backend reads", readCalls)
+	}
+}
+
+func TestPrefetchKeepsSingleConnectionRangeExact(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	offset := int64((8 << 20) - 2)
+	if err := r.Prefetch(context.Background(), "1", offset, 4); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	before := client.readCalls
+	client.mu.Unlock()
+	if _, err := r.ReadExactRange(context.Background(), "1", offset, 4); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	after := client.readCalls
+	client.mu.Unlock()
+	if after != before {
+		t.Fatalf("exact foreground read missed unaligned prefetch: before=%d after=%d", before, after)
+	}
+}
+
 func TestReadCacheEvictsByByteBudgetAndPromotesHits(t *testing.T) {
 	r := NewReader(&stubClient{})
 	r.cacheLimit = 10

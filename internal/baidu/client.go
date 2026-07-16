@@ -87,7 +87,10 @@ func NewDownloadHTTPClient(concurrency int) *http.Client {
 	if concurrency < 4 {
 		concurrency = 4
 	}
-	return &http.Client{Transport: newHTTPTransport(concurrency, 30*time.Second)}
+	return &http.Client{
+		Timeout:   downloadClientTimeout,
+		Transport: newHTTPTransport(concurrency, 30*time.Second),
+	}
 }
 
 func newHTTPTransport(perHost int, responseHeaderTimeout time.Duration) *http.Transport {
@@ -104,6 +107,11 @@ func newHTTPTransport(perHost int, responseHeaderTimeout time.Duration) *http.Tr
 		DisableCompression:    true,
 	}
 }
+
+var (
+	downloadRangeTimeout  = 60 * time.Second
+	downloadClientTimeout = 75 * time.Second
+)
 
 func NewAPIClient(accessToken, refreshToken, clientID, clientSecret string, httpClient *http.Client) *APIClient {
 	return NewAPIClientWithBaseURLs(accessToken, refreshToken, clientID, clientSecret, "", "", httpClient)
@@ -320,7 +328,13 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	if err != nil {
 		return 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link.URL, nil)
+	downloadCtx := ctx
+	cancel := func() {}
+	if downloadRangeTimeout > 0 {
+		downloadCtx, cancel = context.WithTimeout(ctx, downloadRangeTimeout)
+	}
+	defer cancel()
+	req, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, link.URL, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -329,6 +343,10 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	req.Header.Set("User-Agent", "pan.baidu.com")
 	resp, err := c.downloadClient.Do(req)
 	if err != nil {
+		if ctxErr := downloadCtx.Err(); ctxErr != nil {
+			c.downloadClient.CloseIdleConnections()
+			return 0, fmt.Errorf("download range timed out or canceled: %w", ctxErr)
+		}
 		return 0, err
 	}
 	defer resp.Body.Close()
@@ -355,6 +373,10 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 		readN, readErr := resp.Body.Read(dst[n:want])
 		n += readN
 		if readErr != nil {
+			if ctxErr := downloadCtx.Err(); ctxErr != nil {
+				c.downloadClient.CloseIdleConnections()
+				return n, fmt.Errorf("download range body timeout after %d of %d bytes: %w", n, want, ctxErr)
+			}
 			if errors.Is(readErr, io.EOF) && n == want {
 				break
 			}
@@ -371,6 +393,10 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	if extraN, extraErr := resp.Body.Read(extra[:]); extraN > 0 {
 		return n, fmt.Errorf("download range exceeded declared length %d", want)
 	} else if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		if ctxErr := downloadCtx.Err(); ctxErr != nil {
+			c.downloadClient.CloseIdleConnections()
+			return n, fmt.Errorf("download range body timeout after %d of %d bytes: %w", n, want, ctxErr)
+		}
 		return n, extraErr
 	}
 	return n, nil

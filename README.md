@@ -88,6 +88,9 @@ BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=4194304
 
 # 可选：允许通过挂载目录删除百度网盘文件/目录。默认关闭。
 BAIDUDISKLINK_ENABLE_DELETE=
+
+# 可选：容器时区。默认 Asia/Shanghai，使日志显示 GMT+8 时间。
+TZ=Asia/Shanghai
 ```
 
 这两个参数建议先只在 `bench` 里试，确认效果稳定后再用于日常挂载。

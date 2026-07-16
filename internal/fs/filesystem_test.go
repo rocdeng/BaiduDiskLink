@@ -3,6 +3,7 @@ package fs
 import (
 	"context"
 	"database/sql"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -143,6 +144,84 @@ func TestEntryFileHandleReusesReadWindow(t *testing.T) {
 	}
 }
 
+func TestEntryFileHandlePrefetchesAndReusesNextWindow(t *testing.T) {
+	client := newPrefetchReadClient(-1)
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.waitForOffset(t, 0)
+	if _, err := handle.read(context.Background(), remoteReader, entry, (4<<20)+(192<<10), 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.waitForOffset(t, 16<<20)
+	if _, err := handle.read(context.Background(), remoteReader, entry, 16<<20, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if reads := client.readCount(); reads != 2 {
+		t.Fatalf("expected prefetched boundary to avoid another backend read, got %d", reads)
+	}
+	if handle.lastStrategy != "next-window-prefetch" {
+		t.Fatalf("unexpected boundary strategy %q", handle.lastStrategy)
+	}
+}
+
+func TestEntryFileHandleCombinesReadAcrossPrefetchedBoundary(t *testing.T) {
+	client := newPrefetchReadClient(-1)
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.waitForOffset(t, 0)
+	if _, err := handle.read(context.Background(), remoteReader, entry, (4<<20)+(192<<10), 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.waitForOffset(t, 16<<20)
+	got, err := handle.read(context.Background(), remoteReader, entry, (16<<20)-(64<<10), 192<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 192<<10 {
+		t.Fatalf("expected complete cross-window read, got %d bytes", len(got))
+	}
+	if reads := client.readCount(); reads != 2 {
+		t.Fatalf("expected no duplicate boundary download, got %d backend reads", reads)
+	}
+	if handle.lastStrategy != "prefetched-boundary" {
+		t.Fatalf("unexpected boundary strategy %q", handle.lastStrategy)
+	}
+}
+
+func TestEntryFileHandleCancelsPrefetchOnSeek(t *testing.T) {
+	client := newPrefetchReadClient(16 << 20)
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.waitForOffset(t, 0)
+	if _, err := handle.read(context.Background(), remoteReader, entry, (4<<20)+(192<<10), 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.waitForOffset(t, 16<<20)
+	if _, err := handle.read(context.Background(), remoteReader, entry, 48<<20, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prefetch was not canceled after seek")
+	}
+}
+
 func TestEntryFileHandleUsesSmallerWindowAfterLargeSeek(t *testing.T) {
 	client := &countingReadClient{}
 	remoteReader := remote.NewReader(client)
@@ -183,6 +262,32 @@ func TestEntryFileHandleUsesSmallerWindowForInitialHighOffsetRead(t *testing.T) 
 	}
 	if client.lengths[0] != 8<<20 {
 		t.Fatalf("expected smaller initial seek window, got %d", client.lengths[0])
+	}
+}
+
+func TestEntryFileHandleRefetchesWhenCachedWindowCannotSatisfyRead(t *testing.T) {
+	client := &countingReadClient{}
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 32, lastRead: -1}
+	entry := store.Entry{
+		FSID: "1",
+		Path: "/movie.mkv",
+		Size: 256,
+	}
+	if got, err := handle.read(context.Background(), remoteReader, entry, 64, 8); err != nil {
+		t.Fatal(err)
+	} else if len(got) != 8 {
+		t.Fatalf("expected first read length 8, got %d", len(got))
+	}
+	got, err := handle.read(context.Background(), remoteReader, entry, 72, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 16 {
+		t.Fatalf("expected full second read, got %d", len(got))
+	}
+	if client.reads != 2 {
+		t.Fatalf("expected cache tail miss to refetch, got %d reads", client.reads)
 	}
 }
 
@@ -748,7 +853,86 @@ func testDB(t *testing.T) *sql.DB {
 
 type countingReadClient struct {
 	reads   int
+	offsets []int64
 	lengths []int64
+}
+
+type prefetchReadClient struct {
+	mu          sync.Mutex
+	reads       int
+	started     chan int64
+	blockOffset int64
+	canceled    chan struct{}
+	cancelOnce  sync.Once
+}
+
+func newPrefetchReadClient(blockOffset int64) *prefetchReadClient {
+	return &prefetchReadClient{
+		started:     make(chan int64, 16),
+		blockOffset: blockOffset,
+		canceled:    make(chan struct{}),
+	}
+}
+
+func (c *prefetchReadClient) List(string) ([]baidu.RemoteEntry, error) {
+	return nil, nil
+}
+
+func (c *prefetchReadClient) Stat(string) (baidu.RemoteEntry, error) {
+	return baidu.RemoteEntry{}, nil
+}
+
+func (c *prefetchReadClient) GetDownloadLink(string) (baidu.DownloadLink, error) {
+	return baidu.DownloadLink{}, nil
+}
+
+func (c *prefetchReadClient) Delete([]string) error {
+	return nil
+}
+
+func (c *prefetchReadClient) ReadRange(ctx context.Context, _ string, offset int64, dst []byte) (int, error) {
+	c.mu.Lock()
+	c.reads++
+	c.mu.Unlock()
+	select {
+	case c.started <- offset:
+	default:
+	}
+	if offset == c.blockOffset {
+		<-ctx.Done()
+		c.cancelOnce.Do(func() { close(c.canceled) })
+		return 0, ctx.Err()
+	}
+	for i := range dst {
+		dst[i] = 'x'
+	}
+	return len(dst), nil
+}
+
+func (c *prefetchReadClient) RefreshAuth() error {
+	return nil
+}
+
+func (c *prefetchReadClient) readCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads
+}
+
+func (c *prefetchReadClient) waitForOffset(t *testing.T, want int64) {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case got := <-c.started:
+			if got == want {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for backend offset %d", want)
+		}
+	}
 }
 
 func (c *countingReadClient) List(path string) ([]baidu.RemoteEntry, error) {
@@ -767,8 +951,9 @@ func (c *countingReadClient) Delete(paths []string) error {
 	return nil
 }
 
-func (c *countingReadClient) ReadRange(_ context.Context, _ string, _ int64, dst []byte) (int, error) {
+func (c *countingReadClient) ReadRange(_ context.Context, _ string, offset int64, dst []byte) (int, error) {
 	c.reads++
+	c.offsets = append(c.offsets, offset)
 	c.lengths = append(c.lengths, int64(len(dst)))
 	for i := range dst {
 		dst[i] = 'x'

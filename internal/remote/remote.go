@@ -141,10 +141,25 @@ func (r *Reader) Prefetch(ctx context.Context, fsid string, offset, length int64
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	client := r.currentClient()
+	if client == nil {
+		return nil
+	}
+	if _, err := r.downloadLink(fsid, client); err != nil {
+		return err
+	}
 	if _, ok := r.readCached(fsid, offset, length); ok {
 		return nil
 	}
-	_, err := r.ReadExactRange(ctx, fsid, offset, length)
+	r.mu.RLock()
+	concurrency := r.concurrency
+	chunkSize := r.chunkSize
+	r.mu.RUnlock()
+	if concurrency <= 1 || length <= chunkSize {
+		_, err := r.ReadExactRange(ctx, fsid, offset, length)
+		return err
+	}
+	_, err := r.readConcurrent(ctx, client, fsid, offset, length, chunkSize, concurrency)
 	return err
 }
 

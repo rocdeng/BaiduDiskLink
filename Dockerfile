@@ -1,4 +1,4 @@
-FROM golang:1.24-alpine AS build
+FROM golang:1.25.11-alpine AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -8,7 +8,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/baidudisklink ./cmd/b
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates fuse3 bash
+RUN apk add --no-cache ca-certificates fuse3 bash tzdata
 WORKDIR /app
 COPY --from=build /out/baidudisklink /usr/local/bin/baidudisklink
 

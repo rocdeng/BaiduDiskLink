@@ -502,6 +502,13 @@ func TestRunSkipsOAuthWhenStoredTokenIsUsable(t *testing.T) {
 	releaseMount := make(chan struct{})
 	mountStarted := make(chan struct{}, 1)
 	a.mountFunc = func(path string, root *fs.Filesystem) (*fakeMountServer, error) {
+		children, err := a.store.ListChildren("/Videos")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(children) != 1 || children[0].Name != "Movie" {
+			t.Fatalf("expected root metadata to be preloaded before mount, got %#v", children)
+		}
 		mountStarted <- struct{}{}
 		return &fakeMountServer{
 			waitFn:    func() { <-releaseMount },
