@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 
 	"baidudisklink/internal/app"
@@ -10,6 +11,7 @@ import (
 )
 
 func main() {
+	configureLogging()
 	cfg := config.Load()
 	if len(os.Args) > 1 && os.Args[1] == "bench" {
 		runBench(cfg, os.Args[2:])
@@ -32,6 +34,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func configureLogging() {
+	log.SetOutput(os.Stdout)
 }
 
 func runBench(cfg config.Config, args []string) {
