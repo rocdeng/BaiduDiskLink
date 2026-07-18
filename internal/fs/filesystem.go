@@ -761,12 +761,11 @@ func (h *entryFileHandle) cancelPrefetchLocked() {
 	h.prefetchLen = 0
 }
 
-func (h *entryFileHandle) startNextPrefetchLocked(remote *remote.Reader, entry store.Entry, readEnd int64) {
+func (h *entryFileHandle) startNextPrefetchLocked(remote *remote.Reader, entry store.Entry) {
 	if h == nil || remote == nil || h.closed || len(h.window) == 0 || h.windowSize <= 0 {
 		return
 	}
-	consumed := readEnd - h.windowOff
-	if consumed <= int64(len(h.window))/4 {
+	if h.windowOff%h.windowSize != 0 || int64(len(h.window)) != h.windowSize {
 		return
 	}
 	off := h.windowOff + int64(len(h.window))
@@ -782,6 +781,13 @@ func (h *entryFileHandle) startNextPrefetchLocked(remote *remote.Reader, entry s
 	if length <= 0 {
 		return
 	}
+	h.startPrefetchLocked(remote, entry.FSID, off, length)
+}
+
+func (h *entryFileHandle) startPrefetchLocked(remote *remote.Reader, fsid string, off, length int64) {
+	if h == nil || remote == nil || h.closed || fsid == "" || length <= 0 {
+		return
+	}
 	if h.prefetchDone != nil && h.prefetchOff == off && h.prefetchLen == length {
 		return
 	}
@@ -793,7 +799,7 @@ func (h *entryFileHandle) startNextPrefetchLocked(remote *remote.Reader, entry s
 	h.prefetchOff = off
 	h.prefetchLen = length
 	go func() {
-		done <- remote.Prefetch(ctx, entry.FSID, off, length)
+		done <- remote.Prefetch(ctx, fsid, off, length)
 		close(done)
 	}()
 }
@@ -846,7 +852,7 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 		if data, ok := h.sliceWindow(off, length); ok {
 			if readSatisfied(off, length, int64(len(data)), entry.Size) {
 				h.lastStrategy = "handle-cache"
-				h.startNextPrefetchLocked(remote, entry, off+int64(len(data)))
+				h.startNextPrefetchLocked(remote, entry)
 				return data, nil
 			}
 			return h.readAcrossWindowBoundaryLocked(ctx, remote, entry, off, length, data)
@@ -893,13 +899,16 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	h.window = data
 	result := h.sliceWindowOrEmpty(off, length)
 	if !jump {
-		h.startNextPrefetchLocked(remote, entry, off+int64(len(result)))
+		h.startNextPrefetchLocked(remote, entry)
 	}
 	return result, nil
 }
 
 func (h *entryFileHandle) readAcrossWindowBoundaryLocked(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64, tail []byte) ([]byte, error) {
 	nextOff := h.windowOff + int64(len(h.window))
+	if h.windowOff%h.windowSize != 0 || int64(len(h.window)) != h.windowSize {
+		return h.readAcrossSeekWindowLocked(ctx, remote, entry, off, length, tail, nextOff)
+	}
 	nextLen := h.windowSize
 	if entry.Size > 0 && nextOff+nextLen > entry.Size {
 		nextLen = entry.Size - nextOff
@@ -932,7 +941,44 @@ func (h *entryFileHandle) readAcrossWindowBoundaryLocked(ctx context.Context, re
 	} else {
 		h.lastStrategy = "window-boundary"
 	}
-	h.startNextPrefetchLocked(remote, entry, nextOff+remaining)
+	h.startNextPrefetchLocked(remote, entry)
+	return result, nil
+}
+
+func (h *entryFileHandle) readAcrossSeekWindowLocked(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64, tail []byte, nextOff int64) ([]byte, error) {
+	remaining := length - int64(len(tail))
+	if remaining <= 0 {
+		return tail, nil
+	}
+	if entry.Size > 0 && nextOff+remaining > entry.Size {
+		remaining = entry.Size - nextOff
+	}
+	if remaining <= 0 {
+		return tail, nil
+	}
+	next, err := remote.ReadExactRange(ctx, entry.FSID, nextOff, remaining)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]byte, len(tail)+len(next))
+	copy(result, tail)
+	copy(result[len(tail):], next)
+	if !readSatisfied(off, length, int64(len(result)), entry.Size) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	h.lastStrategy = "seek-boundary-exact"
+	readEnd := off + int64(len(result))
+	prefetchOff := (readEnd / h.windowSize) * h.windowSize
+	prefetchLen := h.windowSize
+	if entry.Size > 0 {
+		if prefetchOff >= entry.Size {
+			return result, nil
+		}
+		if prefetchOff+prefetchLen > entry.Size {
+			prefetchLen = entry.Size - prefetchOff
+		}
+	}
+	h.startPrefetchLocked(remote, entry.FSID, prefetchOff, prefetchLen)
 	return result, nil
 }
 

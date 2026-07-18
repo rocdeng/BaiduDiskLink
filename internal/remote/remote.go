@@ -125,7 +125,23 @@ func (r *Reader) ReadRange(ctx context.Context, fsid string, offset, length int6
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
 	}
-	return r.readWithOptions(ctx, client, fsid, offset, length)
+	data, err := r.readWithOptions(ctx, client, fsid, offset, length)
+	if err != nil || int64(len(data)) >= length {
+		return data, err
+	}
+	missingOffset := offset + int64(len(data))
+	missingLength := length - int64(len(data))
+	missing, err := r.ReadExactRange(ctx, fsid, missingOffset, missingLength)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]byte, len(data)+len(missing))
+	copy(result, data)
+	copy(result[len(data):], missing)
+	if int64(len(result)) != length {
+		return nil, fmt.Errorf("read range at %d returned %d of %d bytes: %w", offset, len(result), length, io.ErrUnexpectedEOF)
+	}
+	return result, nil
 }
 
 func (r *Reader) Prefetch(ctx context.Context, fsid string, offset, length int64) error {
@@ -184,6 +200,9 @@ func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		n, err := client.ReadRange(ctx, fsid, offset, data)
+		if err == nil && n != len(data) {
+			err = fmt.Errorf("read exact range at %d returned %d of %d bytes: %w", offset, n, len(data), io.ErrUnexpectedEOF)
+		}
 		if err == nil {
 			data = data[:n]
 			r.storeCached(fsid, offset, data)

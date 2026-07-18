@@ -169,6 +169,44 @@ func TestEntryFileHandlePrefetchesAndReusesNextWindow(t *testing.T) {
 	}
 }
 
+func TestEntryFileHandleStartsPrefetchAfterFirstSequentialRead(t *testing.T) {
+	client := newPrefetchReadClient(-1)
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.waitForOffset(t, 16<<20)
+	handle.Release(context.Background())
+}
+
+func TestEntryFileHandleCompletesReadAcrossUnalignedSeekWindow(t *testing.T) {
+	client := newPrefetchReadClient(-1)
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 128 << 20}
+	boundary := int64(64 << 20)
+	seekOff := boundary - (192 << 10)
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, seekOff, 86<<10); err != nil {
+		t.Fatal(err)
+	}
+	got, err := handle.read(context.Background(), remoteReader, entry, seekOff+(86<<10), 192<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 192<<10 {
+		t.Fatalf("expected complete cross-window read, got %d bytes", len(got))
+	}
+	if handle.lastStrategy != "seek-boundary-exact" {
+		t.Fatalf("unexpected boundary strategy %q", handle.lastStrategy)
+	}
+	client.waitForOffset(t, boundary)
+	handle.Release(context.Background())
+}
+
 func TestEntryFileHandleCombinesReadAcrossPrefetchedBoundary(t *testing.T) {
 	client := newPrefetchReadClient(-1)
 	remoteReader := remote.NewReader(client)
@@ -286,6 +324,7 @@ func TestEntryFileHandleRefetchesWhenCachedWindowCannotSatisfyRead(t *testing.T)
 	if len(got) != 16 {
 		t.Fatalf("expected full second read, got %d", len(got))
 	}
+	handle.Release(context.Background())
 	if client.reads != 2 {
 		t.Fatalf("expected cache tail miss to refetch, got %d reads", client.reads)
 	}

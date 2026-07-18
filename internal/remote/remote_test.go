@@ -252,6 +252,33 @@ func TestReadExactRangeDoesNotPrefetch(t *testing.T) {
 	}
 }
 
+func TestReadExactRangeRejectsShortRead(t *testing.T) {
+	client := &stubClient{shortRead: true}
+	r := NewReader(client)
+	if _, err := r.ReadExactRange(context.Background(), "fsid-1", 1024, 4096); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected short exact read error, got %v", err)
+	}
+}
+
+func TestReadRangeCompletesRequestCrossingAlignedWindow(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	offset := int64((8 << 20) - (64 << 10))
+	got, err := r.ReadRange(context.Background(), "fsid-1", offset, 192<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 192<<10 {
+		t.Fatalf("expected complete cross-window read, got %d bytes", len(got))
+	}
+	client.mu.Lock()
+	readCalls := client.readCalls
+	client.mu.Unlock()
+	if readCalls != 2 {
+		t.Fatalf("expected aligned read plus exact remainder, got %d backend reads", readCalls)
+	}
+}
+
 func TestReadRangeCachesDownloadLinkAndRetries(t *testing.T) {
 	client := &stubClient{failRead: true}
 	r := NewReader(client)
