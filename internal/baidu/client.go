@@ -84,12 +84,13 @@ func NewMetadataHTTPClient() *http.Client {
 }
 
 func NewDownloadHTTPClient(concurrency int) *http.Client {
-	if concurrency < 4 {
-		concurrency = 4
+	perHost := concurrency + 8
+	if perHost < 12 {
+		perHost = 12
 	}
 	return &http.Client{
 		Timeout:   downloadClientTimeout,
-		Transport: newHTTPTransport(concurrency, 30*time.Second),
+		Transport: newHTTPTransport(perHost, 30*time.Second),
 	}
 }
 

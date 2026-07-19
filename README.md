@@ -80,8 +80,8 @@ BAIDUDISKLINK_REMOTE_ROOT_PATH=/Videos
 # 可选：允许指定 DSM 组读取挂载内容。推荐填数字 GID，多个用逗号分隔。
 BAIDUDISKLINK_FUSE_GROUP_NAME=101
 
-# 可选：百度直链读取并发数。默认 1。
-BAIDUDISKLINK_DOWNLOAD_CONCURRENCY=1
+# 可选：百度直链读取并发数。默认 4。
+BAIDUDISKLINK_DOWNLOAD_CONCURRENCY=4
 
 # 可选：每个分块读取大小。默认 4MiB。
 BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=4194304
@@ -93,7 +93,7 @@ BAIDUDISKLINK_ENABLE_DELETE=
 TZ=Asia/Shanghai
 ```
 
-这两个参数建议先只在 `bench` 里试，确认效果稳定后再用于日常挂载。
+这两个参数同时用于 `bench` 和日常 FUSE 挂载。
 
 默认容器内路径由 `docker-compose.yml` 固定为：
 

@@ -35,7 +35,7 @@ func Load() Config {
 		FuseGroupName:       os.Getenv("BAIDUDISKLINK_FUSE_GROUP_NAME"),
 		FuseTraceReads:      parseBool(os.Getenv("BAIDUDISKLINK_FUSE_TRACE_READS")),
 		EnableDelete:        parseBool(os.Getenv("BAIDUDISKLINK_ENABLE_DELETE")),
-		DownloadConcurrency: parseInt(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CONCURRENCY"), 1),
+		DownloadConcurrency: parseInt(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CONCURRENCY"), 4),
 		DownloadChunkSize:   parseInt64(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE"), 4<<20),
 		ClientID:            os.Getenv("BAIDUDISKLINK_CLIENT_ID"),
 		ClientSecret:        os.Getenv("BAIDUDISKLINK_CLIENT_SECRET"),

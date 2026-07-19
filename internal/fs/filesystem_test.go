@@ -119,6 +119,25 @@ func TestEntryReadUsesCachedWindowWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestShouldTraceReadSkipsRoutineCacheHits(t *testing.T) {
+	for _, strategy := range []string{"handle-cache", "global-cache", "shared-window-cache"} {
+		if shouldTraceRead(strategy, 196608, 196608) {
+			t.Fatalf("expected routine %s read to be suppressed", strategy)
+		}
+	}
+}
+
+func TestShouldTraceReadKeepsDiagnosticEvents(t *testing.T) {
+	for _, strategy := range []string{"seek-exact", "seek-boundary-exact", "next-window-prefetch", "prefetched-boundary", "foreground-prefetch", "foreground-boundary", "window-boundary", "window-prefetch", "node-range"} {
+		if !shouldTraceRead(strategy, 196608, 196608) {
+			t.Fatalf("expected %s read to remain visible", strategy)
+		}
+	}
+	if !shouldTraceRead("handle-cache", 196608, 4096) {
+		t.Fatal("expected short cache read to remain visible")
+	}
+}
+
 func TestEntryFileHandleReusesReadWindow(t *testing.T) {
 	client := &countingReadClient{}
 	remoteReader := remote.NewReader(client)
@@ -139,8 +158,8 @@ func TestEntryFileHandleReusesReadWindow(t *testing.T) {
 	if len(first) != 8 || len(second) != 8 {
 		t.Fatalf("unexpected read lengths: %d %d", len(first), len(second))
 	}
-	if client.reads != 1 {
-		t.Fatalf("expected one remote read for same handle window, got %d", client.reads)
+	if reads, _ := client.snapshot(); reads != 1 {
+		t.Fatalf("expected one remote read for same handle window, got %d", reads)
 	}
 }
 
@@ -158,6 +177,7 @@ func TestEntryFileHandlePrefetchesAndReusesNextWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.waitForOffset(t, 16<<20)
+	waitForCachedRange(t, remoteReader, entry.FSID, 16<<20, 16<<20)
 	if _, err := handle.read(context.Background(), remoteReader, entry, 16<<20, 192<<10); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +198,128 @@ func TestEntryFileHandleStartsPrefetchAfterFirstSequentialRead(t *testing.T) {
 	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
 		t.Fatal(err)
 	}
+	client.assertNoOffset(t, 16<<20)
+	if _, err := handle.read(context.Background(), remoteReader, entry, 192<<10, 192<<10); err != nil {
+		t.Fatal(err)
+	}
 	client.waitForOffset(t, 16<<20)
+	handle.Release(context.Background())
+}
+
+func TestEntryFileHandleSingleProbeDoesNotStartDeepPrefetch(t *testing.T) {
+	client := newPrefetchReadClient(-1)
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 8 << 20, prefetchDepth: 32 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 64<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.assertNoOffset(t, 8<<20)
+	handle.Release(context.Background())
+}
+
+func TestEntryFileHandleQueuesThirtyTwoMiBAheadInEightMiBChunks(t *testing.T) {
+	client := newPrefetchReadClient(-1)
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 8 << 20, prefetchDepth: 32 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.read(context.Background(), remoteReader, entry, 192<<10, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[int64]struct{})
+	for len(seen) < 4 {
+		off := client.waitForAnyOffset(t)
+		if off >= 8<<20 && off <= 32<<20 {
+			seen[off] = struct{}{}
+		}
+	}
+	for _, off := range []int64{8 << 20, 16 << 20, 24 << 20, 32 << 20} {
+		if _, ok := seen[off]; !ok {
+			t.Fatalf("expected prefetch offset %d, got %#v", off, seen)
+		}
+	}
+	handle.Release(context.Background())
+}
+
+func TestEntryFileHandlePrefetchesFourWindowsConcurrently(t *testing.T) {
+	client := newPrefetchReadClient(8 << 20)
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 8 << 20, prefetchDepth: 32 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.read(context.Background(), remoteReader, entry, 192<<10, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int64]struct{}{}
+	for len(seen) < 4 {
+		off := client.waitForAnyOffset(t)
+		if off == 8<<20 || off == 16<<20 || off == 24<<20 || off == 32<<20 {
+			seen[off] = struct{}{}
+		}
+	}
+	handle.Release(context.Background())
+}
+
+func TestEntryFileHandlesShareSameFilePrefetch(t *testing.T) {
+	client := newPrefetchReadClient(-1)
+	remoteReader := remote.NewReader(client)
+	first := &entryFileHandle{windowSize: 8 << 20, prefetchDepth: 32 << 20, lastRead: -1}
+	second := &entryFileHandle{windowSize: 8 << 20, prefetchDepth: 32 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+
+	if _, err := first.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.read(context.Background(), remoteReader, entry, 192<<10, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.read(context.Background(), remoteReader, entry, 192<<10, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	for _, off := range []int64{8 << 20, 16 << 20, 24 << 20, 32 << 20} {
+		waitForCachedRange(t, remoteReader, entry.FSID, off, 8<<20)
+	}
+	for _, off := range []int64{0, 8 << 20, 16 << 20, 24 << 20, 32 << 20} {
+		if calls := client.readCountAt(off); calls != 1 {
+			t.Fatalf("expected offset %d to download once across handles, got %d", off, calls)
+		}
+	}
+	first.Release(context.Background())
+	second.Release(context.Background())
+}
+
+func TestEntryFileHandleSeekCancelsQueuedPrefetch(t *testing.T) {
+	client := newPrefetchReadClient(8 << 20)
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 8 << 20, prefetchDepth: 32 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.read(context.Background(), remoteReader, entry, 192<<10, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.waitForOffset(t, 8<<20)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := handle.read(ctx, remoteReader, entry, 24<<20, 192<<10); err != nil {
+		t.Fatalf("seek read remained blocked behind queued prefetch: %v", err)
+	}
+	if handle.lastStrategy != "seek-exact" {
+		t.Fatalf("unexpected seek strategy %q", handle.lastStrategy)
+	}
 	handle.Release(context.Background())
 }
 
@@ -203,7 +344,11 @@ func TestEntryFileHandleCompletesReadAcrossUnalignedSeekWindow(t *testing.T) {
 	if handle.lastStrategy != "seek-boundary-exact" {
 		t.Fatalf("unexpected boundary strategy %q", handle.lastStrategy)
 	}
-	client.waitForOffset(t, boundary)
+	client.assertNoOffset(t, boundary)
+	if _, err := handle.read(context.Background(), remoteReader, entry, boundary+(128<<10), 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	client.waitForOffset(t, boundary+(16<<20))
 	handle.Release(context.Background())
 }
 
@@ -221,6 +366,7 @@ func TestEntryFileHandleCombinesReadAcrossPrefetchedBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.waitForOffset(t, 16<<20)
+	waitForCachedRange(t, remoteReader, entry.FSID, 16<<20, 16<<20)
 	got, err := handle.read(context.Background(), remoteReader, entry, (16<<20)-(64<<10), 192<<10)
 	if err != nil {
 		t.Fatal(err)
@@ -236,8 +382,9 @@ func TestEntryFileHandleCombinesReadAcrossPrefetchedBoundary(t *testing.T) {
 	}
 }
 
-func TestEntryFileHandleCancelsPrefetchOnSeek(t *testing.T) {
+func TestEntryFileHandleSeekBypassesStalePrefetch(t *testing.T) {
 	client := newPrefetchReadClient(16 << 20)
+	client.blockRelease = make(chan struct{})
 	remoteReader := remote.NewReader(client)
 	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
 	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
@@ -250,14 +397,24 @@ func TestEntryFileHandleCancelsPrefetchOnSeek(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.waitForOffset(t, 16<<20)
-	if _, err := handle.read(context.Background(), remoteReader, entry, 48<<20, 192<<10); err != nil {
-		t.Fatal(err)
-	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := handle.read(context.Background(), remoteReader, entry, 48<<20, 192<<10)
+		readDone <- err
+	}()
 	select {
-	case <-client.canceled:
-	case <-time.After(2 * time.Second):
-		t.Fatal("prefetch was not canceled after seek")
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("seek read waited for stale prefetch")
 	}
+	if handle.lastStrategy != "seek-exact" {
+		t.Fatalf("unexpected seek strategy %q", handle.lastStrategy)
+	}
+	close(client.blockRelease)
+	handle.Release(context.Background())
 }
 
 func TestEntryFileHandleUsesSmallerWindowAfterLargeSeek(t *testing.T) {
@@ -275,12 +432,39 @@ func TestEntryFileHandleUsesSmallerWindowAfterLargeSeek(t *testing.T) {
 	if _, err := handle.read(context.Background(), remoteReader, entry, 80<<20, 4<<20); err != nil {
 		t.Fatal(err)
 	}
-	if client.reads != 2 {
-		t.Fatalf("expected second remote read after seek, got %d", client.reads)
+	reads, lengths := client.snapshot()
+	if reads != 2 {
+		t.Fatalf("expected second remote read after seek, got %d", reads)
 	}
-	if client.lengths[1] != 8<<20 {
-		t.Fatalf("expected smaller seek window, got %d", client.lengths[1])
+	if lengths[1] != 8<<20 {
+		t.Fatalf("expected smaller seek window, got %d", lengths[1])
 	}
+}
+
+func TestEntryFileHandleTreatsLargeBackwardJumpAsSeek(t *testing.T) {
+	client := &countingReadClient{}
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 8 << 20, prefetchDepth: 32 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 30}
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, entry.Size-8192, 8192); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.read(context.Background(), remoteReader, entry, 19<<30, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if handle.lastStrategy != "seek-exact" {
+		t.Fatalf("large backward jump was treated as sequential read: %q", handle.lastStrategy)
+	}
+	reads, lengths := client.snapshot()
+	if reads != 2 {
+		t.Fatalf("expected two exact probe reads, got %d", reads)
+	}
+	if lengths[1] != 384<<10 {
+		t.Fatalf("expected bounded seek read, got %d bytes", lengths[1])
+	}
+	client.assertNoReadLength(t, 8<<20)
+	handle.Release(context.Background())
 }
 
 func TestEntryFileHandleUsesSmallerWindowForInitialHighOffsetRead(t *testing.T) {
@@ -295,11 +479,12 @@ func TestEntryFileHandleUsesSmallerWindowForInitialHighOffsetRead(t *testing.T) 
 	if _, err := handle.read(context.Background(), remoteReader, entry, 80<<20, 4<<20); err != nil {
 		t.Fatal(err)
 	}
-	if client.reads != 1 {
-		t.Fatalf("expected one remote read, got %d", client.reads)
+	reads, lengths := client.snapshot()
+	if reads != 1 {
+		t.Fatalf("expected one remote read, got %d", reads)
 	}
-	if client.lengths[0] != 8<<20 {
-		t.Fatalf("expected smaller initial seek window, got %d", client.lengths[0])
+	if lengths[0] != 8<<20 {
+		t.Fatalf("expected smaller initial seek window, got %d", lengths[0])
 	}
 }
 
@@ -325,9 +510,29 @@ func TestEntryFileHandleRefetchesWhenCachedWindowCannotSatisfyRead(t *testing.T)
 		t.Fatalf("expected full second read, got %d", len(got))
 	}
 	handle.Release(context.Background())
-	if client.reads != 2 {
-		t.Fatalf("expected cache tail miss to refetch, got %d reads", client.reads)
+	if reads, _ := client.snapshot(); reads != 2 {
+		t.Fatalf("expected cache tail miss to refetch, got %d reads", reads)
 	}
+}
+
+func TestEntryFileHandleCompletesFirstReadCrossingWindowBoundary(t *testing.T) {
+	client := &countingReadClient{}
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 8 << 20, prefetchDepth: 32 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
+	off := int64((8 << 20) - (120 << 10))
+
+	got, err := handle.read(context.Background(), remoteReader, entry, off, 192<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 192<<10 {
+		t.Fatalf("expected complete first boundary read, got %d bytes", len(got))
+	}
+	if handle.lastStrategy != "window-boundary" {
+		t.Fatalf("unexpected boundary strategy %q", handle.lastStrategy)
+	}
+	handle.Release(context.Background())
 }
 
 func TestRefreshRootLoadsRemoteEntriesIntoStore(t *testing.T) {
@@ -891,23 +1096,44 @@ func testDB(t *testing.T) *sql.DB {
 }
 
 type countingReadClient struct {
+	mu      sync.Mutex
 	reads   int
 	offsets []int64
 	lengths []int64
 }
 
+func (c *countingReadClient) snapshot() (int, []int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads, append([]int64(nil), c.lengths...)
+}
+
+func (c *countingReadClient) assertNoReadLength(t *testing.T, unwanted int64) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, length := range c.lengths {
+		if length == unwanted {
+			t.Fatalf("unexpected full-window read of %d bytes: %#v", unwanted, c.lengths)
+		}
+	}
+}
+
 type prefetchReadClient struct {
-	mu          sync.Mutex
-	reads       int
-	started     chan int64
-	blockOffset int64
-	canceled    chan struct{}
-	cancelOnce  sync.Once
+	mu           sync.Mutex
+	reads        int
+	offsets      map[int64]int
+	started      chan int64
+	blockOffset  int64
+	blockRelease chan struct{}
+	canceled     chan struct{}
+	cancelOnce   sync.Once
 }
 
 func newPrefetchReadClient(blockOffset int64) *prefetchReadClient {
 	return &prefetchReadClient{
 		started:     make(chan int64, 16),
+		offsets:     make(map[int64]int),
 		blockOffset: blockOffset,
 		canceled:    make(chan struct{}),
 	}
@@ -932,15 +1158,19 @@ func (c *prefetchReadClient) Delete([]string) error {
 func (c *prefetchReadClient) ReadRange(ctx context.Context, _ string, offset int64, dst []byte) (int, error) {
 	c.mu.Lock()
 	c.reads++
+	c.offsets[offset]++
 	c.mu.Unlock()
 	select {
 	case c.started <- offset:
 	default:
 	}
 	if offset == c.blockOffset {
-		<-ctx.Done()
-		c.cancelOnce.Do(func() { close(c.canceled) })
-		return 0, ctx.Err()
+		select {
+		case <-ctx.Done():
+			c.cancelOnce.Do(func() { close(c.canceled) })
+			return 0, ctx.Err()
+		case <-c.blockRelease:
+		}
 	}
 	for i := range dst {
 		dst[i] = 'x'
@@ -958,6 +1188,12 @@ func (c *prefetchReadClient) readCount() int {
 	return c.reads
 }
 
+func (c *prefetchReadClient) readCountAt(offset int64) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.offsets[offset]
+}
+
 func (c *prefetchReadClient) waitForOffset(t *testing.T, want int64) {
 	t.Helper()
 	timer := time.NewTimer(2 * time.Second)
@@ -972,6 +1208,45 @@ func (c *prefetchReadClient) waitForOffset(t *testing.T, want int64) {
 			t.Fatalf("timed out waiting for backend offset %d", want)
 		}
 	}
+}
+
+func (c *prefetchReadClient) waitForAnyOffset(t *testing.T) int64 {
+	t.Helper()
+	select {
+	case got := <-c.started:
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for backend read")
+		return 0
+	}
+}
+
+func (c *prefetchReadClient) assertNoOffset(t *testing.T, unwanted int64) {
+	t.Helper()
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	for {
+		select {
+		case got := <-c.started:
+			if got == unwanted {
+				t.Fatalf("unexpected prefetch at seek probe offset %d", unwanted)
+			}
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+func waitForCachedRange(t *testing.T, reader *remote.Reader, fsid string, offset, length int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := reader.ReadCachedWindow(fsid, offset, length); ok {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for cached range offset=%d length=%d", offset, length)
 }
 
 func (c *countingReadClient) List(path string) ([]baidu.RemoteEntry, error) {
@@ -991,6 +1266,8 @@ func (c *countingReadClient) Delete(paths []string) error {
 }
 
 func (c *countingReadClient) ReadRange(_ context.Context, _ string, offset int64, dst []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.reads++
 	c.offsets = append(c.offsets, offset)
 	c.lengths = append(c.lengths, int64(len(dst)))

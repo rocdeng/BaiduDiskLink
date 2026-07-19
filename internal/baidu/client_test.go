@@ -63,7 +63,7 @@ func TestNewDownloadHTTPClientConfiguresConnectionPool(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected transport type %T", client.Transport)
 	}
-	if transport.MaxConnsPerHost != 4 || transport.MaxIdleConnsPerHost != 4 {
+	if transport.MaxConnsPerHost != 12 || transport.MaxIdleConnsPerHost != 12 {
 		t.Fatalf("unexpected per-host limits: active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
 	}
 	if !transport.DisableCompression || transport.ResponseHeaderTimeout != 30*time.Second {
@@ -77,8 +77,8 @@ func TestNewDownloadHTTPClientKeepsMinimumConnectionPool(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected transport type %T", client.Transport)
 	}
-	if transport.MaxConnsPerHost != 4 || transport.MaxIdleConnsPerHost != 4 {
-		t.Fatalf("expected minimum four per-host connections, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	if transport.MaxConnsPerHost != 12 || transport.MaxIdleConnsPerHost != 12 {
+		t.Fatalf("expected minimum twelve per-host connections, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
 	}
 }
 
@@ -88,8 +88,8 @@ func TestNewDownloadHTTPClientPreservesHigherConcurrency(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected transport type %T", client.Transport)
 	}
-	if transport.MaxConnsPerHost != 8 || transport.MaxIdleConnsPerHost != 8 {
-		t.Fatalf("expected configured per-host connections, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	if transport.MaxConnsPerHost != 16 || transport.MaxIdleConnsPerHost != 16 {
+		t.Fatalf("expected configured concurrency plus foreground reserve, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
 	}
 }
 

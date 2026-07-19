@@ -34,7 +34,11 @@ type Filesystem struct {
 	enableDelete bool
 }
 
-const fuseReadWindowSize int64 = 16 << 20
+const (
+	fuseReadWindowSize  int64 = 8 << 20
+	fusePrefetchDepth   int64 = 32 << 20
+	fusePrefetchWorkers       = 4
+)
 
 func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath string) *Filesystem {
 	out := make(map[uint32]struct{}, len(gids))
@@ -611,7 +615,22 @@ func (n *entryNode) traceRead(off int64, requested, returned int, strategy strin
 	if n == nil || n.Filesystem == nil || !n.Filesystem.traceReads {
 		return
 	}
+	if !shouldTraceRead(strategy, requested, returned) {
+		return
+	}
 	log.Printf("fuse read path=%q fsid=%q offset=%d requested=%d returned=%d strategy=%s", n.entry.Path, n.entry.FSID, off, requested, returned, strategy)
+}
+
+func shouldTraceRead(strategy string, requested, returned int) bool {
+	if returned != requested {
+		return true
+	}
+	switch strategy {
+	case "handle-cache", "global-cache", "shared-window-cache":
+		return false
+	default:
+		return true
+	}
 }
 
 func (n *entryNode) Opendir(ctx context.Context) syscall.Errno {
@@ -622,7 +641,7 @@ func (n *entryNode) Open(ctx context.Context, openFlags uint32) (fh goFs.FileHan
 	if n.entry.IsDir {
 		return nil, 0, syscall.EISDIR
 	}
-	return &entryFileHandle{windowSize: fuseReadWindowSize, lastRead: -1}, fuse.FOPEN_KEEP_CACHE, 0
+	return &entryFileHandle{windowSize: fuseReadWindowSize, prefetchDepth: fusePrefetchDepth, lastRead: -1}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 func (f *Filesystem) shouldRefreshRoot(children []store.Entry) bool {
@@ -727,17 +746,30 @@ func inodeTime(mtm int64) time.Time {
 }
 
 type entryFileHandle struct {
-	mu             sync.Mutex
-	window         []byte
-	windowOff      int64
-	windowSize     int64
-	lastRead       int64
-	lastStrategy   string
-	prefetchCancel context.CancelFunc
-	prefetchDone   chan error
-	prefetchOff    int64
-	prefetchLen    int64
-	closed         bool
+	mu              sync.Mutex
+	window          []byte
+	windowOff       int64
+	windowSize      int64
+	prefetchDepth   int64
+	lastRead        int64
+	sequentialReads int
+	lastStrategy    string
+	prefetchCancel  context.CancelFunc
+	prefetchJobs    chan prefetchJob
+	prefetchTasks   map[int64]*prefetchTask
+	prefetchFSID    string
+	closed          bool
+}
+
+type prefetchJob struct {
+	off    int64
+	length int64
+	task   *prefetchTask
+}
+
+type prefetchTask struct {
+	length int64
+	done   chan error
 }
 
 func (h *entryFileHandle) Release(_ context.Context) syscall.Errno {
@@ -756,9 +788,9 @@ func (h *entryFileHandle) cancelPrefetchLocked() {
 		h.prefetchCancel()
 	}
 	h.prefetchCancel = nil
-	h.prefetchDone = nil
-	h.prefetchOff = 0
-	h.prefetchLen = 0
+	h.prefetchJobs = nil
+	h.prefetchTasks = nil
+	h.prefetchFSID = ""
 }
 
 func (h *entryFileHandle) startNextPrefetchLocked(remote *remote.Reader, entry store.Entry) {
@@ -781,49 +813,99 @@ func (h *entryFileHandle) startNextPrefetchLocked(remote *remote.Reader, entry s
 	if length <= 0 {
 		return
 	}
-	h.startPrefetchLocked(remote, entry.FSID, off, length)
+	h.startPrefetchRangeLocked(remote, entry, off)
 }
 
 func (h *entryFileHandle) startPrefetchLocked(remote *remote.Reader, fsid string, off, length int64) {
 	if h == nil || remote == nil || h.closed || fsid == "" || length <= 0 {
 		return
 	}
-	if h.prefetchDone != nil && h.prefetchOff == off && h.prefetchLen == length {
-		return
+	if h.prefetchFSID != "" && h.prefetchFSID != fsid {
+		h.cancelPrefetchLocked()
 	}
-	h.cancelPrefetchLocked()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	h.prefetchCancel = cancel
-	h.prefetchDone = done
-	h.prefetchOff = off
-	h.prefetchLen = length
-	go func() {
-		done <- remote.Prefetch(ctx, fsid, off, length)
-		close(done)
-	}()
+	if h.prefetchTasks != nil {
+		if task := h.prefetchTasks[off]; task != nil && task.length >= length {
+			return
+		}
+	}
+	if h.prefetchJobs == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		jobs := make(chan prefetchJob, 16)
+		h.prefetchCancel = cancel
+		h.prefetchJobs = jobs
+		h.prefetchTasks = make(map[int64]*prefetchTask)
+		h.prefetchFSID = fsid
+		go runPrefetchQueue(ctx, remote, fsid, jobs, fusePrefetchWorkers)
+	}
+	task := &prefetchTask{length: length, done: make(chan error, 1)}
+	h.prefetchTasks[off] = task
+	select {
+	case h.prefetchJobs <- prefetchJob{off: off, length: length, task: task}:
+	default:
+		delete(h.prefetchTasks, off)
+		task.done <- errors.New("prefetch queue is full")
+		close(task.done)
+	}
 }
 
-func (h *entryFileHandle) waitPrefetchLocked(ctx context.Context, off, length int64) (bool, error) {
-	if h.prefetchDone == nil || off < h.prefetchOff || off+length > h.prefetchOff+h.prefetchLen {
-		return false, nil
+func runPrefetchQueue(ctx context.Context, remote *remote.Reader, fsid string, jobs <-chan prefetchJob, workers int) {
+	if workers <= 0 {
+		workers = 1
 	}
-	done := h.prefetchDone
-	select {
-	case err := <-done:
-		h.prefetchCancel = nil
-		h.prefetchDone = nil
-		h.prefetchOff = 0
-		h.prefetchLen = 0
-		if err != nil {
-			if ctx.Err() != nil {
-				return false, ctx.Err()
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					err := remote.Prefetch(ctx, fsid, job.off, job.length)
+					job.task.done <- err
+					close(job.task.done)
+				}
 			}
-			return false, nil
+		}()
+	}
+	wg.Wait()
+}
+
+func (h *entryFileHandle) prefetchStatusLocked(off, length int64) (ready bool, pending bool) {
+	if h.prefetchTasks == nil {
+		return false, false
+	}
+	task := h.prefetchTasks[off]
+	if task == nil || length > task.length {
+		return false, false
+	}
+	select {
+	case err := <-task.done:
+		delete(h.prefetchTasks, off)
+		return err == nil, false
+	default:
+		return false, true
+	}
+}
+
+func (h *entryFileHandle) discardPrefetchBeforeLocked(off int64) {
+	for taskOff, task := range h.prefetchTasks {
+		if taskOff+task.length <= off {
+			delete(h.prefetchTasks, taskOff)
 		}
-		return true, nil
-	case <-ctx.Done():
-		return false, ctx.Err()
+	}
+}
+
+func (h *entryFileHandle) ensurePrefetchDefaults() {
+	if h.windowSize <= 0 {
+		h.windowSize = fuseReadWindowSize
+	}
+	if h.prefetchDepth <= 0 {
+		h.prefetchDepth = h.windowSize
 	}
 }
 
@@ -837,13 +919,16 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	if entry.Size > 0 && off >= entry.Size {
 		return []byte{}, nil
 	}
-	if h.windowSize <= 0 {
-		h.windowSize = fuseReadWindowSize
-	}
+	h.ensurePrefetchDefaults()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	firstHighOffsetRead := h.lastRead < 0 && off >= h.windowSize
-	jump := firstHighOffsetRead || (h.lastRead >= 0 && off > h.lastRead+int64(len(h.window)) && off-h.lastRead > h.windowSize)
+	jump := firstHighOffsetRead || h.isLargeSeekLocked(off)
+	if jump {
+		h.sequentialReads = 0
+	} else if h.lastRead >= 0 && off >= h.lastRead && off-h.lastRead <= h.windowSize {
+		h.sequentialReads++
+	}
 	h.lastRead = off
 	if jump {
 		h.cancelPrefetchLocked()
@@ -852,7 +937,9 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 		if data, ok := h.sliceWindow(off, length); ok {
 			if readSatisfied(off, length, int64(len(data)), entry.Size) {
 				h.lastStrategy = "handle-cache"
-				h.startNextPrefetchLocked(remote, entry)
+				if h.shouldPrefetchLocked() {
+					h.startNextPrefetchLocked(remote, entry)
+				}
 				return data, nil
 			}
 			return h.readAcrossWindowBoundaryLocked(ctx, remote, entry, off, length, data)
@@ -881,13 +968,17 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 		data, err = remote.ReadExactRange(ctx, entry.FSID, fetchOff, fetchLen)
 		h.lastStrategy = "seek-exact"
 	} else {
-		prefetched, waitErr := h.waitPrefetchLocked(ctx, fetchOff, fetchLen)
-		if waitErr != nil {
-			return nil, waitErr
+		prefetched, pending := h.prefetchStatusLocked(fetchOff, fetchLen)
+		cached := false
+		if data, cached = remote.ReadCachedWindow(entry.FSID, fetchOff, fetchLen); !cached {
+			data, err = remote.ReadExactRange(ctx, entry.FSID, fetchOff, fetchLen)
 		}
-		data, err = remote.ReadRange(ctx, entry.FSID, fetchOff, fetchLen)
-		if prefetched {
+		if prefetched || (pending && cached) {
 			h.lastStrategy = "next-window-prefetch"
+		} else if pending {
+			h.lastStrategy = "foreground-prefetch"
+		} else if cached {
+			h.lastStrategy = "shared-window-cache"
 		} else {
 			h.lastStrategy = "window-prefetch"
 		}
@@ -897,11 +988,36 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	}
 	h.windowOff = fetchOff
 	h.window = data
+	h.discardPrefetchBeforeLocked(fetchOff)
 	result := h.sliceWindowOrEmpty(off, length)
-	if !jump {
+	if !readSatisfied(off, length, int64(len(result)), entry.Size) {
+		return h.readAcrossWindowBoundaryLocked(ctx, remote, entry, off, length, result)
+	}
+	if !jump && h.shouldPrefetchLocked() {
 		h.startNextPrefetchLocked(remote, entry)
 	}
 	return result, nil
+}
+
+func (h *entryFileHandle) shouldPrefetchLocked() bool {
+	return h != nil && h.sequentialReads >= 1
+}
+
+func (h *entryFileHandle) isLargeSeekLocked(off int64) bool {
+	if h == nil || h.lastRead < 0 || h.windowSize <= 0 {
+		return false
+	}
+	if len(h.window) > 0 {
+		windowEnd := h.windowOff + int64(len(h.window))
+		if off >= h.windowOff && off < windowEnd {
+			return false
+		}
+	}
+	delta := off - h.lastRead
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta > h.windowSize
 }
 
 func (h *entryFileHandle) readAcrossWindowBoundaryLocked(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64, tail []byte) ([]byte, error) {
@@ -916,11 +1032,12 @@ func (h *entryFileHandle) readAcrossWindowBoundaryLocked(ctx context.Context, re
 	if nextLen <= 0 {
 		return tail, nil
 	}
-	prefetched, err := h.waitPrefetchLocked(ctx, nextOff, nextLen)
-	if err != nil {
-		return nil, err
+	prefetched, pending := h.prefetchStatusLocked(nextOff, nextLen)
+	next, cached := remote.ReadCachedWindow(entry.FSID, nextOff, nextLen)
+	var err error
+	if !cached {
+		next, err = remote.ReadExactRange(ctx, entry.FSID, nextOff, nextLen)
 	}
-	next, err := remote.ReadRange(ctx, entry.FSID, nextOff, nextLen)
 	if err != nil {
 		return nil, err
 	}
@@ -936,12 +1053,19 @@ func (h *entryFileHandle) readAcrossWindowBoundaryLocked(ctx context.Context, re
 	}
 	h.windowOff = nextOff
 	h.window = next
-	if prefetched {
+	h.discardPrefetchBeforeLocked(nextOff)
+	if prefetched || (pending && cached) {
 		h.lastStrategy = "prefetched-boundary"
+	} else if pending {
+		h.lastStrategy = "foreground-boundary"
+	} else if cached {
+		h.lastStrategy = "shared-window-cache"
 	} else {
 		h.lastStrategy = "window-boundary"
 	}
-	h.startNextPrefetchLocked(remote, entry)
+	if h.shouldPrefetchLocked() {
+		h.startNextPrefetchLocked(remote, entry)
+	}
 	return result, nil
 }
 
@@ -967,19 +1091,30 @@ func (h *entryFileHandle) readAcrossSeekWindowLocked(ctx context.Context, remote
 		return nil, io.ErrUnexpectedEOF
 	}
 	h.lastStrategy = "seek-boundary-exact"
-	readEnd := off + int64(len(result))
-	prefetchOff := (readEnd / h.windowSize) * h.windowSize
-	prefetchLen := h.windowSize
-	if entry.Size > 0 {
-		if prefetchOff >= entry.Size {
-			return result, nil
-		}
-		if prefetchOff+prefetchLen > entry.Size {
-			prefetchLen = entry.Size - prefetchOff
-		}
-	}
-	h.startPrefetchLocked(remote, entry.FSID, prefetchOff, prefetchLen)
 	return result, nil
+}
+
+func (h *entryFileHandle) startPrefetchRangeLocked(remote *remote.Reader, entry store.Entry, off int64) {
+	depth := h.prefetchDepth
+	if depth <= 0 {
+		depth = h.windowSize
+	}
+	for remaining := depth; remaining > 0; remaining -= h.windowSize {
+		length := h.windowSize
+		if entry.Size > 0 {
+			if off >= entry.Size {
+				return
+			}
+			if off+length > entry.Size {
+				length = entry.Size - off
+			}
+		}
+		if length <= 0 {
+			return
+		}
+		h.startPrefetchLocked(remote, entry.FSID, off, length)
+		off += length
+	}
 }
 
 func readSatisfied(off, requested, returned, fileSize int64) bool {
