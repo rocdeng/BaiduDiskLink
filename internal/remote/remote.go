@@ -13,30 +13,22 @@ import (
 import "context"
 
 type Reader struct {
-	mu            sync.RWMutex
-	client        baidu.Client
-	links         map[string]cachedLink
-	cached        map[cacheKey]cachedRead
-	cacheByFSID   map[string]map[cacheKey]struct{}
-	cacheOrder    []cacheKey
-	cacheBytes    int64
-	cacheLimit    int64
-	inflight      map[cacheKey]*inflightRead
-	exactInflight map[exactRangeKey]*exactInflightRead
-	prefetchSlots chan struct{}
-	concurrency   int
-	chunkSize     int64
+	mu          sync.RWMutex
+	client      baidu.Client
+	links       map[string]cachedLink
+	cached      map[cacheKey]cachedRead
+	cacheByFSID map[string]map[cacheKey]struct{}
+	cacheOrder  []cacheKey
+	cacheBytes  int64
+	cacheLimit  int64
+	inflight    map[cacheKey]*inflightRead
+	concurrency int
+	chunkSize   int64
 }
 
 type cacheKey struct {
 	fsid   string
 	offset int64
-}
-
-type exactRangeKey struct {
-	fsid   string
-	offset int64
-	length int64
 }
 
 type cachedLink struct {
@@ -56,34 +48,19 @@ type inflightRead struct {
 	err  error
 }
 
-type exactInflightRead struct {
-	done      chan struct{}
-	data      []byte
-	err       error
-	ctx       context.Context
-	cancel    context.CancelFunc
-	startOnce sync.Once
-	waiters   int
-	completed bool
-}
-
 const prefetchBytes = 8 << 20
 const maxCachedWindows = 8
-const maxBackgroundPrefetches = 4
-const maxBackgroundChunkConcurrency = 2
 
 func NewReader(client baidu.Client) *Reader {
 	return &Reader{
-		client:        client,
-		links:         make(map[string]cachedLink),
-		cached:        make(map[cacheKey]cachedRead),
-		cacheByFSID:   make(map[string]map[cacheKey]struct{}),
-		inflight:      make(map[cacheKey]*inflightRead),
-		exactInflight: make(map[exactRangeKey]*exactInflightRead),
-		prefetchSlots: make(chan struct{}, maxBackgroundPrefetches),
-		cacheLimit:    64 << 20,
-		concurrency:   1,
-		chunkSize:     4 << 20,
+		client:      client,
+		links:       make(map[string]cachedLink),
+		cached:      make(map[cacheKey]cachedRead),
+		cacheByFSID: make(map[string]map[cacheKey]struct{}),
+		inflight:    make(map[cacheKey]*inflightRead),
+		cacheLimit:  64 << 20,
+		concurrency: 1,
+		chunkSize:   8 << 20,
 	}
 }
 
@@ -95,7 +72,7 @@ func (r *Reader) SetDownloadOptions(concurrency int, chunkSize int64) {
 		concurrency = 1
 	}
 	if chunkSize <= 0 {
-		chunkSize = 4 << 20
+		chunkSize = 8 << 20
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -148,12 +125,6 @@ func (r *Reader) ReadRange(ctx context.Context, fsid string, offset, length int6
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
 	}
-	if inflight := r.joinExactInflight(exactRangeKey{fsid: fsid, offset: offset, length: length}); inflight != nil {
-		data, err := r.waitExactInflight(ctx, inflight)
-		if err == nil || ctx.Err() != nil || !errors.Is(err, context.Canceled) {
-			return data, err
-		}
-	}
 	data, err := r.readWithOptions(ctx, client, fsid, offset, length)
 	if err != nil || int64(len(data)) >= length {
 		return data, err
@@ -193,49 +164,19 @@ func (r *Reader) Prefetch(ctx context.Context, fsid string, offset, length int64
 	if _, err := r.downloadLink(fsid, client); err != nil {
 		return err
 	}
-	key := exactRangeKey{fsid: fsid, offset: offset, length: length}
-	for attempt := 0; attempt < 2; attempt++ {
-		if _, ok := r.readCached(fsid, offset, length); ok {
-			return nil
-		}
-		inflight, taskCtx, owner := r.beginExactInflight(key)
-		if owner {
-			go r.runQueuedExactPrefetch(taskCtx, client, key, inflight)
-		}
-		_, err := r.waitExactInflight(ctx, inflight)
-		if err == nil || ctx.Err() != nil || !errors.Is(err, context.Canceled) {
-			return err
-		}
+	if _, ok := r.readCached(fsid, offset, length); ok {
+		return nil
 	}
-	return context.Canceled
-}
-
-func (r *Reader) runQueuedExactPrefetch(ctx context.Context, client baidu.Client, key exactRangeKey, inflight *exactInflightRead) {
-	select {
-	case r.prefetchSlots <- struct{}{}:
-		if !r.startExactTask(ctx, client, key, inflight, maxBackgroundChunkConcurrency, func() { <-r.prefetchSlots }) {
-			<-r.prefetchSlots
-		}
-	case <-ctx.Done():
-		inflight.startOnce.Do(func() {
-			r.finishExactInflight(key, inflight, nil, ctx.Err())
-		})
+	r.mu.RLock()
+	concurrency := r.concurrency
+	chunkSize := r.chunkSize
+	r.mu.RUnlock()
+	if concurrency <= 1 || length <= chunkSize {
+		_, err := r.ReadExactRange(ctx, fsid, offset, length)
+		return err
 	}
-}
-
-func (r *Reader) startExactTask(ctx context.Context, client baidu.Client, key exactRangeKey, inflight *exactInflightRead, concurrencyLimit int, onDone func()) bool {
-	started := false
-	inflight.startOnce.Do(func() {
-		started = true
-		go func() {
-			if onDone != nil {
-				defer onDone()
-			}
-			data, err := r.fetchExactRange(ctx, client, key.fsid, key.offset, key.length, concurrencyLimit)
-			r.finishExactInflight(key, inflight, data, err)
-		}()
-	})
-	return started
+	_, err := r.readConcurrent(ctx, client, fsid, offset, length, chunkSize, concurrency)
+	return err
 }
 
 func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length int64) ([]byte, error) {
@@ -254,33 +195,6 @@ func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length
 	}
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
-	}
-	key := exactRangeKey{fsid: fsid, offset: offset, length: length}
-	for attempt := 0; attempt < 2; attempt++ {
-		inflight, taskCtx, _ := r.beginExactInflight(key)
-		r.startExactTask(taskCtx, client, key, inflight, 0, nil)
-		data, err := r.waitExactInflight(ctx, inflight)
-		if err == nil || ctx.Err() != nil || !errors.Is(err, context.Canceled) {
-			return data, err
-		}
-	}
-	return nil, context.Canceled
-}
-
-func (r *Reader) fetchExactRange(ctx context.Context, client baidu.Client, fsid string, offset, length int64, concurrencyLimit int) ([]byte, error) {
-	r.mu.RLock()
-	concurrency := r.concurrency
-	chunkSize := r.chunkSize
-	r.mu.RUnlock()
-	if concurrencyLimit > 0 && concurrency > concurrencyLimit {
-		concurrency = concurrencyLimit
-	}
-	if concurrency > 1 && length > chunkSize {
-		data, err := r.readConcurrent(ctx, client, fsid, offset, length, chunkSize, concurrency)
-		if err == nil {
-			r.storeCached(fsid, offset, data)
-		}
-		return data, err
 	}
 	data := make([]byte, length)
 	var lastErr error
@@ -301,63 +215,6 @@ func (r *Reader) fetchExactRange(ctx context.Context, client baidu.Client, fsid 
 		_ = client.RefreshAuth()
 	}
 	return nil, lastErr
-}
-
-func (r *Reader) joinExactInflight(key exactRangeKey) *exactInflightRead {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	inflight := r.exactInflight[key]
-	if inflight != nil {
-		inflight.waiters++
-	}
-	return inflight
-}
-
-func (r *Reader) beginExactInflight(key exactRangeKey) (*exactInflightRead, context.Context, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if inflight := r.exactInflight[key]; inflight != nil {
-		inflight.waiters++
-		return inflight, inflight.ctx, false
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	inflight := &exactInflightRead{done: make(chan struct{}), ctx: ctx, cancel: cancel, waiters: 1}
-	r.exactInflight[key] = inflight
-	return inflight, ctx, true
-}
-
-func (r *Reader) finishExactInflight(key exactRangeKey, inflight *exactInflightRead, data []byte, err error) {
-	r.mu.Lock()
-	if r.exactInflight[key] == inflight {
-		delete(r.exactInflight, key)
-	}
-	inflight.data = data
-	inflight.err = err
-	inflight.completed = true
-	inflight.cancel = nil
-	close(inflight.done)
-	r.mu.Unlock()
-}
-
-func (r *Reader) waitExactInflight(ctx context.Context, inflight *exactInflightRead) ([]byte, error) {
-	defer r.releaseExactWaiter(inflight)
-	select {
-	case <-inflight.done:
-		return inflight.data, inflight.err
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-func (r *Reader) releaseExactWaiter(inflight *exactInflightRead) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if inflight.waiters > 0 {
-		inflight.waiters--
-	}
-	if inflight.waiters == 0 && !inflight.completed && inflight.cancel != nil {
-		inflight.cancel()
-	}
 }
 
 func (r *Reader) readCached(fsid string, offset, length int64) ([]byte, bool) {
@@ -463,7 +320,6 @@ func (r *Reader) clearReadCacheLocked() {
 	r.cacheOrder = nil
 	r.cacheBytes = 0
 	r.inflight = make(map[cacheKey]*inflightRead)
-	r.exactInflight = make(map[exactRangeKey]*exactInflightRead)
 }
 
 func (r *Reader) readWithOptions(ctx context.Context, client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
@@ -594,7 +450,7 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 		return []byte{}, nil
 	}
 	if chunkSize <= 0 {
-		chunkSize = 4 << 20
+		chunkSize = 8 << 20
 	}
 	total := int((length + chunkSize - 1) / chunkSize)
 	if total <= 1 {

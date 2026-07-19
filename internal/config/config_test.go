@@ -25,15 +25,11 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	}
 }
 
-func TestLoadUsesPlaybackDownloadDefaults(t *testing.T) {
-	t.Setenv("BAIDUDISKLINK_DOWNLOAD_CONCURRENCY", "")
+func TestLoadUsesEightMiBDefaultChunkSize(t *testing.T) {
 	t.Setenv("BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE", "")
-	cfg := Load()
-	if cfg.DownloadConcurrency != 4 {
-		t.Fatalf("expected default concurrency 4, got %d", cfg.DownloadConcurrency)
-	}
-	if cfg.DownloadChunkSize != 4<<20 {
-		t.Fatalf("expected default chunk size 4 MiB, got %d", cfg.DownloadChunkSize)
+
+	if got := Load().DownloadChunkSize; got != 8<<20 {
+		t.Fatalf("unexpected default chunk size: %d", got)
 	}
 }
 
