@@ -611,7 +611,25 @@ func (n *entryNode) traceRead(off int64, requested, returned int, strategy strin
 	if n == nil || n.Filesystem == nil || !n.Filesystem.traceReads {
 		return
 	}
+	if !shouldTraceRead(off, strategy, requested, returned) {
+		return
+	}
 	log.Printf("fuse read path=%q fsid=%q offset=%d requested=%d returned=%d strategy=%s", n.entry.Path, n.entry.FSID, off, requested, returned, strategy)
+}
+
+func shouldTraceRead(off int64, strategy string, requested, returned int) bool {
+	if returned != requested {
+		return true
+	}
+	if off == 0 && strategy == "window-prefetch" {
+		return true
+	}
+	switch strategy {
+	case "seek-exact", "seek-boundary-exact", "window-boundary", "prefetched-boundary":
+		return true
+	default:
+		return false
+	}
 }
 
 func (n *entryNode) Opendir(ctx context.Context) syscall.Errno {
@@ -898,6 +916,9 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	h.windowOff = fetchOff
 	h.window = data
 	result := h.sliceWindowOrEmpty(off, length)
+	if !readSatisfied(off, length, int64(len(result)), entry.Size) {
+		return h.readAcrossWindowBoundaryLocked(ctx, remote, entry, off, length, result)
+	}
 	if !jump {
 		h.startNextPrefetchLocked(remote, entry)
 	}

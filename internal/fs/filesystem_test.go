@@ -150,6 +150,47 @@ func TestProductionReadWindowIsThirtyTwoMiB(t *testing.T) {
 	}
 }
 
+func TestTraceReadKeepsOnlyDiagnosticEvents(t *testing.T) {
+	if shouldTraceRead(192<<10, "handle-cache", 192<<10, 192<<10) {
+		t.Fatal("routine handle cache read should be suppressed")
+	}
+	if shouldTraceRead(32<<20, "next-window-prefetch", 192<<10, 192<<10) {
+		t.Fatal("routine prefetched window read should be suppressed")
+	}
+	if !shouldTraceRead(0, "window-prefetch", 192<<10, 192<<10) {
+		t.Fatal("initial read should remain visible")
+	}
+	if !shouldTraceRead(32<<20, "prefetched-boundary", 192<<10, 192<<10) {
+		t.Fatal("window boundary should remain visible")
+	}
+	if !shouldTraceRead(32<<20, "handle-cache", 192<<10, 12<<10) {
+		t.Fatal("short read should remain visible")
+	}
+}
+
+func TestEntryFileHandleCompletesFirstReadCrossingAlignedWindow(t *testing.T) {
+	client := &countingReadClient{}
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 8 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 32 << 20}
+	off := int64((8 << 20) - (12 << 10))
+
+	got, err := handle.read(context.Background(), remoteReader, entry, off, 192<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 192<<10 {
+		t.Fatalf("expected complete cross-window read, got %d bytes", len(got))
+	}
+	if handle.lastStrategy != "window-boundary" {
+		t.Fatalf("unexpected boundary strategy %q", handle.lastStrategy)
+	}
+	if client.reads != 2 {
+		t.Fatalf("expected two adjacent window reads, got %d", client.reads)
+	}
+	handle.Release(context.Background())
+}
+
 func TestEntryFileHandlePrefetchesAndReusesNextWindow(t *testing.T) {
 	client := newPrefetchReadClient(-1)
 	remoteReader := remote.NewReader(client)
