@@ -148,6 +148,9 @@ func TestProductionReadWindowIsThirtyTwoMiB(t *testing.T) {
 	if fuseReadWindowSize != 32<<20 {
 		t.Fatalf("unexpected FUSE read window size: %d", fuseReadWindowSize)
 	}
+	if fuseSeekWindowSize != 8<<20 {
+		t.Fatalf("unexpected FUSE seek window size: %d", fuseSeekWindowSize)
+	}
 }
 
 func TestTraceReadKeepsOnlyDiagnosticEvents(t *testing.T) {
@@ -250,7 +253,34 @@ func TestEntryFileHandleCompletesReadAcrossUnalignedSeekWindow(t *testing.T) {
 	if handle.lastStrategy != "seek-boundary-exact" {
 		t.Fatalf("unexpected boundary strategy %q", handle.lastStrategy)
 	}
-	client.waitForOffset(t, boundary)
+	client.waitForOffset(t, seekOff+(172<<10))
+	handle.Release(context.Background())
+}
+
+func TestEntryFileHandleUsesEightMiBWindowsAfterSeekBoundary(t *testing.T) {
+	client := &countingReadClient{}
+	remoteReader := remote.NewReader(client)
+	handle := &entryFileHandle{windowSize: 32 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 256 << 20}
+	seekOff := int64(160<<20) - (86 << 10)
+
+	if _, err := handle.read(context.Background(), remoteReader, entry, seekOff, 86<<10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.read(context.Background(), remoteReader, entry, seekOff+(86<<10), 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if client.reads != 2 {
+		t.Fatalf("expected two seek reads, got %d", client.reads)
+	}
+	if client.lengths[1] != 8<<20 {
+		t.Fatalf("expected 8 MiB continuation window, got %d", client.lengths[1])
+	}
+	for _, length := range client.lengths {
+		if length == 32<<20 {
+			t.Fatalf("seek path unexpectedly fetched a full 32 MiB window: %#v", client.lengths)
+		}
+	}
 	handle.Release(context.Background())
 }
 

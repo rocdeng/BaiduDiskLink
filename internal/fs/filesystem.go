@@ -34,7 +34,10 @@ type Filesystem struct {
 	enableDelete bool
 }
 
-const fuseReadWindowSize int64 = 32 << 20
+const (
+	fuseReadWindowSize int64 = 32 << 20
+	fuseSeekWindowSize int64 = 8 << 20
+)
 
 func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath string) *Filesystem {
 	out := make(map[uint32]struct{}, len(gids))
@@ -977,29 +980,29 @@ func (h *entryFileHandle) readAcrossSeekWindowLocked(ctx context.Context, remote
 	if remaining <= 0 {
 		return tail, nil
 	}
-	next, err := remote.ReadExactRange(ctx, entry.FSID, nextOff, remaining)
+	fetchLen := fuseSeekWindowSize
+	if fetchLen < remaining {
+		fetchLen = remaining
+	}
+	if entry.Size > 0 && nextOff+fetchLen > entry.Size {
+		fetchLen = entry.Size - nextOff
+	}
+	next, err := remote.ReadExactRange(ctx, entry.FSID, nextOff, fetchLen)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]byte, len(tail)+len(next))
+	if int64(len(next)) < remaining {
+		return nil, io.ErrUnexpectedEOF
+	}
+	result := make([]byte, len(tail)+int(remaining))
 	copy(result, tail)
-	copy(result[len(tail):], next)
+	copy(result[len(tail):], next[:remaining])
 	if !readSatisfied(off, length, int64(len(result)), entry.Size) {
 		return nil, io.ErrUnexpectedEOF
 	}
+	h.windowOff = nextOff
+	h.window = next
 	h.lastStrategy = "seek-boundary-exact"
-	readEnd := off + int64(len(result))
-	prefetchOff := (readEnd / h.windowSize) * h.windowSize
-	prefetchLen := h.windowSize
-	if entry.Size > 0 {
-		if prefetchOff >= entry.Size {
-			return result, nil
-		}
-		if prefetchOff+prefetchLen > entry.Size {
-			prefetchLen = entry.Size - prefetchOff
-		}
-	}
-	h.startPrefetchLocked(remote, entry.FSID, prefetchOff, prefetchLen)
 	return result, nil
 }
 
