@@ -144,6 +144,12 @@ func TestEntryFileHandleReusesReadWindow(t *testing.T) {
 	}
 }
 
+func TestProductionReadWindowIsThirtyTwoMiB(t *testing.T) {
+	if fuseReadWindowSize != 32<<20 {
+		t.Fatalf("unexpected FUSE read window size: %d", fuseReadWindowSize)
+	}
+}
+
 func TestEntryFileHandlePrefetchesAndReusesNextWindow(t *testing.T) {
 	client := newPrefetchReadClient(-1)
 	remoteReader := remote.NewReader(client)

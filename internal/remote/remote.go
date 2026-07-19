@@ -60,7 +60,7 @@ func NewReader(client baidu.Client) *Reader {
 		inflight:    make(map[cacheKey]*inflightRead),
 		cacheLimit:  64 << 20,
 		concurrency: 1,
-		chunkSize:   4 << 20,
+		chunkSize:   8 << 20,
 	}
 }
 
@@ -72,7 +72,7 @@ func (r *Reader) SetDownloadOptions(concurrency int, chunkSize int64) {
 		concurrency = 1
 	}
 	if chunkSize <= 0 {
-		chunkSize = 4 << 20
+		chunkSize = 8 << 20
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -450,7 +450,7 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 		return []byte{}, nil
 	}
 	if chunkSize <= 0 {
-		chunkSize = 4 << 20
+		chunkSize = 8 << 20
 	}
 	total := int((length + chunkSize - 1) / chunkSize)
 	if total <= 1 {

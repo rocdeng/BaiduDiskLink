@@ -83,8 +83,8 @@ BAIDUDISKLINK_FUSE_GROUP_NAME=101
 # 可选：百度直链读取并发数。默认 1。
 BAIDUDISKLINK_DOWNLOAD_CONCURRENCY=1
 
-# 可选：每个分块读取大小。默认 4MiB。
-BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=4194304
+# 可选：每个分块读取大小。默认 8MiB。
+BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=8388608
 
 # 可选：允许通过挂载目录删除百度网盘文件/目录。默认关闭。
 BAIDUDISKLINK_ENABLE_DELETE=
@@ -252,14 +252,14 @@ docker-compose exec baidudisklink baidudisklink bench --path /Videos/test.zip
 可以临时覆盖并发和分块大小：
 
 ```bash
-docker-compose exec baidudisklink baidudisklink bench --path /Videos/test.zip --concurrency 4 --chunk-size 4194304
+docker-compose exec baidudisklink baidudisklink bench --path /Videos/test.zip --concurrency 4 --chunk-size 8388608
 ```
 
 如果你想通过 `.env` 全局生效，也可以直接改：
 
 ```dotenv
 BAIDUDISKLINK_DOWNLOAD_CONCURRENCY=4
-BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=4194304
+BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=8388608
 ```
 
 `bench-fuse` 测 FUSE 挂载后的实际读取速度：

@@ -25,6 +25,14 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	}
 }
 
+func TestLoadUsesEightMiBDefaultChunkSize(t *testing.T) {
+	t.Setenv("BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE", "")
+
+	if got := Load().DownloadChunkSize; got != 8<<20 {
+		t.Fatalf("unexpected default chunk size: %d", got)
+	}
+}
+
 func TestLoadLeavesUnsetValuesEmpty(t *testing.T) {
 	got := Load()
 	if got.MountPath != "" || got.RemoteRootPath != "" || got.TokenPath != "" || got.RedirectURI != "" {

@@ -34,7 +34,7 @@ type Filesystem struct {
 	enableDelete bool
 }
 
-const fuseReadWindowSize int64 = 16 << 20
+const fuseReadWindowSize int64 = 32 << 20
 
 func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath string) *Filesystem {
 	out := make(map[uint32]struct{}, len(gids))
