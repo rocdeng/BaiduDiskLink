@@ -81,6 +81,18 @@ func (r *Reader) SetDownloadOptions(concurrency int, chunkSize int64) {
 	r.clearReadCacheLocked()
 }
 
+func (r *Reader) ChunkSize() int64 {
+	if r == nil {
+		return 8 << 20
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.chunkSize <= 0 {
+		return 8 << 20
+	}
+	return r.chunkSize
+}
+
 func (r *Reader) SetClient(client baidu.Client) {
 	if r == nil {
 		return
@@ -483,21 +495,7 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 					end = length
 				}
 				dst := buf[begin:end]
-				var err error
-				for attempt := 0; attempt < 2; attempt++ {
-					var n int
-					n, err = client.ReadRange(ctx, fsid, start, dst)
-					if err == nil && n != len(dst) {
-						err = fmt.Errorf("read chunk at %d returned %d of %d bytes: %w", start, n, len(dst), io.ErrUnexpectedEOF)
-					}
-					if err == nil {
-						break
-					}
-					if ctx.Err() != nil {
-						break
-					}
-					_ = client.RefreshAuth()
-				}
+				chunk, err := r.readChunk(ctx, client, fsid, start, int64(len(dst)))
 				if err != nil {
 					errMu.Lock()
 					if firstErr == nil {
@@ -507,6 +505,7 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 					errMu.Unlock()
 					return
 				}
+				copy(dst, chunk)
 			}
 		}
 	}
@@ -529,8 +528,50 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	r.storeCached(fsid, offset, buf)
 	return buf, nil
+}
+
+func (r *Reader) readChunk(ctx context.Context, client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
+	if data, ok := r.readCached(fsid, offset, length); ok {
+		return data, nil
+	}
+	if data, err, waited := r.waitInflight(ctx, fsid, offset, offset, length); waited {
+		return data, err
+	}
+	inflight, owner := r.beginInflight(fsid, offset)
+	if !owner {
+		select {
+		case <-inflight.done:
+			if inflight.err != nil {
+				return nil, inflight.err
+			}
+			return sliceForWindow(inflight.data, offset, offset, length), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	data := make([]byte, length)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		n, err := client.ReadRange(ctx, fsid, offset, data)
+		if err == nil && n != len(data) {
+			err = fmt.Errorf("read chunk at %d returned %d of %d bytes: %w", offset, n, len(data), io.ErrUnexpectedEOF)
+		}
+		if err == nil {
+			data = data[:n]
+			r.finishInflight(fsid, offset, inflight, data, nil)
+			r.storeCached(fsid, offset, data)
+			return data, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			r.finishInflight(fsid, offset, inflight, nil, ctx.Err())
+			return nil, ctx.Err()
+		}
+		_ = client.RefreshAuth()
+	}
+	r.finishInflight(fsid, offset, inflight, nil, lastErr)
+	return nil, lastErr
 }
 
 func (r *Reader) downloadLink(fsid string, client baidu.Client) (baidu.DownloadLink, error) {

@@ -643,7 +643,11 @@ func (n *entryNode) Open(ctx context.Context, openFlags uint32) (fh goFs.FileHan
 	if n.entry.IsDir {
 		return nil, 0, syscall.EISDIR
 	}
-	return &entryFileHandle{windowSize: fuseReadWindowSize, lastRead: -1}, fuse.FOPEN_KEEP_CACHE, 0
+	chunkSize := fuseSeekWindowSize
+	if n.Filesystem != nil && n.Filesystem.remote != nil {
+		chunkSize = n.Filesystem.remote.ChunkSize()
+	}
+	return &entryFileHandle{windowSize: fuseReadWindowSize, chunkSize: chunkSize, lastRead: -1}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 func (f *Filesystem) shouldRefreshRoot(children []store.Entry) bool {
@@ -752,6 +756,7 @@ type entryFileHandle struct {
 	window         []byte
 	windowOff      int64
 	windowSize     int64
+	chunkSize      int64
 	lastRead       int64
 	lastStrategy   string
 	prefetchCancel context.CancelFunc
@@ -783,14 +788,17 @@ func (h *entryFileHandle) cancelPrefetchLocked() {
 }
 
 func (h *entryFileHandle) startNextPrefetchLocked(remote *remote.Reader, entry store.Entry) {
-	if h == nil || remote == nil || h.closed || len(h.window) == 0 || h.windowSize <= 0 {
+	if h == nil || remote == nil || h.closed || len(h.window) == 0 || h.windowSize <= 0 || h.chunkSize <= 0 {
 		return
 	}
-	if h.windowOff%h.windowSize != 0 || int64(len(h.window)) != h.windowSize {
+	if h.windowOff%h.chunkSize != 0 || int64(len(h.window)) > h.chunkSize {
 		return
 	}
 	off := h.windowOff + int64(len(h.window))
-	length := h.windowSize
+	length := h.windowSize - int64(len(h.window))
+	if length <= 0 {
+		length = h.windowSize
+	}
 	if entry.Size > 0 {
 		if off >= entry.Size {
 			return
@@ -809,10 +817,17 @@ func (h *entryFileHandle) startPrefetchLocked(remote *remote.Reader, fsid string
 	if h == nil || remote == nil || h.closed || fsid == "" || length <= 0 {
 		return
 	}
-	if h.prefetchDone != nil && h.prefetchOff == off && h.prefetchLen == length {
-		return
+	if h.prefetchDone != nil {
+		select {
+		case <-h.prefetchDone:
+			h.prefetchCancel = nil
+			h.prefetchDone = nil
+			h.prefetchOff = 0
+			h.prefetchLen = 0
+		default:
+			return
+		}
 	}
-	h.cancelPrefetchLocked()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	h.prefetchCancel = cancel
@@ -823,29 +838,6 @@ func (h *entryFileHandle) startPrefetchLocked(remote *remote.Reader, fsid string
 		done <- remote.Prefetch(ctx, fsid, off, length)
 		close(done)
 	}()
-}
-
-func (h *entryFileHandle) waitPrefetchLocked(ctx context.Context, off, length int64) (bool, error) {
-	if h.prefetchDone == nil || off < h.prefetchOff || off+length > h.prefetchOff+h.prefetchLen {
-		return false, nil
-	}
-	done := h.prefetchDone
-	select {
-	case err := <-done:
-		h.prefetchCancel = nil
-		h.prefetchDone = nil
-		h.prefetchOff = 0
-		h.prefetchLen = 0
-		if err != nil {
-			if ctx.Err() != nil {
-				return false, ctx.Err()
-			}
-			return false, nil
-		}
-		return true, nil
-	case <-ctx.Done():
-		return false, ctx.Err()
-	}
 }
 
 func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64) ([]byte, error) {
@@ -860,6 +852,12 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	}
 	if h.windowSize <= 0 {
 		h.windowSize = fuseReadWindowSize
+	}
+	if h.chunkSize <= 0 {
+		h.chunkSize = remote.ChunkSize()
+		if h.chunkSize > h.windowSize {
+			h.chunkSize = h.windowSize
+		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -879,7 +877,7 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 			return h.readAcrossWindowBoundaryLocked(ctx, remote, entry, off, length, data)
 		}
 	}
-	fetchLen := h.windowSize
+	fetchLen := h.chunkSize
 	if jump {
 		fetchLen = min64(length*2, h.windowSize/2)
 		if fetchLen < length {
@@ -888,7 +886,7 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 	}
 	fetchOff := off
 	if !jump {
-		fetchOff = (off / h.windowSize) * h.windowSize
+		fetchOff = (off / h.chunkSize) * h.chunkSize
 	}
 	if fetchLen < length {
 		fetchLen = length
@@ -902,10 +900,7 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 		data, err = remote.ReadExactRange(ctx, entry.FSID, fetchOff, fetchLen)
 		h.lastStrategy = "seek-exact"
 	} else {
-		prefetched, waitErr := h.waitPrefetchLocked(ctx, fetchOff, fetchLen)
-		if waitErr != nil {
-			return nil, waitErr
-		}
+		_, prefetched := remote.ReadCachedWindow(entry.FSID, fetchOff, fetchLen)
 		data, err = remote.ReadRange(ctx, entry.FSID, fetchOff, fetchLen)
 		if prefetched {
 			h.lastStrategy = "next-window-prefetch"
@@ -930,20 +925,17 @@ func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry
 
 func (h *entryFileHandle) readAcrossWindowBoundaryLocked(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64, tail []byte) ([]byte, error) {
 	nextOff := h.windowOff + int64(len(h.window))
-	if h.windowOff%h.windowSize != 0 || int64(len(h.window)) != h.windowSize {
+	if h.windowOff%h.chunkSize != 0 || int64(len(h.window)) != h.chunkSize {
 		return h.readAcrossSeekWindowLocked(ctx, remote, entry, off, length, tail, nextOff)
 	}
-	nextLen := h.windowSize
+	nextLen := h.chunkSize
 	if entry.Size > 0 && nextOff+nextLen > entry.Size {
 		nextLen = entry.Size - nextOff
 	}
 	if nextLen <= 0 {
 		return tail, nil
 	}
-	prefetched, err := h.waitPrefetchLocked(ctx, nextOff, nextLen)
-	if err != nil {
-		return nil, err
-	}
+	_, prefetched := remote.ReadCachedWindow(entry.FSID, nextOff, nextLen)
 	next, err := remote.ReadRange(ctx, entry.FSID, nextOff, nextLen)
 	if err != nil {
 		return nil, err
@@ -980,7 +972,10 @@ func (h *entryFileHandle) readAcrossSeekWindowLocked(ctx context.Context, remote
 	if remaining <= 0 {
 		return tail, nil
 	}
-	fetchLen := fuseSeekWindowSize
+	fetchLen := h.chunkSize - (nextOff % h.chunkSize)
+	if fetchLen <= 0 || fetchLen > h.chunkSize {
+		fetchLen = h.chunkSize
+	}
 	if fetchLen < remaining {
 		fetchLen = remaining
 	}

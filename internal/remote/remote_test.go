@@ -133,6 +133,41 @@ func TestPrefetchUsesConfiguredDownloadConcurrency(t *testing.T) {
 	}
 }
 
+func TestPrefetchPublishesFastChunkBeforeSlowSibling(t *testing.T) {
+	client := newChunkBlockingClient(4)
+	r := NewReader(client)
+	r.SetDownloadOptions(2, 4)
+
+	prefetchDone := make(chan error, 1)
+	go func() {
+		prefetchDone <- r.Prefetch(context.Background(), "1", 0, 8)
+	}()
+	client.waitStarted(t, 0)
+	client.waitStarted(t, 4)
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := r.ReadRange(context.Background(), "1", 0, 4)
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground read waited for an unrelated slow prefetch chunk")
+	}
+
+	close(client.release)
+	if err := <-prefetchDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := client.readCount(0); got != 1 {
+		t.Fatalf("completed chunk was downloaded %d times", got)
+	}
+}
+
 func TestPrefetchKeepsSingleConnectionRangeExact(t *testing.T) {
 	client := &stubClient{}
 	r := NewReader(client)
@@ -406,4 +441,73 @@ func TestReadRangeCancelsInflightWaiter(t *testing.T) {
 	if err := <-ownerDone; err != nil {
 		t.Fatal(err)
 	}
+}
+
+type chunkBlockingClient struct {
+	mu          sync.Mutex
+	blockOffset int64
+	started     chan int64
+	release     chan struct{}
+	reads       map[int64]int
+}
+
+func newChunkBlockingClient(blockOffset int64) *chunkBlockingClient {
+	return &chunkBlockingClient{
+		blockOffset: blockOffset,
+		started:     make(chan int64, 8),
+		release:     make(chan struct{}),
+		reads:       make(map[int64]int),
+	}
+}
+
+func (c *chunkBlockingClient) List(string) ([]baidu.RemoteEntry, error) { return nil, nil }
+func (c *chunkBlockingClient) Stat(string) (baidu.RemoteEntry, error) {
+	return baidu.RemoteEntry{}, nil
+}
+func (c *chunkBlockingClient) GetDownloadLink(string) (baidu.DownloadLink, error) {
+	return baidu.DownloadLink{URL: "https://example.invalid", ExpiresAt: time.Now().Add(time.Minute)}, nil
+}
+func (c *chunkBlockingClient) Delete([]string) error { return nil }
+func (c *chunkBlockingClient) RefreshAuth() error    { return nil }
+func (c *chunkBlockingClient) ReadRange(ctx context.Context, _ string, offset int64, dst []byte) (int, error) {
+	c.mu.Lock()
+	c.reads[offset]++
+	c.mu.Unlock()
+	select {
+	case c.started <- offset:
+	default:
+	}
+	if offset == c.blockOffset {
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	for i := range dst {
+		dst[i] = byte(offset + int64(i))
+	}
+	return len(dst), nil
+}
+
+func (c *chunkBlockingClient) waitStarted(t *testing.T, want int64) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case got := <-c.started:
+			if got == want {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for chunk %d", want)
+		}
+	}
+}
+
+func (c *chunkBlockingClient) readCount(offset int64) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads[offset]
 }

@@ -207,14 +207,14 @@ func TestEntryFileHandlePrefetchesAndReusesNextWindow(t *testing.T) {
 	if _, err := handle.read(context.Background(), remoteReader, entry, (4<<20)+(192<<10), 192<<10); err != nil {
 		t.Fatal(err)
 	}
-	client.waitForOffset(t, 16<<20)
+	client.waitForOffset(t, 8<<20)
 	if _, err := handle.read(context.Background(), remoteReader, entry, 16<<20, 192<<10); err != nil {
 		t.Fatal(err)
 	}
-	if reads := client.readCount(); reads != 2 {
-		t.Fatalf("expected prefetched boundary to avoid another backend read, got %d", reads)
+	if reads := client.readCount(); reads != 3 {
+		t.Fatalf("expected foreground chunk plus two read-ahead chunks, got %d", reads)
 	}
-	if handle.lastStrategy != "next-window-prefetch" {
+	if handle.lastStrategy != "window-prefetch" {
 		t.Fatalf("unexpected boundary strategy %q", handle.lastStrategy)
 	}
 }
@@ -228,8 +228,44 @@ func TestEntryFileHandleStartsPrefetchAfterFirstSequentialRead(t *testing.T) {
 	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10); err != nil {
 		t.Fatal(err)
 	}
-	client.waitForOffset(t, 16<<20)
+	client.waitForOffset(t, 8<<20)
 	handle.Release(context.Background())
+}
+
+func TestEntryFileHandleReturnsCurrentChunkWhileLaterChunkIsSlow(t *testing.T) {
+	chunkSize := int64(8 << 20)
+	client := newPrefetchReadClient(2 * chunkSize)
+	remoteReader := remote.NewReader(client)
+	remoteReader.SetDownloadOptions(4, chunkSize)
+	handle := &entryFileHandle{windowSize: 32 << 20, lastRead: -1}
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 128 << 20}
+
+	start := time.Now()
+	got, err := handle.read(context.Background(), remoteReader, entry, 0, 192<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 192<<10 {
+		t.Fatalf("expected current read immediately, got %d bytes", len(got))
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("current read waited for later slow chunk: %s", elapsed)
+	}
+	client.waitForOffset(t, 2*chunkSize)
+
+	start = time.Now()
+	if _, err := handle.read(context.Background(), remoteReader, entry, chunkSize, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("completed next chunk waited for slow sibling: %s", elapsed)
+	}
+	handle.Release(context.Background())
+	select {
+	case <-client.canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow read-ahead chunk was not canceled on release")
+	}
 }
 
 func TestEntryFileHandleCompletesReadAcrossUnalignedSeekWindow(t *testing.T) {
@@ -257,7 +293,7 @@ func TestEntryFileHandleCompletesReadAcrossUnalignedSeekWindow(t *testing.T) {
 	handle.Release(context.Background())
 }
 
-func TestEntryFileHandleUsesEightMiBWindowsAfterSeekBoundary(t *testing.T) {
+func TestEntryFileHandleResumesAlignedChunksAfterSeekBoundary(t *testing.T) {
 	client := &countingReadClient{}
 	remoteReader := remote.NewReader(client)
 	handle := &entryFileHandle{windowSize: 32 << 20, lastRead: -1}
@@ -273,13 +309,22 @@ func TestEntryFileHandleUsesEightMiBWindowsAfterSeekBoundary(t *testing.T) {
 	if client.reads != 2 {
 		t.Fatalf("expected two seek reads, got %d", client.reads)
 	}
-	if client.lengths[1] != 8<<20 {
-		t.Fatalf("expected 8 MiB continuation window, got %d", client.lengths[1])
+	bridgeLen := int64(8<<20) - (86 << 10)
+	if client.lengths[1] != bridgeLen {
+		t.Fatalf("expected exact bridge to next chunk boundary, got %d want %d", client.lengths[1], bridgeLen)
 	}
-	for _, length := range client.lengths {
-		if length == 32<<20 {
-			t.Fatalf("seek path unexpectedly fetched a full 32 MiB window: %#v", client.lengths)
-		}
+	alignedOff := int64(168 << 20)
+	if _, err := handle.read(context.Background(), remoteReader, entry, alignedOff, 192<<10); err != nil {
+		t.Fatal(err)
+	}
+	if client.offsets[2] != alignedOff {
+		t.Fatalf("expected aligned chunk after seek bridge, got offset %d", client.offsets[2])
+	}
+	if client.lengths[2] != 8<<20 {
+		t.Fatalf("expected normal 8 MiB chunk after seek bridge, got %d", client.lengths[2])
+	}
+	if handle.lastStrategy != "window-prefetch" {
+		t.Fatalf("seek path did not resume normal chunk mode: %q", handle.lastStrategy)
 	}
 	handle.Release(context.Background())
 }
@@ -297,7 +342,7 @@ func TestEntryFileHandleCombinesReadAcrossPrefetchedBoundary(t *testing.T) {
 	if _, err := handle.read(context.Background(), remoteReader, entry, (4<<20)+(192<<10), 192<<10); err != nil {
 		t.Fatal(err)
 	}
-	client.waitForOffset(t, 16<<20)
+	client.waitForOffset(t, 8<<20)
 	got, err := handle.read(context.Background(), remoteReader, entry, (16<<20)-(64<<10), 192<<10)
 	if err != nil {
 		t.Fatal(err)
@@ -305,16 +350,16 @@ func TestEntryFileHandleCombinesReadAcrossPrefetchedBoundary(t *testing.T) {
 	if len(got) != 192<<10 {
 		t.Fatalf("expected complete cross-window read, got %d bytes", len(got))
 	}
-	if reads := client.readCount(); reads != 2 {
-		t.Fatalf("expected no duplicate boundary download, got %d backend reads", reads)
+	if reads := client.readCount(); reads != 4 {
+		t.Fatalf("expected current and read-ahead chunks without duplicate foreground download, got %d backend reads", reads)
 	}
-	if handle.lastStrategy != "prefetched-boundary" {
+	if handle.lastStrategy != "window-boundary" {
 		t.Fatalf("unexpected boundary strategy %q", handle.lastStrategy)
 	}
 }
 
 func TestEntryFileHandleCancelsPrefetchOnSeek(t *testing.T) {
-	client := newPrefetchReadClient(16 << 20)
+	client := newPrefetchReadClient(8 << 20)
 	remoteReader := remote.NewReader(client)
 	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
 	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Size: 64 << 20}
@@ -326,7 +371,7 @@ func TestEntryFileHandleCancelsPrefetchOnSeek(t *testing.T) {
 	if _, err := handle.read(context.Background(), remoteReader, entry, (4<<20)+(192<<10), 192<<10); err != nil {
 		t.Fatal(err)
 	}
-	client.waitForOffset(t, 16<<20)
+	client.waitForOffset(t, 8<<20)
 	if _, err := handle.read(context.Background(), remoteReader, entry, 48<<20, 192<<10); err != nil {
 		t.Fatal(err)
 	}
