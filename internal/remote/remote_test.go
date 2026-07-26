@@ -2,6 +2,7 @@ package remote
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ type stubClient struct {
 	readRelease   chan struct{}
 	failRead      bool
 	shortRead     bool
+	invalidated   int
 }
 
 func (s *stubClient) List(path string) ([]baidu.RemoteEntry, error) { return nil, nil }
@@ -55,6 +57,11 @@ func (s *stubClient) ReadRange(ctx context.Context, fsid string, offset int64, d
 }
 func (s *stubClient) Delete(paths []string) error { return nil }
 func (s *stubClient) RefreshAuth() error          { return nil }
+func (s *stubClient) InvalidateDownloadLink(string) {
+	s.mu.Lock()
+	s.invalidated++
+	s.mu.Unlock()
+}
 
 func sameBackingArray(a, b []byte) bool {
 	return len(a) > 0 && len(b) > 0 && &a[0] == &b[0]
@@ -326,6 +333,57 @@ func TestReadRangeCachesDownloadLinkAndRetries(t *testing.T) {
 	}
 	if client.readCalls != 2 {
 		t.Fatalf("expected two read attempts, got %d", client.readCalls)
+	}
+}
+
+func TestReadStreamRangeBypassesReaderCache(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	r.storeCached("fsid-1", 0, []byte("cached"))
+	data, err := r.ReadStreamRange(context.Background(), "fsid-1", 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	readCalls := client.readCalls
+	client.mu.Unlock()
+	if len(data) != 6 || readCalls != 1 {
+		t.Fatalf("stream range len=%d backend_reads=%d", len(data), readCalls)
+	}
+}
+
+func TestInvalidateDownloadLinkClearsBothReaderAndClientCaches(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	if _, err := r.downloadLink("fsid-1", client); err != nil {
+		t.Fatal(err)
+	}
+	r.InvalidateDownloadLink("fsid-1")
+	r.mu.RLock()
+	_, cached := r.links["fsid-1"]
+	r.mu.RUnlock()
+	client.mu.Lock()
+	invalidated := client.invalidated
+	client.mu.Unlock()
+	if cached || invalidated != 1 {
+		t.Fatalf("invalidate cached=%v client_calls=%d", cached, invalidated)
+	}
+}
+
+func TestClassifyDownloadError(t *testing.T) {
+	tests := []struct {
+		err  error
+		want DownloadErrorKind
+	}{
+		{fmt.Errorf("download range failed: status=403"), DownloadErrorAuth},
+		{fmt.Errorf("download range failed: status=416"), DownloadErrorRange},
+		{fmt.Errorf("connection reset by peer"), DownloadErrorTransport},
+		{io.ErrUnexpectedEOF, DownloadErrorEOF},
+	}
+	for _, test := range tests {
+		if got := ClassifyDownloadError(test.err); got != test.want {
+			t.Fatalf("classify %v: got %d want %d", test.err, got, test.want)
+		}
 	}
 }
 

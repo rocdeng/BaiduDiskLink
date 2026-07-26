@@ -3,7 +3,6 @@ package fs
 import (
 	"context"
 	"errors"
-	"io"
 	"log"
 	"path"
 	"sort"
@@ -18,12 +17,14 @@ import (
 	"baidudisklink/internal/cache"
 	"baidudisklink/internal/remote"
 	"baidudisklink/internal/store"
+	"baidudisklink/internal/stream"
 )
 
 type Filesystem struct {
 	goFs.Inode
 	store        *store.Store
 	remote       *remote.Reader
+	stream       *stream.Manager
 	negative     *cache.NegativeCache
 	ttl          time.Duration
 	primaryGID   uint32
@@ -32,14 +33,33 @@ type Filesystem struct {
 	refreshMu    chan struct{}
 	traceReads   bool
 	enableDelete bool
+	readDiagMu   sync.Mutex
+	readDiag     map[string]*readDiagnosticWindow
 }
 
 const (
-	fuseReadWindowSize int64 = 32 << 20
-	fuseSeekWindowSize int64 = 8 << 20
+	slowFuseReadThreshold  = 300 * time.Millisecond
+	readDiagnosticInterval = 5 * time.Second
 )
 
+type readDiagnosticWindow struct {
+	startedAt      time.Time
+	path           string
+	fsid           string
+	strategy       string
+	slowReads      int
+	canceledReads  int
+	requestedBytes int64
+	returnedBytes  int64
+	maxElapsed     time.Duration
+	maxOffset      int64
+}
+
 func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath string) *Filesystem {
+	return NewFilesystemWithStream(st, r, nil, gids, rootPath)
+}
+
+func NewFilesystemWithStream(st *store.Store, r *remote.Reader, streamManager *stream.Manager, gids []uint32, rootPath string) *Filesystem {
 	out := make(map[uint32]struct{}, len(gids))
 	var primary uint32
 	for _, gid := range gids {
@@ -51,7 +71,7 @@ func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath st
 	if rootPath == "" {
 		rootPath = "/"
 	}
-	return &Filesystem{store: st, remote: r, ttl: time.Minute, primaryGID: primary, gids: out, rootPath: rootPath, refreshMu: make(chan struct{}, 1)}
+	return &Filesystem{store: st, remote: r, stream: streamManager, ttl: time.Minute, primaryGID: primary, gids: out, rootPath: rootPath, refreshMu: make(chan struct{}, 1), readDiag: make(map[string]*readDiagnosticWindow)}
 }
 
 func (f *Filesystem) SetTraceReads(enabled bool) {
@@ -66,6 +86,65 @@ func (f *Filesystem) SetDeleteEnabled(enabled bool) {
 		return
 	}
 	f.enableDelete = enabled
+}
+
+func (f *Filesystem) recordSlowRead(path, fsid string, offset int64, requested, returned int, elapsed time.Duration, strategy string) {
+	f.recordReadDiagnostic(time.Now(), path, fsid, offset, requested, returned, elapsed, strategy, true)
+}
+
+func (f *Filesystem) recordCanceledRead(path, fsid string, offset int64, requested int) {
+	f.recordReadDiagnostic(time.Now(), path, fsid, offset, requested, 0, 0, "", false)
+}
+
+func (f *Filesystem) recordReadDiagnostic(now time.Time, path, fsid string, offset int64, requested, returned int, elapsed time.Duration, strategy string, slow bool) {
+	if f == nil || fsid == "" {
+		return
+	}
+	f.readDiagMu.Lock()
+	if f.readDiag == nil {
+		f.readDiag = make(map[string]*readDiagnosticWindow)
+	}
+	window := f.readDiag[fsid]
+	if window == nil {
+		window = &readDiagnosticWindow{startedAt: now, path: path, fsid: fsid}
+		f.readDiag[fsid] = window
+	}
+	var flushed *readDiagnosticWindow
+	if now.Sub(window.startedAt) >= readDiagnosticInterval {
+		copy := *window
+		flushed = &copy
+		*window = readDiagnosticWindow{startedAt: now, path: path, fsid: fsid}
+	}
+	if path != "" {
+		window.path = path
+	}
+	if strategy != "" {
+		window.strategy = strategy
+	}
+	if slow {
+		window.slowReads++
+		window.requestedBytes += int64(requested)
+		window.returnedBytes += int64(returned)
+		if elapsed > window.maxElapsed {
+			window.maxElapsed = elapsed
+			window.maxOffset = offset
+		}
+	} else {
+		window.canceledReads++
+		window.requestedBytes += int64(requested)
+		window.maxOffset = offset
+	}
+	f.readDiagMu.Unlock()
+	if flushed != nil {
+		logReadDiagnostic(*flushed)
+	}
+}
+
+func logReadDiagnostic(window readDiagnosticWindow) {
+	if window.slowReads == 0 && window.canceledReads == 0 {
+		return
+	}
+	log.Printf("fuse read summary path=%q fsid=%q window=%s slow_reads=%d canceled_reads=%d requested=%d returned=%d max_elapsed=%s max_offset=%d strategy=%s", window.path, window.fsid, readDiagnosticInterval, window.slowReads, window.canceledReads, window.requestedBytes, window.returnedBytes, window.maxElapsed, window.maxOffset, window.strategy)
 }
 
 func (f *Filesystem) OnAdd(ctx context.Context) {
@@ -587,12 +666,30 @@ func (n *entryNode) Read(ctx context.Context, fh goFs.FileHandle, dest []byte, o
 		return fuse.ReadResultData(nil), 0
 	}
 	if handle, ok := fh.(*entryFileHandle); ok {
-		data, err := handle.read(ctx, n.Filesystem.remote, n.entry, off, int64(len(dest)))
+		startedAt := time.Now()
+		var data []byte
+		var err error
+		if streamHandle := handle.stream(); streamHandle != nil {
+			data, err = streamHandle.ReadAt(ctx, off, int64(len(dest)))
+			handle.setStrategy("stream-manager")
+		} else {
+			data, err = n.Filesystem.remote.ReadRange(ctx, n.entry.FSID, off, int64(len(dest)))
+			handle.setStrategy("remote-range")
+		}
+		elapsed := time.Since(startedAt)
+		strategy := handle.strategy()
+		if elapsed >= slowFuseReadThreshold {
+			n.Filesystem.recordSlowRead(n.entry.Path, n.entry.FSID, off, len(dest), len(data), elapsed, strategy)
+		}
 		if err != nil {
-			log.Printf("fuse read failed path=%q fsid=%q offset=%d length=%d: %v", n.entry.Path, n.entry.FSID, off, len(dest), err)
+			if errors.Is(err, context.Canceled) {
+				n.Filesystem.recordCanceledRead(n.entry.Path, n.entry.FSID, off, len(dest))
+			} else {
+				log.Printf("fuse read failed path=%q fsid=%q offset=%d length=%d: %v", n.entry.Path, n.entry.FSID, off, len(dest), err)
+			}
 			return nil, syscall.EIO
 		}
-		n.traceRead(off, len(dest), len(data), handle.lastStrategy)
+		n.traceRead(off, len(dest), len(data), strategy)
 		return fuse.ReadResultData(data), 0
 	}
 	if n.entry.Size > 0 && len(dest) > 0 {
@@ -624,15 +721,7 @@ func shouldTraceRead(off int64, strategy string, requested, returned int) bool {
 	if returned != requested {
 		return true
 	}
-	if off == 0 && strategy == "window-prefetch" {
-		return true
-	}
-	switch strategy {
-	case "seek-exact", "seek-boundary-exact", "window-boundary", "prefetched-boundary":
-		return true
-	default:
-		return false
-	}
+	return strategy == "stream-event"
 }
 
 func (n *entryNode) Opendir(ctx context.Context) syscall.Errno {
@@ -643,11 +732,15 @@ func (n *entryNode) Open(ctx context.Context, openFlags uint32) (fh goFs.FileHan
 	if n.entry.IsDir {
 		return nil, 0, syscall.EISDIR
 	}
-	chunkSize := fuseSeekWindowSize
-	if n.Filesystem != nil && n.Filesystem.remote != nil {
-		chunkSize = n.Filesystem.remote.ChunkSize()
+	if n.Filesystem != nil && n.Filesystem.stream != nil {
+		file := streamFile(n.entry)
+		streamHandle := n.Filesystem.stream.Open(file)
+		if streamHandle == nil {
+			return nil, 0, syscall.EIO
+		}
+		return &entryFileHandle{streamHandle: streamHandle}, fuse.FOPEN_KEEP_CACHE, 0
 	}
-	return &entryFileHandle{windowSize: fuseReadWindowSize, chunkSize: chunkSize, lastRead: -1}, fuse.FOPEN_KEEP_CACHE, 0
+	return &entryFileHandle{}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 func (f *Filesystem) shouldRefreshRoot(children []store.Entry) bool {
@@ -752,18 +845,9 @@ func inodeTime(mtm int64) time.Time {
 }
 
 type entryFileHandle struct {
-	mu             sync.Mutex
-	window         []byte
-	windowOff      int64
-	windowSize     int64
-	chunkSize      int64
-	lastRead       int64
-	lastStrategy   string
-	prefetchCancel context.CancelFunc
-	prefetchDone   chan error
-	prefetchOff    int64
-	prefetchLen    int64
-	closed         bool
+	mu           sync.Mutex
+	lastStrategy string
+	streamHandle *stream.Handle
 }
 
 func (h *entryFileHandle) Release(_ context.Context) syscall.Errno {
@@ -771,273 +855,42 @@ func (h *entryFileHandle) Release(_ context.Context) syscall.Errno {
 		return 0
 	}
 	h.mu.Lock()
-	h.closed = true
-	h.cancelPrefetchLocked()
+	streamHandle := h.streamHandle
+	h.streamHandle = nil
 	h.mu.Unlock()
+	if streamHandle != nil {
+		streamHandle.Release()
+	}
 	return 0
 }
 
-func (h *entryFileHandle) cancelPrefetchLocked() {
-	if h.prefetchCancel != nil {
-		h.prefetchCancel()
+func (h *entryFileHandle) setStrategy(strategy string) {
+	if h == nil {
+		return
 	}
-	h.prefetchCancel = nil
-	h.prefetchDone = nil
-	h.prefetchOff = 0
-	h.prefetchLen = 0
+	h.mu.Lock()
+	h.lastStrategy = strategy
+	h.mu.Unlock()
 }
 
-func (h *entryFileHandle) startNextPrefetchLocked(remote *remote.Reader, entry store.Entry) {
-	if h == nil || remote == nil || h.closed || len(h.window) == 0 || h.windowSize <= 0 || h.chunkSize <= 0 {
-		return
-	}
-	if h.windowOff%h.chunkSize != 0 || int64(len(h.window)) > h.chunkSize {
-		return
-	}
-	off := h.windowOff + int64(len(h.window))
-	length := h.windowSize - int64(len(h.window))
-	if length <= 0 {
-		length = h.windowSize
-	}
-	if entry.Size > 0 {
-		if off >= entry.Size {
-			return
-		}
-		if off+length > entry.Size {
-			length = entry.Size - off
-		}
-	}
-	if length <= 0 {
-		return
-	}
-	h.startPrefetchLocked(remote, entry.FSID, off, length)
-}
-
-func (h *entryFileHandle) startPrefetchLocked(remote *remote.Reader, fsid string, off, length int64) {
-	if h == nil || remote == nil || h.closed || fsid == "" || length <= 0 {
-		return
-	}
-	if h.prefetchDone != nil {
-		select {
-		case <-h.prefetchDone:
-			h.prefetchCancel = nil
-			h.prefetchDone = nil
-			h.prefetchOff = 0
-			h.prefetchLen = 0
-		default:
-			return
-		}
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	h.prefetchCancel = cancel
-	h.prefetchDone = done
-	h.prefetchOff = off
-	h.prefetchLen = length
-	go func() {
-		done <- remote.Prefetch(ctx, fsid, off, length)
-		close(done)
-	}()
-}
-
-func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64) ([]byte, error) {
-	if h == nil || remote == nil {
-		return nil, nil
-	}
-	if length <= 0 {
-		return []byte{}, nil
-	}
-	if entry.Size > 0 && off >= entry.Size {
-		return []byte{}, nil
-	}
-	if h.windowSize <= 0 {
-		h.windowSize = fuseReadWindowSize
-	}
-	if h.chunkSize <= 0 {
-		h.chunkSize = remote.ChunkSize()
-		if h.chunkSize > h.windowSize {
-			h.chunkSize = h.windowSize
-		}
+func (h *entryFileHandle) stream() *stream.Handle {
+	if h == nil {
+		return nil
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	firstHighOffsetRead := h.lastRead < 0 && off >= h.windowSize
-	jump := firstHighOffsetRead || (h.lastRead >= 0 && off > h.lastRead+int64(len(h.window)) && off-h.lastRead > h.windowSize)
-	h.lastRead = off
-	if jump {
-		h.cancelPrefetchLocked()
-	}
-	if len(h.window) > 0 {
-		if data, ok := h.sliceWindow(off, length); ok {
-			if readSatisfied(off, length, int64(len(data)), entry.Size) {
-				h.lastStrategy = "handle-cache"
-				h.startNextPrefetchLocked(remote, entry)
-				return data, nil
-			}
-			return h.readAcrossWindowBoundaryLocked(ctx, remote, entry, off, length, data)
-		}
-	}
-	fetchLen := h.chunkSize
-	if jump {
-		fetchLen = min64(length*2, h.windowSize/2)
-		if fetchLen < length {
-			fetchLen = length
-		}
-	}
-	fetchOff := off
-	if !jump {
-		fetchOff = (off / h.chunkSize) * h.chunkSize
-	}
-	if fetchLen < length {
-		fetchLen = length
-	}
-	if entry.Size > 0 && fetchOff+fetchLen > entry.Size {
-		fetchLen = entry.Size - fetchOff
-	}
-	var data []byte
-	var err error
-	if jump {
-		data, err = remote.ReadExactRange(ctx, entry.FSID, fetchOff, fetchLen)
-		h.lastStrategy = "seek-exact"
-	} else {
-		_, prefetched := remote.ReadCachedWindow(entry.FSID, fetchOff, fetchLen)
-		data, err = remote.ReadRange(ctx, entry.FSID, fetchOff, fetchLen)
-		if prefetched {
-			h.lastStrategy = "next-window-prefetch"
-		} else {
-			h.lastStrategy = "window-prefetch"
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-	h.windowOff = fetchOff
-	h.window = data
-	result := h.sliceWindowOrEmpty(off, length)
-	if !readSatisfied(off, length, int64(len(result)), entry.Size) {
-		return h.readAcrossWindowBoundaryLocked(ctx, remote, entry, off, length, result)
-	}
-	if !jump {
-		h.startNextPrefetchLocked(remote, entry)
-	}
-	return result, nil
+	return h.streamHandle
 }
 
-func (h *entryFileHandle) readAcrossWindowBoundaryLocked(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64, tail []byte) ([]byte, error) {
-	nextOff := h.windowOff + int64(len(h.window))
-	if h.windowOff%h.chunkSize != 0 || int64(len(h.window)) != h.chunkSize {
-		return h.readAcrossSeekWindowLocked(ctx, remote, entry, off, length, tail, nextOff)
+func (h *entryFileHandle) strategy() string {
+	if h == nil {
+		return ""
 	}
-	nextLen := h.chunkSize
-	if entry.Size > 0 && nextOff+nextLen > entry.Size {
-		nextLen = entry.Size - nextOff
-	}
-	if nextLen <= 0 {
-		return tail, nil
-	}
-	_, prefetched := remote.ReadCachedWindow(entry.FSID, nextOff, nextLen)
-	next, err := remote.ReadRange(ctx, entry.FSID, nextOff, nextLen)
-	if err != nil {
-		return nil, err
-	}
-	remaining := length - int64(len(tail))
-	if remaining > int64(len(next)) {
-		remaining = int64(len(next))
-	}
-	result := make([]byte, len(tail)+int(remaining))
-	copy(result, tail)
-	copy(result[len(tail):], next[:remaining])
-	if !readSatisfied(off, length, int64(len(result)), entry.Size) {
-		return nil, io.ErrUnexpectedEOF
-	}
-	h.windowOff = nextOff
-	h.window = next
-	if prefetched {
-		h.lastStrategy = "prefetched-boundary"
-	} else {
-		h.lastStrategy = "window-boundary"
-	}
-	h.startNextPrefetchLocked(remote, entry)
-	return result, nil
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastStrategy
 }
 
-func (h *entryFileHandle) readAcrossSeekWindowLocked(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64, tail []byte, nextOff int64) ([]byte, error) {
-	remaining := length - int64(len(tail))
-	if remaining <= 0 {
-		return tail, nil
-	}
-	if entry.Size > 0 && nextOff+remaining > entry.Size {
-		remaining = entry.Size - nextOff
-	}
-	if remaining <= 0 {
-		return tail, nil
-	}
-	fetchLen := h.chunkSize - (nextOff % h.chunkSize)
-	if fetchLen <= 0 || fetchLen > h.chunkSize {
-		fetchLen = h.chunkSize
-	}
-	if fetchLen < remaining {
-		fetchLen = remaining
-	}
-	if entry.Size > 0 && nextOff+fetchLen > entry.Size {
-		fetchLen = entry.Size - nextOff
-	}
-	next, err := remote.ReadExactRange(ctx, entry.FSID, nextOff, fetchLen)
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(next)) < remaining {
-		return nil, io.ErrUnexpectedEOF
-	}
-	result := make([]byte, len(tail)+int(remaining))
-	copy(result, tail)
-	copy(result[len(tail):], next[:remaining])
-	if !readSatisfied(off, length, int64(len(result)), entry.Size) {
-		return nil, io.ErrUnexpectedEOF
-	}
-	h.windowOff = nextOff
-	h.window = next
-	h.lastStrategy = "seek-boundary-exact"
-	return result, nil
-}
-
-func readSatisfied(off, requested, returned, fileSize int64) bool {
-	if returned >= requested {
-		return true
-	}
-	return fileSize > 0 && off+returned >= fileSize
-}
-
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func (h *entryFileHandle) sliceWindowOrEmpty(off, length int64) []byte {
-	data, ok := h.sliceWindow(off, length)
-	if !ok {
-		return []byte{}
-	}
-	return data
-}
-
-func (h *entryFileHandle) sliceWindow(off, length int64) ([]byte, bool) {
-	if h == nil || len(h.window) == 0 || length <= 0 {
-		return nil, false
-	}
-	windowEnd := h.windowOff + int64(len(h.window))
-	if off < h.windowOff || off >= windowEnd {
-		return nil, false
-	}
-	start := off - h.windowOff
-	end := start + length
-	if end > int64(len(h.window)) {
-		end = int64(len(h.window))
-	}
-	if end <= start {
-		return nil, false
-	}
-	return h.window[start:end], true
+func streamFile(entry store.Entry) stream.File {
+	return stream.File{FSID: entry.FSID, Size: entry.Size, MTM: entry.MTM}
 }

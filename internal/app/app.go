@@ -22,6 +22,7 @@ import (
 	"baidudisklink/internal/fs"
 	"baidudisklink/internal/remote"
 	"baidudisklink/internal/store"
+	"baidudisklink/internal/stream"
 )
 
 type Config struct {
@@ -34,6 +35,15 @@ type Config struct {
 	EnableDelete        bool
 	DownloadConcurrency int
 	DownloadChunkSize   int64
+	StreamChunkSize     int64
+	StreamWorkers       int
+	StreamLowWatermark  int64
+	StreamTargetBuffer  int64
+	StreamBackBuffer    int64
+	StreamMemoryCache   int64
+	StreamDiskCache     int64
+	StreamCachePath     string
+	StreamHedge         bool
 	ClientID            string
 	ClientSecret        string
 	RedirectURI         string
@@ -51,6 +61,7 @@ type App struct {
 	auth            *auth.Manager
 	store           *store.Store
 	remote          *remote.Reader
+	stream          *stream.Manager
 	oauth           oauthFlow
 	tokenHTTPClient *http.Client
 	clientFactory   func(auth.Token) baidu.Client
@@ -145,6 +156,21 @@ func New(cfg Config) (*App, error) {
 	mgr := auth.NewManager(tokenStore)
 	remoteReader := remote.NewReader(&baidu.StaticClient{})
 	remoteReader.SetDownloadOptions(cfg.DownloadConcurrency, cfg.DownloadChunkSize)
+	streamManager, err := stream.NewManager(remoteReader, stream.Config{
+		ChunkSize:      cfg.StreamChunkSize,
+		Workers:        cfg.StreamWorkers,
+		LowWatermark:   cfg.StreamLowWatermark,
+		TargetBuffer:   cfg.StreamTargetBuffer,
+		BackBuffer:     cfg.StreamBackBuffer,
+		MemoryCache:    cfg.StreamMemoryCache,
+		DiskCache:      cfg.StreamDiskCache,
+		CachePath:      cfg.StreamCachePath,
+		Hedge:          cfg.StreamHedge,
+		SessionWorkers: cfg.StreamWorkers - 2,
+	})
+	if err != nil {
+		return nil, err
+	}
 
 	return &App{
 		cfg:      cfg,
@@ -152,6 +178,7 @@ func New(cfg Config) (*App, error) {
 		auth:     mgr,
 		store:    metaStore,
 		remote:   remoteReader,
+		stream:   streamManager,
 		oauth: auth.NewOAuthServer(auth.OAuthConfig{
 			ClientID:         cfg.ClientID,
 			ClientSecret:     cfg.ClientSecret,
@@ -162,7 +189,7 @@ func New(cfg Config) (*App, error) {
 			AuthorizeBaseURL: cfg.AuthorizeBaseURL,
 		}, mgr),
 		clientFactory: func(token auth.Token) baidu.Client {
-			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(cfg.DownloadConcurrency), nil)
+			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(cfg.StreamWorkers), nil)
 		},
 		mountFunc: func(mountPath string, root *fs.Filesystem) (*fakeMountServer, error) {
 			server, err := fs.Mount(mountPath, root, fs.MountOptions{
@@ -293,7 +320,7 @@ func (a *App) mountAndWait() error {
 	if a == nil {
 		return errors.New("app is nil")
 	}
-	a.filesystem = fs.NewFilesystem(a.store, a.remote, a.fuseGIDs, a.cfg.RemoteRootPath)
+	a.filesystem = fs.NewFilesystemWithStream(a.store, a.remote, a.stream, a.fuseGIDs, a.cfg.RemoteRootPath)
 	a.filesystem.SetTraceReads(a.cfg.FuseTraceReads)
 	a.filesystem.SetDeleteEnabled(a.cfg.EnableDelete)
 	if err := a.filesystem.RefreshRootOnly(context.Background()); err != nil {
@@ -384,7 +411,7 @@ func (a *App) bindRemoteClient() error {
 	}
 	if a.clientFactory == nil {
 		a.clientFactory = func(token auth.Token) baidu.Client {
-			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, a.cfg.ClientID, a.cfg.ClientSecret, a.cfg.APIBaseURL, a.cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(a.cfg.DownloadConcurrency), func(accessToken, refreshToken string) error {
+			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, a.cfg.ClientID, a.cfg.ClientSecret, a.cfg.APIBaseURL, a.cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(a.cfg.StreamWorkers), func(accessToken, refreshToken string) error {
 				return a.auth.SaveToken(auth.Token{AccessToken: accessToken, RefreshToken: refreshToken})
 			})
 		}

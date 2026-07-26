@@ -1,0 +1,339 @@
+<mxfile>
+  <diagram id="01" name="01 系统上下文">
+    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="user" value="用户 / 管理员&#xa;[Person]&#xa;配置 OAuth、挂载目录并进行运维测试" style="shape=mxgraph.c4.person2;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#083F75;strokeColor=#06315C;" vertex="1" parent="1">
+          <mxGeometry x="30" y="180" width="200" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="players" value="媒体消费者&#xa;[Software System: Emby / 网易爆米花 / Infuse]&#xa;扫描媒体库、读取文件、播放与 Seek" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="270" y="0" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <UserObject label="BaiduDiskLink&#xa;[Software System: Go + FUSE 3]&#xa;把百度网盘目录映射为 DSM 本地只读文件系统" link="data:page/id,02" id="baidudisklink">
+          <mxCell style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#1061B0;strokeColor=#0D5091;" vertex="1" parent="1">
+          <mxGeometry x="140" y="430" width="240" height="120" as="geometry"/>
+        </mxCell>
+        </UserObject>
+        <mxCell id="baiduopen" value="百度开放平台&#xa;[Software System: OAuth 2.0 / Netdisk API]&#xa;授权、Token 刷新、目录与文件元数据" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="0" y="610" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="baiducdn" value="百度 CDN&#xa;[Software System: HTTP Range]&#xa;提供视频文件分块内容" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="280" y="610" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="dsm" value="群晖 DSM&#xa;[Software System: Docker / FUSE / bind mount]&#xa;运行容器并向宿主机传播挂载点" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="270" y="210" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="e0" value="配置、授权、诊断命令" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="user" target="baidudisklink">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="180" y="370"/><mxPoint x="180" y="420"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e1" value="访问 /volume2/baidu_videos" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="players" target="dsm">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="390" y="120"/><mxPoint x="390" y="200"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e2" value="/dev/fuse + rshared 挂载传播" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="dsm" target="baidudisklink">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="320" y="340"/><mxPoint x="320" y="420"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e3" value="OAuth、List、Stat、dlink" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="baidudisklink" target="baiduopen">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="190" y="550"/><mxPoint x="190" y="600"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e4" value="并发 HTTP Range 下载" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="baidudisklink" target="baiducdn">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="330" y="550"/><mxPoint x="330" y="600"/></Array></mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="02" name="02 容器与部署">
+    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <UserObject label="CLI 入口&#xa;[Container: cmd/baidudisklink]&#xa;mount、bench、bench-fuse、bench-stream、bench-download、playback" link="data:page/id,03" id="cli">
+          <mxCell style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="280" y="190" width="240" height="120" as="geometry"/>
+        </mxCell>
+        </UserObject>
+        <UserObject label="应用编排&#xa;[Container: internal/app]&#xa;配置校验、依赖组装、OAuth 流程、挂载与周期刷新" link="data:page/id,03" id="app">
+          <mxCell style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="550" y="0" width="240" height="120" as="geometry"/>
+        </mxCell>
+        </UserObject>
+        <mxCell id="fusemount" value="FUSE 挂载&#xa;[Container: go-fuse/v2 + FUSE 3]&#xa;容器内挂载 /mnt/baidu，向 DSM 传播" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="0" y="560" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="persistent" value="持久化数据卷&#xa;[Container: /data]&#xa;token.json、meta.db、stream-cache" style="shape=cylinder3;size=15;boundedLbl=1;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="280" y="560" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="hostmount" value="DSM 宿主机挂载点&#xa;[Container: bind propagation: rshared]&#xa;/volume2/baidu_videos，供 Emby 与播放器读取" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="0" y="740" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="oauthport" value="OAuth 回调端口&#xa;[Container: HTTP :8765]&#xa;接收百度授权码回调" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="550" y="560" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="docker" value="Docker Compose / Container Manager&#xa;[Software System]&#xa;privileged、SYS_ADMIN、/dev/fuse、环境变量与卷映射" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="280" y="0" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <UserObject label="应用编排&#xa;[Container: internal/app]&#xa;配置校验、依赖组装、OAuth 流程、挂载与周期刷新" link="data:page/id,03" id="app02">
+          <mxCell style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="280" y="370" width="240" height="120" as="geometry"/>
+        </mxCell>
+        </UserObject>
+        <mxCell id="players02" value="媒体消费者&#xa;[Software System: Emby / 网易爆米花 / Infuse]&#xa;通过 DSM 宿主机挂载点读取视频" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="0" y="930" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="e0" value="启动容器进程" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="docker" target="cli">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="400" y="120"/><mxPoint x="400" y="170"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e1" value="加载环境变量并执行命令" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="cli" target="app02">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="400" y="310"/><mxPoint x="400" y="360"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e2" value="Mount / Wait / Unmount" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="app02" target="fusemount">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="200" y="430"/><mxPoint x="120" y="430"/><mxPoint x="120" y="430"/><mxPoint x="120" y="430"/><mxPoint x="120" y="540"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e3" value="读写凭证、元数据和缓存" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="app02" target="persistent">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="400" y="490"/><mxPoint x="400" y="540"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e4" value="未授权时启动本地回调" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="app02" target="oauthport">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="590" y="430"/><mxPoint x="670" y="430"/><mxPoint x="670" y="430"/><mxPoint x="670" y="430"/><mxPoint x="670" y="540"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e5" value="rshared 挂载传播" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="fusemount" target="hostmount">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="120" y="680"/><mxPoint x="120" y="730"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e6" value="本地文件路径读取" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="hostmount" target="players02">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="120" y="860"/><mxPoint x="120" y="910"/></Array></mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="03" name="03 应用组件">
+    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="config" value="配置加载&#xa;[Component: internal/config]&#xa;解析 BAIDUDISKLINK_* 环境变量及默认值" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="170" y="0" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="auth" value="认证管理&#xa;[Component: internal/auth]&#xa;OAuth URL、回调换 Token、文件凭证存储与刷新" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="0" y="370" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="metadata" value="元数据仓库&#xa;[Component: internal/store + SQLite]&#xa;目录、文件属性、缓存过期与刷新" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="170" y="560" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="negative" value="负缓存&#xa;[Component: internal/cache]&#xa;短期缓存不存在路径，降低重复远端请求" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="450" y="0" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <UserObject label="FUSE 文件系统&#xa;[Component: internal/fs]&#xa;Lookup、Getattr、Readdir、Open、Read、Release、可选删除" link="data:page/id,04" id="filesystem">
+          <mxCell style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="350" y="370" width="240" height="120" as="geometry"/>
+        </mxCell>
+        </UserObject>
+        <UserObject label="高码率流式引擎&#xa;[Component: internal/stream]&#xa;Session、Handle、优先队列、Worker、缓冲水位、Hedge" link="data:page/id,04" id="streammgr">
+          <mxCell style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="450" y="560" width="240" height="120" as="geometry"/>
+        </mxCell>
+        </UserObject>
+        <mxCell id="chunkstore" value="两级分块缓存&#xa;[Container: Memory LRU + Disk LRU]&#xa;默认 320 MiB 内存 + 2 GiB 磁盘，缓存键含文件版本与块大小" style="shape=cylinder3;size=15;boundedLbl=1;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="170" y="740" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="remote" value="远端读取层&#xa;[Component: internal/remote]&#xa;精确 Range、旧 bench 并发读取、dlink 缓存和错误分类" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="450" y="740" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="baiduclient" value="百度 API 客户端&#xa;[Component: internal/baidu]&#xa;List、Stat、Delete、GetDownloadLink、ReadRange、RefreshAuth" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="450" y="930" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="logging" value="可观测性&#xa;[Component: internal/logging + 聚合日志]&#xa;stream summary、FUSE 慢读摘要、benchmark 指标" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="730" y="740" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="benchtools" value="诊断与基准工具&#xa;[Component: internal/app]&#xa;bench-download、bench、bench-fuse、bench-stream、playback" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="730" y="0" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="app03" value="应用编排&#xa;[Container: internal/app]&#xa;组装认证、存储、远端、流式引擎和 FUSE" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="170" y="190" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="baiduopen03" value="百度开放平台与 CDN&#xa;[Software System: OAuth / Netdisk API / HTTP Range]&#xa;认证、元数据、dlink 与文件分块内容" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="0" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="e0" value="构造运行配置" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="config" target="app03">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="290" y="120"/><mxPoint x="290" y="170"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e1" value="加载或获取 Token" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="app03" target="auth">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="210" y="310"/><mxPoint x="210" y="360"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e2" value="打开 meta.db" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="app03" target="metadata">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="290" y="310"/><mxPoint x="290" y="540"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e3" value="创建并挂载文件系统" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="app03" target="filesystem">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="380" y="310"/><mxPoint x="380" y="360"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e4" value="目录和属性查询" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="filesystem" target="metadata">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="380" y="490"/><mxPoint x="380" y="540"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e5" value="文件 ReadAt / Release" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="filesystem" target="streammgr">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="520" y="490"/><mxPoint x="520" y="540"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e6" value="查询、发布、淘汰分块" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="streammgr" target="chunkstore">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="440" y="620"/><mxPoint x="430" y="620"/><mxPoint x="430" y="620"/><mxPoint x="430" y="620"/><mxPoint x="430" y="800"/><mxPoint x="430" y="800"/><mxPoint x="430" y="800"/><mxPoint x="430" y="800"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e7" value="P0-P3 Range 任务" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="streammgr" target="remote">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="570" y="680"/><mxPoint x="570" y="730"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e8" value="下载与元数据接口" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="remote" target="baiduclient">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="570" y="860"/><mxPoint x="570" y="910"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e9" value="缓冲、重试、Hedge 摘要" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="streammgr" target="logging">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="770" y="620"/><mxPoint x="850" y="620"/><mxPoint x="850" y="620"/><mxPoint x="850" y="620"/><mxPoint x="850" y="730"/></Array></mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="04" name="04 播放读取链路">
+    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="clientread" value="播放器 / Emby 读取&#xa;[Software System: open + read + seek]&#xa;通过 DSM 本地路径发起小块、顺序或跳转读取" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="550" y="0" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="fuseops" value="FUSE 语义层&#xa;[Component: internal/fs]&#xa;路径映射、权限、文件大小边界和 errno" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="550" y="190" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="handle" value="独立 Stream Handle&#xa;[Component: Probe / Stream / Seek]&#xa;每次 Open 独立游标；多个句柄共享 Session 与缓存" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="550" y="370" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="scheduler" value="优先级调度器&#xa;[Component: P0 / P1 / P2 / P3]&#xa;前台块、近端 64 MiB、目标 256 MiB、后向 32 MiB" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="360" y="560" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="workers" value="下载 Worker 池&#xa;[Component: 默认 8 Workers]&#xa;逐块领取任务，不等待同批慢块；支持取消和公平配额" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="360" y="740" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="hedge" value="慢块竞速与重试&#xa;[Component: 动态 P95 阈值]&#xa;P0 慢块最多竞速一次，连续慢块刷新 dlink" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="230" y="930" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="memorycache" value="内存热缓存&#xa;[Container: 默认 320 MiB]&#xa;覆盖前向窗口、后向保留与调度余量" style="shape=cylinder3;size=15;boundedLbl=1;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="550" y="1300" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="diskcache" value="磁盘临时缓存&#xa;[Container: 默认 2 GiB / 可关闭]&#xa;.part 完整后原子改名为 .chunk，按 LRU 清理" style="shape=cylinder3;size=15;boundedLbl=1;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="0" y="1300" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="exactrange" value="精确 Range 传输&#xa;[Component: internal/remote]&#xa;按 1 MiB 调度块调用底层 ReadRange" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="280" y="1110" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="dlink" value="dlink 与 HTTP 客户端&#xa;[Component: internal/baidu]&#xa;官方 API 获取直链，下载连接池执行 Range" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="280" y="1300" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="cdn" value="百度 CDN 节点&#xa;[Software System: HTTP/1.1 Range]&#xa;返回目标字节范围" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="830" y="0" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="e0" value="Read(offset, length)" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="clientread" target="fuseops">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="710" y="120"/><mxPoint x="710" y="170"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e1" value="Handle.ReadAt" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="fuseops" target="handle">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="630" y="310"/><mxPoint x="630" y="360"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e2" value="先查热缓存" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="handle" target="memorycache">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="660" y="490"/><mxPoint x="660" y="1280"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e3" value="识别模式并创建 epoch" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="handle" target="scheduler">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="580" y="490"/><mxPoint x="580" y="540"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e4" value="按优先级持续派发" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="scheduler" target="workers">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="480" y="680"/><mxPoint x="480" y="730"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e5" value="前台慢块触发保护" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="workers" target="hedge">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="410" y="860"/><mxPoint x="410" y="910"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e6" value="下载缺失块" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="workers" target="exactrange">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="490" y="860"/><mxPoint x="490" y="1100"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e7" value="竞速请求 / 重试" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="hedge" target="exactrange">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="370" y="1050"/><mxPoint x="370" y="1100"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e8" value="ReadRange(fsid, offset)" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="exactrange" target="dlink">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="400" y="1230"/><mxPoint x="400" y="1280"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e9" value="发布不可变分块" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="exactrange" target="memorycache">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="550" y="1170"/><mxPoint x="580" y="1170"/><mxPoint x="580" y="1170"/><mxPoint x="580" y="1170"/><mxPoint x="580" y="1280"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e10" value="异步落盘" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="exactrange" target="diskcache">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="250" y="1170"/><mxPoint x="240" y="1170"/><mxPoint x="240" y="1170"/><mxPoint x="240" y="1170"/><mxPoint x="240" y="1280"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e11" value="唤醒前台读取" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="memorycache" target="handle">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="730" y="1290"/><mxPoint x="730" y="500"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e12" value="返回请求字节" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="handle" target="fuseops">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="710" y="370"/><mxPoint x="710" y="320"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e13" value="本地文件数据" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="fuseops" target="clientread">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="630" y="180"/><mxPoint x="630" y="130"/></Array></mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="05" name="05 元数据与认证链路">
+    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="admin" value="管理员&#xa;[Person]&#xa;首次授权或凭证失效后重新授权" style="shape=mxgraph.c4.person2;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#083F75;strokeColor=#06315C;" vertex="1" parent="1">
+          <mxGeometry x="20" y="0" width="200" height="180" as="geometry"/>
+        </mxCell>
+        <mxCell id="oauthserver" value="本地 OAuth Server&#xa;[Component: internal/auth :8765]&#xa;生成授权 URL 并接收 code" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="0" y="250" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="baiduauth" value="百度授权页 / Token API&#xa;[Software System: OAuth 2.0]&#xa;用户登录授权并返回 access_token / refresh_token" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="0" y="430" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="tokenfile" value="Token 文件&#xa;[Container: /data/token.json]&#xa;本地保存凭证，远端不经第三方中转" style="shape=cylinder3;size=15;boundedLbl=1;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="280" y="430" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="apiclient" value="百度元数据客户端&#xa;[Component: internal/baidu]&#xa;使用 Token 调用 List、Stat、dlink 和删除接口" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="280" y="620" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="metastore" value="SQLite 元数据缓存&#xa;[Container: /data/meta.db (WAL)]&#xa;目录树、FSID、大小、MTM、过期状态" style="shape=cylinder3;size=15;boundedLbl=1;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#23A2D9;strokeColor=#0E7DAD;" vertex="1" parent="1">
+          <mxGeometry x="550" y="430" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="fusedir" value="FUSE 目录操作&#xa;[Component: Lookup / Readdir / Getattr]&#xa;优先查询 SQLite，缺失或过期时拉取远端" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="550" y="250" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="refresh" value="刷新机制&#xa;[Component: 懒刷新 + 每分钟根目录刷新]&#xa;序列化远端刷新并更新负缓存" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#63BEF2;strokeColor=#2086C9;" vertex="1" parent="1">
+          <mxGeometry x="830" y="430" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="baiduopen05" value="百度网盘官方 API&#xa;[Software System: Netdisk API]&#xa;目录列表、文件元数据和 dlink 接口" style="rounded=1;arcSize=10;html=1;whiteSpace=wrap;fontSize=12;fontColor=#ffffff;align=center;fillColor=#8C8496;strokeColor=#736782;" vertex="1" parent="1">
+          <mxGeometry x="280" y="800" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="e0" value="打开授权 URL" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="admin" target="oauthserver">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="120" y="180"/><mxPoint x="120" y="230"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e1" value="authorize / token exchange" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="oauthserver" target="baiduauth">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="80" y="370"/><mxPoint x="80" y="420"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e2" value="callback code + Token" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="baiduauth" target="oauthserver">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="160" y="430"/><mxPoint x="160" y="380"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e3" value="保存凭证" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="oauthserver" target="tokenfile">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="310" y="310"/><mxPoint x="400" y="310"/><mxPoint x="400" y="310"/><mxPoint x="400" y="310"/><mxPoint x="400" y="420"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e4" value="启动时加载 Token" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="tokenfile" target="apiclient">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="360" y="550"/><mxPoint x="360" y="600"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e5" value="刷新 Token 后回写" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="apiclient" target="tokenfile">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="440" y="610"/><mxPoint x="440" y="560"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e6" value="读取目录和属性" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="fusedir" target="metastore">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="710" y="370"/><mxPoint x="710" y="420"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e7" value="缓存缺失或过期" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="fusedir" target="refresh">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="870" y="310"/><mxPoint x="950" y="310"/><mxPoint x="950" y="310"/><mxPoint x="950" y="310"/><mxPoint x="950" y="420"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e8" value="List / Stat" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="refresh" target="apiclient">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="950" y="600"/><mxPoint x="950" y="680"/><mxPoint x="950" y="680"/><mxPoint x="950" y="680"/><mxPoint x="530" y="680"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e9" value="官方网盘 API" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="apiclient" target="baiduopen05">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="400" y="740"/><mxPoint x="400" y="790"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e10" value="返回本地目录视图" style="endArrow=blockThin;endFill=1;endSize=10;html=1;fontSize=11;fontColor=#404040;strokeColor=#828282;labelBackgroundColor=#ffffff;rounded=0;" edge="1" parent="1" source="metastore" target="fusedir">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="630" y="430"/><mxPoint x="630" y="380"/></Array></mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

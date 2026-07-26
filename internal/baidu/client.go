@@ -251,6 +251,15 @@ func (c *APIClient) GetDownloadLink(fsid string) (DownloadLink, error) {
 	return out, nil
 }
 
+func (c *APIClient) InvalidateDownloadLink(fsid string) {
+	if c == nil || fsid == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.links, fsid)
+	c.mu.Unlock()
+}
+
 func (c *APIClient) Delete(paths []string) error {
 	if len(paths) == 0 {
 		return nil

@@ -127,6 +127,15 @@ func TestAPIClientSeparatesMetadataAndDownloadClients(t *testing.T) {
 	}
 }
 
+func TestAPIClientInvalidateDownloadLink(t *testing.T) {
+	client := NewAPIClient("token", "refresh", "client", "secret", nil)
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.InvalidateDownloadLink("1")
+	if _, ok := client.cachedDownloadLink("1"); ok {
+		t.Fatal("download link cache was not invalidated")
+	}
+}
+
 func TestAPIClientList(t *testing.T) {
 	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{
 		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {

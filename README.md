@@ -86,6 +86,17 @@ BAIDUDISKLINK_DOWNLOAD_CONCURRENCY=1
 # 可选：每个分块读取大小。默认 8MiB。
 BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=8388608
 
+# 高码率流式引擎：默认按 100Mbps 播放目标配置。
+BAIDUDISKLINK_STREAM_CHUNK_SIZE=1048576
+BAIDUDISKLINK_STREAM_WORKERS=8
+BAIDUDISKLINK_STREAM_LOW_WATERMARK=134217728
+BAIDUDISKLINK_STREAM_TARGET_BUFFER=268435456
+BAIDUDISKLINK_STREAM_BACK_BUFFER=33554432
+BAIDUDISKLINK_STREAM_MEMORY_CACHE=335544320
+BAIDUDISKLINK_STREAM_DISK_CACHE=2147483648  # 设为 0 可关闭磁盘缓存
+BAIDUDISKLINK_STREAM_CACHE_PATH=/data/stream-cache
+BAIDUDISKLINK_STREAM_HEDGE=1
+
 # 可选：允许通过挂载目录删除百度网盘文件/目录。默认关闭。
 BAIDUDISKLINK_ENABLE_DELETE=
 
@@ -93,7 +104,9 @@ BAIDUDISKLINK_ENABLE_DELETE=
 TZ=Asia/Shanghai
 ```
 
-这两个参数同时用于 `bench` 和日常 FUSE 挂载。
+`BAIDUDISKLINK_DOWNLOAD_*` 继续用于旧 `bench` 直读测试；日常 FUSE 播放使用独立的 `BAIDUDISKLINK_STREAM_*` 配置，二者互不覆盖。
+
+流式引擎把视频拆成独立 `1 MiB` 块，降低百度 CDN 大 Range 的慢尾延迟，使用持续 Worker 队列建立前向缓冲。默认低水位为 `128 MiB`、目标缓冲为 `256 MiB`，并使用 `320 MiB` 内存热缓存和 `/data/stream-cache` 下最多 `2 GiB` 的临时磁盘缓存。内存预算覆盖完整前向窗口和后向保留，连续播放不会因为预取块挤出即将消费的数据而退化为逐块磁盘读取。缓存 key 包含块大小，切换 `STREAM_CHUNK_SIZE` 后旧缓存会自然失效，不会错位复用；磁盘缓存不位于 FUSE 挂载点，删除后只会重新下载，不影响百度网盘数据。
 
 默认容器内路径由 `docker-compose.yml` 固定为：
 
@@ -262,11 +275,50 @@ BAIDUDISKLINK_DOWNLOAD_CONCURRENCY=4
 BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE=8388608
 ```
 
+如果要排除 OAuth、FUSE、元数据和本地缓存，只测试百度 CDN 直链，可以使用独立的 `bench-download`。它先用一个 `Range` 探测文件大小，再按指定并发数直接向直链发起 Range 下载，不会初始化挂载服务。
+
+直链和 Cookie 建议通过环境变量传入；程序不会输出这两个值。实际设置变量时应使用你自己的安全输入方式，避免把真实值直接写进 shell 历史：
+
+```bash
+export BAIDUDISKLINK_BENCH_URL='https://d.pcs.baidu.com/...'
+export BAIDUDISKLINK_BENCH_COOKIE='BDUSS=...'
+
+docker-compose exec -T \
+  -e BAIDUDISKLINK_BENCH_URL="$BAIDUDISKLINK_BENCH_URL" \
+  -e BAIDUDISKLINK_BENCH_COOKIE="$BAIDUDISKLINK_BENCH_COOKIE" \
+  baidudisklink baidudisklink bench-download \
+  --bytes 268435456 \
+  --connections 8 \
+  --chunk-size 1048576 \
+  --http-version 1.1 \
+  --retries 0
+```
+
+对照 HTTP/2 或默认协商协议时只改 `--http-version auto`。输出中的 `connections_observed` 是实际 TCP 连接数：如果 `auto` 使用 HTTP/2，多个 Range 可能复用 1 条连接；`1.1` 通常会观察到多条连接。`range_requests` 不包含前置的 1 字节大小探测，`retries` 只统计测试下载阶段的重试。
+
+默认值是 `256 MiB`、`8` 个并发、每个 Range `1 MiB`、不重试、总超时 `10m`。这里的 `--chunk-size` 是每个 HTTP Range 请求长度，并不等同于 aria2c 的 `-k` 最小分片大小；若要近似 `256 MiB / 8` 条长连接，可再用 `--chunk-size 33554432` 对照。百度直链和 Cookie 具有时效性，测试完成后应立即清除当前 shell 中的两个环境变量；不要把真实直链或 Cookie 粘贴到日志、Issue 或文档中。
+
 `bench-fuse` 测 FUSE 挂载后的实际读取速度：
 
 ```bash
 docker-compose exec baidudisklink baidudisklink bench-fuse --path /mnt/baidu/test.zip
 ```
+
+`bench-stream` 按指定码率模拟播放器持续消费，并可定期 Seek：
+
+```bash
+docker-compose exec baidudisklink baidudisklink bench-stream \
+  --path '/Videos/test.mkv' \
+  --bitrate 100 \
+  --duration 30m \
+  --seek-interval 60s
+```
+
+输出会区分缓冲达到低水位前的 `warmup_stalls` 和达到低水位后的 `steady_stalls`，并给出 stall 的累计时长、P95、最大值和首次/最后发生时间。同时会输出前台读取延迟 `read_p50/read_p95/read_p99/read_max`、缓冲区最小/最大值、低水位次数、零缓冲次数、实际远端下载量、重试和竞速次数，以及 MiB/s 和 Mbps 吞吐。验收重点是 `steady_stalls=0`、`buffer_zero_count=0`，`seek_p95` 应小于 `3s`。
+
+服务日志中的连续 FUSE 慢读会按文件每 5 秒聚合为一条 `fuse read summary`；正常的连续 `stream start` 和单块 `chunk hedge` 不再逐条输出，只在 stream summary 中保留计数。非预期读取错误仍会立即输出，`context canceled` 会计入聚合摘要。
+
+要隔离 DSM 本地磁盘缓存写入和淘汰造成的 I/O 抖动，可以只对本次测试追加 `--disk-cache 0`；该参数不会删除已有缓存文件，也不改变服务容器的日常配置。
 
 如果需要诊断 Emby 拖动进度时是否真的触发了 FUSE 读取，可以临时打开读跟踪：
 

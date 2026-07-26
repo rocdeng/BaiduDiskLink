@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,36 @@ type Reader struct {
 	inflight    map[cacheKey]*inflightRead
 	concurrency int
 	chunkSize   int64
+}
+
+type DownloadErrorKind uint8
+
+const (
+	DownloadErrorOther DownloadErrorKind = iota
+	DownloadErrorTransport
+	DownloadErrorAuth
+	DownloadErrorRange
+	DownloadErrorEOF
+)
+
+func ClassifyDownloadError(err error) DownloadErrorKind {
+	if err == nil {
+		return DownloadErrorOther
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return DownloadErrorEOF
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "status=401") || strings.Contains(message, "status=403") || strings.Contains(message, "unauthorized") || strings.Contains(message, "forbidden") {
+		return DownloadErrorAuth
+	}
+	if strings.Contains(message, "status=416") || strings.Contains(message, "content range") {
+		return DownloadErrorRange
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || strings.Contains(message, "timeout") || strings.Contains(message, "connection reset") {
+		return DownloadErrorTransport
+	}
+	return DownloadErrorOther
 }
 
 type cacheKey struct {
@@ -102,6 +133,19 @@ func (r *Reader) SetClient(client baidu.Client) {
 	r.client = client
 	r.links = make(map[string]cachedLink)
 	r.clearReadCacheLocked()
+}
+
+func (r *Reader) InvalidateDownloadLink(fsid string) {
+	if r == nil || fsid == "" {
+		return
+	}
+	r.mu.Lock()
+	delete(r.links, fsid)
+	client := r.client
+	r.mu.Unlock()
+	if invalidator, ok := client.(interface{ InvalidateDownloadLink(string) }); ok {
+		invalidator.InvalidateDownloadLink(fsid)
+	}
 }
 
 func (r *Reader) List(path string) ([]baidu.RemoteEntry, error) {
@@ -224,9 +268,36 @@ func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		_ = client.RefreshAuth()
+		if ClassifyDownloadError(err) == DownloadErrorAuth {
+			_ = client.RefreshAuth()
+		}
 	}
 	return nil, lastErr
+}
+
+func (r *Reader) ReadStreamRange(ctx context.Context, fsid string, offset, length int64) ([]byte, error) {
+	if length < 0 {
+		return nil, errors.New("length must be non-negative")
+	}
+	if fsid == "" {
+		return nil, errors.New("fsid is required")
+	}
+	client := r.currentClient()
+	if r == nil || client == nil {
+		return make([]byte, length), nil
+	}
+	data := make([]byte, length)
+	n, err := client.ReadRange(ctx, fsid, offset, data)
+	if err == nil && n != len(data) {
+		err = fmt.Errorf("stream range at %d returned %d of %d bytes: %w", offset, n, len(data), io.ErrUnexpectedEOF)
+	}
+	if err != nil {
+		if ClassifyDownloadError(err) == DownloadErrorAuth {
+			_ = client.RefreshAuth()
+		}
+		return nil, err
+	}
+	return data[:n], nil
 }
 
 func (r *Reader) readCached(fsid string, offset, length int64) ([]byte, bool) {
@@ -387,7 +458,9 @@ func (r *Reader) readSequential(ctx context.Context, client baidu.Client, fsid s
 			r.finishInflight(fsid, fetchOffset, inflight, nil, ctx.Err())
 			return nil, ctx.Err()
 		}
-		_ = client.RefreshAuth()
+		if ClassifyDownloadError(err) == DownloadErrorAuth {
+			_ = client.RefreshAuth()
+		}
 	}
 	r.finishInflight(fsid, fetchOffset, inflight, nil, lastErr)
 	return nil, lastErr
@@ -568,7 +641,9 @@ func (r *Reader) readChunk(ctx context.Context, client baidu.Client, fsid string
 			r.finishInflight(fsid, offset, inflight, nil, ctx.Err())
 			return nil, ctx.Err()
 		}
-		_ = client.RefreshAuth()
+		if ClassifyDownloadError(err) == DownloadErrorAuth {
+			_ = client.RefreshAuth()
+		}
 	}
 	r.finishInflight(fsid, offset, inflight, nil, lastErr)
 	return nil, lastErr
