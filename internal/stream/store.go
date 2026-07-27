@@ -200,6 +200,7 @@ func (s *chunkStore) forgetDisk(key chunkKey, path string) {
 	s.diskMu.Lock()
 	s.removeDiskLocked(key, path)
 	s.diskMu.Unlock()
+	_ = os.Remove(path)
 }
 
 func (s *chunkStore) putMemory(key chunkKey, data []byte) {

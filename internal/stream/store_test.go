@@ -193,3 +193,31 @@ func TestChunkStoreRemovesPartialFilesOnStartup(t *testing.T) {
 		t.Fatalf("partial file still exists: %v", err)
 	}
 }
+
+func TestChunkStoreRemovesUnreadableIndexedPath(t *testing.T) {
+	path := t.TempDir()
+	store, err := newChunkStore(0, path, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := chunkKey{version: "1", index: 0}
+	if err := store.putDisk(key, []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	chunkPath := store.chunkPath(key)
+	if err := os.Remove(chunkPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(chunkPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.get(key); ok {
+		t.Fatal("unreadable disk chunk unexpectedly succeeded")
+	}
+	if _, err := os.Stat(chunkPath); !os.IsNotExist(err) {
+		t.Fatalf("unreadable disk path remains: %v", err)
+	}
+	if store.diskBytes != 0 || len(store.diskEntries) != 0 || len(store.diskReady) != 0 {
+		t.Fatalf("unreadable disk chunk remains indexed: bytes=%d entries=%d ready=%d", store.diskBytes, len(store.diskEntries), len(store.diskReady))
+	}
+}

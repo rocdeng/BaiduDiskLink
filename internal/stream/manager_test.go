@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -501,6 +502,7 @@ func TestScheduleBufferAdvancesIncrementally(t *testing.T) {
 
 func TestSequentialStreamReadDoesNotPromoteConsumedMemoryChunk(t *testing.T) {
 	reader := newControlledReader()
+	reader.blocked[12] = make(chan struct{})
 	manager := testManager(t, reader, func(cfg *Config) {
 		cfg.MemoryCache = 12
 		cfg.TargetBuffer = 8
@@ -685,7 +687,7 @@ func TestSummaryLoggingDoesNotBlockForegroundRead(t *testing.T) {
 	defer close(writer.release)
 
 	reader := newControlledReader()
-	manager := testManager(t, reader, nil)
+	manager := testManager(t, reader, func(cfg *Config) { cfg.Diagnostics = true })
 	file := File{FSID: "1", Size: 64, MTM: 1}
 	handle := testHandle(t, manager, file)
 	if _, err := handle.ReadAt(context.Background(), 0, 3); err != nil {
@@ -709,5 +711,30 @@ func TestSummaryLoggingDoesNotBlockForegroundRead(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("foreground read waited for summary logging")
+	}
+}
+
+func TestDiagnosticsDisabledSuppressesStreamEventsAndSummary(t *testing.T) {
+	var output bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(previousWriter)
+
+	reader := newControlledReader()
+	manager := testManager(t, reader, nil)
+	file := File{FSID: "1", Size: 64, MTM: 1}
+	handle := testHandle(t, manager, file)
+	if _, err := handle.ReadAt(context.Background(), 0, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.ReadAt(context.Background(), 3, 3); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	got := output.String()
+	for _, unexpected := range []string{"stream start", "stream seek", "stream summary"} {
+		if strings.Contains(got, unexpected) {
+			t.Fatalf("unexpected diagnostic %q with diagnostics disabled: %q", unexpected, got)
+		}
 	}
 }

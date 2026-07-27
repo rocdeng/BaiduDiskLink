@@ -89,10 +89,16 @@ func (f *Filesystem) SetDeleteEnabled(enabled bool) {
 }
 
 func (f *Filesystem) recordSlowRead(path, fsid string, offset int64, requested, returned int, elapsed time.Duration, strategy string) {
+	if f == nil || !f.traceReads {
+		return
+	}
 	f.recordReadDiagnostic(time.Now(), path, fsid, offset, requested, returned, elapsed, strategy, true)
 }
 
 func (f *Filesystem) recordCanceledRead(path, fsid string, offset int64, requested int) {
+	if f == nil || !f.traceReads {
+		return
+	}
 	f.recordReadDiagnostic(time.Now(), path, fsid, offset, requested, 0, 0, "", false)
 }
 
@@ -234,8 +240,7 @@ func (f *Filesystem) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	}
 	if f.shouldRefreshRoot(children) {
 		if err := f.refreshRoot(ctx); err != nil {
-			f.markMissing(JoinPath(f.rootPath, name))
-			return nil, syscall.ENOENT
+			return nil, syscall.EIO
 		}
 		children, err = f.store.ListChildren(f.rootPath)
 		if err != nil {
@@ -261,10 +266,6 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 		return err
 	}
 	log.Printf("refresh root %q loaded %d entries", f.rootPath, len(entries))
-	if len(entries) == 0 {
-		f.markMissing(f.rootPath)
-		return nil
-	}
 	mapped := make([]store.Entry, 0, len(entries))
 	for _, entry := range entries {
 		relPath := trimRootPrefix(f.rootPath, entry.Path)
@@ -493,13 +494,17 @@ func (n *entryNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	if n == nil || n.Filesystem == nil || n.Filesystem.store == nil {
 		return nil, syscall.ENOENT
 	}
+	childPath := JoinPath(n.entry.Path, name)
+	if n.Filesystem.negative != nil && n.Filesystem.negative.IsMissing(childPath) {
+		return nil, syscall.ENOENT
+	}
 	children, err := n.Filesystem.store.ListChildren(n.entry.Path)
 	if err != nil {
 		return nil, syscall.EIO
 	}
 	if n.Filesystem.shouldRefreshDir(n.entry.Path, children) && n.Filesystem.remote != nil && n.entry.IsDir {
 		if err := n.Filesystem.refreshDir(ctx, n.entry.Path, n.entry.FSID); err != nil {
-			return nil, syscall.ENOENT
+			return nil, syscall.EIO
 		}
 		children, err = n.Filesystem.store.ListChildren(n.entry.Path)
 		if err != nil {
@@ -521,6 +526,7 @@ func (n *entryNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 		}, goFs.StableAttr{Mode: mode})
 		return inode, 0
 	}
+	n.Filesystem.markMissing(childPath)
 	return nil, syscall.ENOENT
 }
 
@@ -578,6 +584,7 @@ func (f *Filesystem) deleteChild(ctx context.Context, parentPath string, name st
 		log.Printf("delete metadata failed path=%q fsid=%q: %v", target.Path, target.FSID, err)
 		return syscall.EIO
 	}
+	f.markMissing(target.Path)
 	log.Printf("fuse delete path=%q fsid=%q", target.Path, target.FSID)
 	return 0
 }
@@ -591,10 +598,6 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 		return err
 	}
 	log.Printf("refresh dir %q loaded %d entries", dirPath, len(entries))
-	if len(entries) == 0 {
-		f.markMissing(dirPath)
-		return nil
-	}
 	mapped := make([]store.Entry, 0, len(entries))
 	for _, entry := range entries {
 		mapped = append(mapped, store.Entry{

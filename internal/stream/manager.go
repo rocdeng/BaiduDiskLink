@@ -29,6 +29,7 @@ type Config struct {
 	DiskCache      int64
 	CachePath      string
 	Hedge          bool
+	Diagnostics    bool
 	HedgeMinDelay  time.Duration
 	HedgeMaxDelay  time.Duration
 	SessionWorkers int
@@ -362,9 +363,9 @@ func (m *Manager) readAt(ctx context.Context, handle *Handle, offset, length int
 	if err != nil {
 		return nil, err
 	}
-	if logEvent && event == readEventSeek {
+	if m.cfg.Diagnostics && logEvent && event == readEventSeek {
 		log.Printf("stream seek fsid=%q epoch=%d offset=%d", file.FSID, epoch, offset)
-	} else if logEvent && event == readEventStart {
+	} else if m.cfg.Diagnostics && logEvent && event == readEventStart {
 		log.Printf("stream start fsid=%q epoch=%d offset=%d", file.FSID, epoch, offset)
 	}
 	if mode == modeStream && streamRead {
@@ -439,6 +440,9 @@ func (m *Manager) scheduleProbe(file File, offset, epoch int64) {
 }
 
 func (m *Manager) queueSummary(file File, cursor, epoch int64) {
+	if m == nil || !m.cfg.Diagnostics {
+		return
+	}
 	request := summaryRequest{file: file, cursor: cursor, epoch: epoch}
 	select {
 	case m.summaries <- request:

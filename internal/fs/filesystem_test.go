@@ -3,6 +3,7 @@ package fs
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"strings"
 	"sync"
@@ -187,7 +188,7 @@ func TestReadDiagnosticsAggregateSlowAndCanceledReads(t *testing.T) {
 	log.SetOutput(&output)
 	defer log.SetOutput(previousWriter)
 
-	filesystem := &Filesystem{}
+	filesystem := &Filesystem{traceReads: true}
 	base := time.Unix(100, 0)
 	filesystem.recordReadDiagnostic(base, "/movie.mkv", "1", 0, 192<<10, 192<<10, time.Second, "stream-manager", true)
 	filesystem.recordReadDiagnostic(base.Add(time.Second), "/movie.mkv", "1", 192<<10, 192<<10, 0, 0, "", false)
@@ -199,6 +200,21 @@ func TestReadDiagnosticsAggregateSlowAndCanceledReads(t *testing.T) {
 	}
 	if !strings.Contains(got, "slow_reads=1") || !strings.Contains(got, "canceled_reads=1") {
 		t.Fatalf("summary did not include slow/canceled counts: %q", got)
+	}
+}
+
+func TestReadDiagnosticsAreDisabledWithTraceReadsOff(t *testing.T) {
+	var output strings.Builder
+	previousWriter := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(previousWriter)
+
+	filesystem := &Filesystem{}
+	filesystem.recordSlowRead("/movie.mkv", "1", 0, 192<<10, 192<<10, time.Second, "stream-manager")
+	filesystem.recordCanceledRead("/movie.mkv", "1", 192<<10, 192<<10)
+
+	if got := output.String(); got != "" {
+		t.Fatalf("diagnostic log was emitted with trace reads disabled: %q", got)
 	}
 }
 
@@ -470,6 +486,135 @@ func TestRefreshDirReplacesExistingChildren(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != "new.mkv" {
 		t.Fatalf("expected refreshed children to replace old ones, got %#v", got)
+	}
+}
+
+func TestRefreshRootClearsExistingChildrenWhenRemoteIsEmpty(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "1", Parent: "0", Path: "/old.mkv", Name: "old.mkv"}); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
+	if err := fs.refreshRoot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	children, err := dbStore.ListChildren("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 0 {
+		t.Fatalf("expected empty root after refresh, got %#v", children)
+	}
+	if fs.negative != nil && fs.negative.IsMissing("/") {
+		t.Fatal("existing empty root was marked missing")
+	}
+}
+
+func TestRefreshDirClearsExistingChildrenWhenRemoteIsEmpty(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "1", Parent: "0", Path: "/movies", Name: "movies", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "2", Parent: "1", Path: "/movies/old.mkv", Name: "old.mkv"}); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
+	if err := fs.refreshDir(context.Background(), "/movies", "1"); err != nil {
+		t.Fatal(err)
+	}
+	children, err := dbStore.ListChildren("/movies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 0 {
+		t.Fatalf("expected empty directory after refresh, got %#v", children)
+	}
+	if fs.negative != nil && fs.negative.IsMissing("/movies") {
+		t.Fatal("existing empty directory was marked missing")
+	}
+}
+
+func TestRootLookupReturnsEIOWithoutNegativeCacheOnRefreshFailure(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.ExpirePath("/"); err != nil {
+		t.Fatal(err)
+	}
+	client := &listErrorClient{err: errors.New("network unavailable")}
+	fs := NewFilesystem(dbStore, remote.NewReader(client), nil, "/")
+	if _, errno := fs.Lookup(context.Background(), "missing.mkv", nil); errno != syscall.EIO {
+		t.Fatalf("expected EIO, got %v", errno)
+	}
+	if fs.negative != nil && fs.negative.IsMissing("/missing.mkv") {
+		t.Fatal("refresh failure was cached as a missing path")
+	}
+}
+
+func TestEntryLookupReturnsEIOWithoutNegativeCacheOnRefreshFailure(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	entry := store.Entry{FSID: "1", Parent: "0", Path: "/movies", Name: "movies", IsDir: true}
+	if err := dbStore.UpsertEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	client := &listErrorClient{err: errors.New("network unavailable")}
+	fs := NewFilesystem(dbStore, remote.NewReader(client), nil, "/")
+	node := &entryNode{Filesystem: fs, entry: entry}
+	if _, errno := node.Lookup(context.Background(), "missing.mkv", nil); errno != syscall.EIO {
+		t.Fatalf("expected EIO, got %v", errno)
+	}
+	if fs.negative != nil && fs.negative.IsMissing("/movies/missing.mkv") {
+		t.Fatal("refresh failure was cached as a missing path")
+	}
+}
+
+func TestEntryLookupUsesNegativeCacheBeforeStore(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	entry := store.Entry{FSID: "1", Parent: "0", Path: "/movies", Name: "movies", IsDir: true, ExpiresAt: time.Now().Add(time.Minute).Unix()}
+	if err := dbStore.UpsertEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
+	node := &entryNode{Filesystem: fs, entry: entry}
+	if _, errno := node.Lookup(context.Background(), "missing.mkv", nil); errno != syscall.ENOENT {
+		t.Fatalf("expected ENOENT, got %v", errno)
+	}
+	if !fs.negative.IsMissing("/movies/missing.mkv") {
+		t.Fatal("missing child was not cached")
+	}
+	if err := dbStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, errno := node.Lookup(context.Background(), "missing.mkv", nil); errno != syscall.ENOENT {
+		t.Fatalf("expected negative cache hit before closed store, got %v", errno)
 	}
 }
 
@@ -751,6 +896,9 @@ func TestRmdirDeletesRemoteDirectoryAndMetadataSubtree(t *testing.T) {
 	if got, err := dbStore.GetByPath("/Videos/Movie/test.mkv"); err != nil || got != nil {
 		t.Fatalf("expected child metadata removed, got %#v err=%v", got, err)
 	}
+	if !fs.negative.IsMissing("/Videos/Movie") {
+		t.Fatal("deleted directory was not cached as missing")
+	}
 }
 
 func testDB(t *testing.T) *sql.DB {
@@ -882,6 +1030,21 @@ func (c *countingReadClient) RefreshAuth() error {
 type deleteRecordingClient struct {
 	deleted []string
 }
+
+type listErrorClient struct {
+	err error
+}
+
+func (c *listErrorClient) List(string) ([]baidu.RemoteEntry, error) { return nil, c.err }
+func (c *listErrorClient) Stat(string) (baidu.RemoteEntry, error)   { return baidu.RemoteEntry{}, c.err }
+func (c *listErrorClient) GetDownloadLink(string) (baidu.DownloadLink, error) {
+	return baidu.DownloadLink{}, c.err
+}
+func (c *listErrorClient) Delete([]string) error { return c.err }
+func (c *listErrorClient) ReadRange(context.Context, string, int64, []byte) (int, error) {
+	return 0, c.err
+}
+func (c *listErrorClient) RefreshAuth() error { return c.err }
 
 func (c *deleteRecordingClient) List(path string) ([]baidu.RemoteEntry, error) {
 	return nil, nil

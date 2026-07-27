@@ -316,7 +316,7 @@ docker-compose exec baidudisklink baidudisklink bench-stream \
 
 输出会区分缓冲达到低水位前的 `warmup_stalls` 和达到低水位后的 `steady_stalls`，并给出 stall 的累计时长、P95、最大值和首次/最后发生时间。同时会输出前台读取延迟 `read_p50/read_p95/read_p99/read_max`、缓冲区最小/最大值、低水位次数、零缓冲次数、实际远端下载量、重试和竞速次数，以及 MiB/s 和 Mbps 吞吐。验收重点是 `steady_stalls=0`、`buffer_zero_count=0`，`seek_p95` 应小于 `3s`。
 
-服务日志中的连续 FUSE 慢读会按文件每 5 秒聚合为一条 `fuse read summary`；正常的连续 `stream start` 和单块 `chunk hedge` 不再逐条输出，只在 stream summary 中保留计数。非预期读取错误仍会立即输出，`context canceled` 会计入聚合摘要。
+默认只输出非预期读取错误等必要日志。设置 `BAIDUDISKLINK_FUSE_TRACE_READS=1` 后，额外启用播放诊断：逐次关键 FUSE 读取、`stream start` / `stream seek`、每 5 秒一条 `stream summary`，以及按文件聚合的 `fuse read summary`；`context canceled` 也会计入聚合摘要。
 
 要隔离 DSM 本地磁盘缓存写入和淘汰造成的 I/O 抖动，可以只对本次测试追加 `--disk-cache 0`；该参数不会删除已有缓存文件，也不改变服务容器的日常配置。
 
@@ -332,7 +332,7 @@ BAIDUDISKLINK_FUSE_TRACE_READS=1
 docker-compose logs -f baidudisklink
 ```
 
-日志会打印每次 FUSE 读的文件、offset、请求长度、返回长度和读取策略。这个开关只建议排查问题时打开，正常使用时保持为空。
+日志会打印关键 FUSE 读取的文件、offset、请求长度、返回长度和读取策略，并启用上述播放汇总。这个开关只建议排查问题时打开，正常使用时保持为空。
 
 ### 删除文件和目录
 

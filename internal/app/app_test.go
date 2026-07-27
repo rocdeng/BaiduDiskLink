@@ -5,8 +5,10 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"baidudisklink/internal/baidu"
 	"baidudisklink/internal/fs"
 	"baidudisklink/internal/store"
+	"baidudisklink/internal/stream"
 )
 
 func TestNewAppRequiresMountPath(t *testing.T) {
@@ -540,6 +543,73 @@ func TestRunSkipsOAuthWhenStoredTokenIsUsable(t *testing.T) {
 	}
 }
 
+func TestMountAndWaitUnmountsWhenContextIsCanceled(t *testing.T) {
+	root := t.TempDir()
+	a, err := New(Config{
+		MountPath:    root + "/mount",
+		TokenPath:    root + "/token.json",
+		MetaDBPath:   root + "/meta.db",
+		ClientID:     "client",
+		ClientSecret: "secret",
+		RedirectURI:  "http://127.0.0.1:8765/callback",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	a.remote.SetClient(&baidu.StaticClient{})
+	unmounted := make(chan struct{})
+	var once sync.Once
+	a.mountFunc = func(string, *fs.Filesystem) (*fakeMountServer, error) {
+		return &fakeMountServer{
+			waitFn: func() { <-unmounted },
+			unmountFn: func() error {
+				once.Do(func() { close(unmounted) })
+				return nil
+			},
+		}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.mountAndWait(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("context cancellation did not unmount the filesystem")
+	}
+}
+
+func TestCloseIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	a, err := New(Config{
+		MountPath:    root + "/mount",
+		TokenPath:    root + "/token.json",
+		MetaDBPath:   root + "/meta.db",
+		ClientID:     "client",
+		ClientSecret: "secret",
+		RedirectURI:  "http://127.0.0.1:8765/callback",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if handle := a.stream.Open(stream.File{FSID: "closed", Size: 1}); handle != nil {
+		t.Fatal("stream manager remained open after app close")
+	}
+	if err := a.store.EnsureRoot(); err == nil {
+		t.Fatal("metadata store remained open after app close")
+	}
+}
+
 func TestOAuthListenAddrDefaultsFromRedirectURI(t *testing.T) {
 	a, err := New(Config{
 		MountPath:    "/tmp/mount",
@@ -712,6 +782,51 @@ func TestRefreshAuthPersistsUpdatedToken(t *testing.T) {
 		t.Fatal("expected token update callback")
 	}
 	got, err := a.TokenManager().LoadToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != "access-2" || got.RefreshToken != "refresh-2" {
+		t.Fatalf("unexpected persisted token: %#v", got)
+	}
+}
+
+func TestDefaultClientFactoryPersistsRefreshedToken(t *testing.T) {
+	root := t.TempDir()
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.RawQuery, "grant_type=refresh_token") {
+			t.Fatalf("unexpected refresh request: %s", r.URL.String())
+		}
+		_, _ = io.WriteString(w, `{"access_token":"access-2","refresh_token":"refresh-2"}`)
+	}))
+	defer tokenServer.Close()
+	a, err := New(Config{
+		MountPath:    root + "/mount",
+		TokenPath:    root + "/token.json",
+		MetaDBPath:   root + "/meta.db",
+		ClientID:     "client",
+		ClientSecret: "secret",
+		RedirectURI:  "http://127.0.0.1:8765/callback",
+		TokenBaseURL: tokenServer.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.auth.SaveToken(auth.Token{AccessToken: "access-1", RefreshToken: "refresh-1"}); err != nil {
+		t.Fatal(err)
+	}
+	originalFactory := a.clientFactory
+	var client *baidu.APIClient
+	a.clientFactory = func(token auth.Token) baidu.Client {
+		client = originalFactory(token).(*baidu.APIClient)
+		return client
+	}
+	if err := a.bindRemoteClient(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RefreshAuth(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := a.auth.LoadToken()
 	if err != nil {
 		t.Fatal(err)
 	}

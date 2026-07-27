@@ -76,4 +76,18 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	if got != want {
 		t.Fatalf("unexpected token: %#v", got)
 	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("unexpected token permissions: %o", info.Mode().Perm())
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "token.json-*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary token files remain: %#v", matches)
+	}
 }
