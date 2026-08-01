@@ -71,6 +71,21 @@ func TestChunkStorePrunesMemoryByStreamPosition(t *testing.T) {
 	}
 }
 
+func TestChunkStoreClearsMemory(t *testing.T) {
+	store, err := newChunkStore(32, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.putMemory(chunkKey{version: "1", index: 0}, []byte("1234"))
+	store.putMemory(chunkKey{version: "2", index: 0}, []byte("5678"))
+	if reclaimed := store.clearMemory(); reclaimed != 8 {
+		t.Fatalf("unexpected reclaimed bytes: %d", reclaimed)
+	}
+	if memory, _ := store.usage(); memory != 0 {
+		t.Fatalf("memory cache was not cleared: %d", memory)
+	}
+}
+
 func TestChunkStorePersistsAndReloadsDiskChunk(t *testing.T) {
 	path := t.TempDir()
 	store, err := newChunkStore(1, path, 1024)

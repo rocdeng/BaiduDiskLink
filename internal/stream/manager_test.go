@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"log"
 	"strings"
@@ -9,6 +10,18 @@ import (
 	"testing"
 	"time"
 )
+
+func TestTaskHeapPopClearsBackingReference(t *testing.T) {
+	var queue taskHeap
+	original := &task{data: make([]byte, 1<<20)}
+	heap.Push(&queue, original)
+	if got := heap.Pop(&queue); got != original {
+		t.Fatal("heap returned a different task")
+	}
+	if retained := queue[:cap(queue)][0]; retained != nil {
+		t.Fatal("popped task remained referenced by the heap backing array")
+	}
+}
 
 type controlledReader struct {
 	mu          sync.Mutex
@@ -117,6 +130,48 @@ func TestDefaultConfigUsesOneMiBChunksAndLegacyReadThresholds(t *testing.T) {
 	}
 	if cfg.HedgeMinDelay != 300*time.Millisecond || cfg.HedgeMaxDelay != 800*time.Millisecond {
 		t.Fatalf("unexpected hedge defaults: %#v", cfg)
+	}
+	if cfg.IdleReclaim != 10*time.Minute {
+		t.Fatalf("unexpected idle reclaim delay: %s", cfg.IdleReclaim)
+	}
+}
+
+func TestManagerReclaimsMemoryAfterTenMinuteIdleWindow(t *testing.T) {
+	manager := testManager(t, newControlledReader(), func(cfg *Config) {
+		cfg.IdleReclaim = 20 * time.Millisecond
+	})
+	file := File{FSID: "1", Size: 64, MTM: 1}
+	testHandle(t, manager, file)
+	manager.store.putMemory(chunkKey{version: chunkVersion(file, manager.cfg.ChunkSize), index: 0}, []byte("1234"))
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		memory, _ := manager.store.usage()
+		if memory == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("idle memory was not reclaimed: %d", memory)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestManagerRecentActivityDelaysIdleReclaim(t *testing.T) {
+	manager := testManager(t, newControlledReader(), func(cfg *Config) {
+		cfg.IdleReclaim = 40 * time.Millisecond
+	})
+	file := File{FSID: "1", Size: 64, MTM: 1}
+	testHandle(t, manager, file)
+	key := chunkKey{version: chunkVersion(file, manager.cfg.ChunkSize), index: 0}
+	manager.store.putMemory(key, []byte("1234"))
+	time.Sleep(25 * time.Millisecond)
+	manager.mu.Lock()
+	manager.markActivityLocked(time.Now())
+	manager.mu.Unlock()
+	time.Sleep(25 * time.Millisecond)
+	if _, ok := manager.store.get(key); !ok {
+		t.Fatal("recently active playback cache was reclaimed too early")
 	}
 }
 
@@ -290,15 +345,25 @@ func TestManagerSharesInflightChunkAcrossHandles(t *testing.T) {
 	second := testHandle(t, manager, file)
 	done := make(chan error, 2)
 	go func() { _, err := first.ReadAt(context.Background(), 0, 2); done <- err }()
-	<-reader.started
-	go func() { _, err := second.ReadAt(context.Background(), 0, 2); done <- err }()
-	select {
-	case offset := <-reader.started:
-		if offset == 0 {
-			t.Fatalf("duplicate download started before the shared chunk completed: offset=%d", offset)
+	for {
+		if offset := <-reader.started; offset == 0 {
+			break
 		}
-	case <-time.After(10 * time.Millisecond):
 	}
+	go func() { _, err := second.ReadAt(context.Background(), 0, 2); done <- err }()
+	deadline := time.After(10 * time.Millisecond)
+	for {
+		select {
+		case offset := <-reader.started:
+			if offset == 0 {
+				t.Fatalf("duplicate download started before the shared chunk completed: offset=%d", offset)
+			}
+		case <-deadline:
+			goto shared
+		}
+	}
+
+shared:
 	close(release)
 	for index := 0; index < 2; index++ {
 		if err := <-done; err != nil {

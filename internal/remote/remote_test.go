@@ -105,6 +105,18 @@ func TestReadCacheMaintainsFSIDIndex(t *testing.T) {
 	}
 }
 
+func TestClearReadCacheReportsReclaimedBytes(t *testing.T) {
+	r := NewReader(&stubClient{})
+	r.storeCached("one", 0, []byte("1234"))
+	r.storeCached("two", 0, []byte("5678"))
+	if reclaimed := r.ClearReadCache(); reclaimed != 8 {
+		t.Fatalf("unexpected reclaimed bytes: %d", reclaimed)
+	}
+	if r.cacheBytes != 0 || len(r.cached) != 0 || len(r.cacheByFSID) != 0 || len(r.cacheOrder) != 0 {
+		t.Fatalf("read cache was not cleared: bytes=%d cached=%d fsids=%d order=%d", r.cacheBytes, len(r.cached), len(r.cacheByFSID), len(r.cacheOrder))
+	}
+}
+
 func TestPrefetchPopulatesCache(t *testing.T) {
 	client := &stubClient{}
 	r := NewReader(client)

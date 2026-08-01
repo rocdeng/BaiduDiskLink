@@ -398,11 +398,26 @@ func (r *Reader) storeCachedLocked(fsid string, offset int64, data []byte) {
 }
 
 func (r *Reader) clearReadCacheLocked() {
+	r.clearCachedReadsLocked()
+	r.inflight = make(map[cacheKey]*inflightRead)
+}
+
+func (r *Reader) clearCachedReadsLocked() {
 	r.cached = make(map[cacheKey]cachedRead)
 	r.cacheByFSID = make(map[string]map[cacheKey]struct{})
 	r.cacheOrder = nil
 	r.cacheBytes = 0
-	r.inflight = make(map[cacheKey]*inflightRead)
+}
+
+func (r *Reader) ClearReadCache() int64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	reclaimed := r.cacheBytes
+	r.clearCachedReadsLocked()
+	return reclaimed
 }
 
 func (r *Reader) readWithOptions(ctx context.Context, client baidu.Client, fsid string, offset, length int64) ([]byte, error) {

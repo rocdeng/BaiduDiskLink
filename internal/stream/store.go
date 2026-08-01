@@ -229,6 +229,16 @@ func (s *chunkStore) putMemory(key chunkKey, data []byte) {
 	}
 }
 
+func (s *chunkStore) clearMemory() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reclaimed := s.memoryBytes
+	s.memory = make(map[chunkKey]*list.Element)
+	s.lru.Init()
+	s.memoryBytes = 0
+	return reclaimed
+}
+
 func (s *chunkStore) removeMemoryRange(version string, start, end int64) {
 	if end <= start {
 		return

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -33,6 +35,7 @@ type Config struct {
 	HedgeMinDelay  time.Duration
 	HedgeMaxDelay  time.Duration
 	SessionWorkers int
+	IdleReclaim    time.Duration
 }
 
 func DefaultConfig() Config {
@@ -50,7 +53,13 @@ func DefaultConfig() Config {
 		HedgeMinDelay:  300 * time.Millisecond,
 		HedgeMaxDelay:  800 * time.Millisecond,
 		SessionWorkers: 6,
+		IdleReclaim:    10 * time.Minute,
 	}
+}
+
+type reclaimRequest struct {
+	streamBytes int64
+	readerBytes int64
 }
 
 type Manager struct {
@@ -63,18 +72,22 @@ type Manager struct {
 	wg     sync.WaitGroup
 	diskWG sync.WaitGroup
 
-	mu          sync.Mutex
-	cond        *sync.Cond
-	queue       taskHeap
-	tasks       map[chunkKey]*task
-	sessions    map[string]*session
-	closed      bool
-	sequence    int64
-	nextHandle  uint64
-	diskWrites  chan cacheEntry
-	summaries   chan summaryRequest
-	latencies   []time.Duration
-	latencyNext int
+	mu           sync.Mutex
+	cond         *sync.Cond
+	queue        taskHeap
+	tasks        map[chunkKey]*task
+	sessions     map[string]*session
+	closed       bool
+	sequence     int64
+	nextHandle   uint64
+	diskWrites   chan cacheEntry
+	summaries    chan summaryRequest
+	freeOS       chan reclaimRequest
+	latencies    []time.Duration
+	latencyNext  int
+	idleTimer    *time.Timer
+	idleEpoch    uint64
+	lastActivity time.Time
 
 	downloaded atomic.Int64
 	retries    atomic.Int64
@@ -182,6 +195,7 @@ func (h *taskHeap) Pop() any {
 	old := *h
 	n := len(old)
 	task := old[n-1]
+	old[n-1] = nil
 	task.index = -1
 	*h = old[:n-1]
 	return task
@@ -228,6 +242,9 @@ func NewManager(reader Reader, cfg Config) (*Manager, error) {
 			cfg.SessionWorkers = cfg.Workers
 		}
 	}
+	if cfg.IdleReclaim <= 0 {
+		cfg.IdleReclaim = defaults.IdleReclaim
+	}
 	store, err := newChunkStore(cfg.MemoryCache, cfg.CachePath, cfg.DiskCache)
 	if err != nil {
 		return nil, err
@@ -243,6 +260,7 @@ func NewManager(reader Reader, cfg Config) (*Manager, error) {
 		sessions:   make(map[string]*session),
 		diskWrites: make(chan cacheEntry, cfg.Workers*8),
 		summaries:  make(chan summaryRequest, 1),
+		freeOS:     make(chan reclaimRequest, 1),
 	}
 	m.cond = sync.NewCond(&m.mu)
 	heap.Init(&m.queue)
@@ -254,6 +272,8 @@ func NewManager(reader Reader, cfg Config) (*Manager, error) {
 	go m.diskWriter()
 	m.wg.Add(1)
 	go m.summaryWorker()
+	m.wg.Add(1)
+	go m.osReclaimWorker()
 	return m, nil
 }
 
@@ -267,6 +287,7 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closed = true
+	m.cancelIdleReclaimLocked()
 	for _, task := range m.tasks {
 		if task.cancel != nil {
 			task.cancel()
@@ -293,9 +314,10 @@ func (m *Manager) Open(file File) *Handle {
 		m.mu.Unlock()
 		return nil
 	}
+	m.markActivityLocked(time.Now())
 	s := m.sessionLocked(file)
 	s.refs++
-	s.lastAccess = time.Now()
+	s.lastAccess = m.lastActivity
 	m.nextHandle++
 	handle := &Handle{manager: m, file: file, id: m.nextHandle, lastOffset: -1, mode: modeProbe}
 	m.mu.Unlock()
@@ -520,6 +542,8 @@ func (m *Manager) prepareRead(handle *Handle, offset, length int64) (int64, acce
 	if m.closed {
 		return 0, modeProbe, false, readEventNone, false, errors.New("stream manager is closed")
 	}
+	now := time.Now()
+	m.markActivityLocked(now)
 	s := m.sessionLocked(handle.file)
 	version := chunkVersion(handle.file, m.cfg.ChunkSize)
 	event := observed.event
@@ -557,7 +581,7 @@ func (m *Manager) prepareRead(handle *Handle, offset, length int64) (int64, acce
 		event = readEventStart
 	}
 	handle.epoch = s.epoch
-	s.lastAccess = time.Now()
+	s.lastAccess = now
 	streamRead := !independentRead && observed.streamRead && (s.activeHandle == handle.id || withinWindow)
 	if streamRead {
 		if end := offset + length; end > s.cursor {
@@ -663,6 +687,97 @@ func (m *Manager) cleanupSessionLocked(version string, s *session) {
 		}
 	}
 	delete(m.sessions, version)
+}
+
+func (m *Manager) cancelIdleReclaimLocked() {
+	m.idleEpoch++
+	if m.idleTimer != nil {
+		m.idleTimer.Stop()
+		m.idleTimer = nil
+	}
+}
+
+func (m *Manager) markActivityLocked(now time.Time) {
+	if m.closed {
+		return
+	}
+	m.lastActivity = now
+	if m.idleTimer == nil {
+		m.scheduleIdleReclaimAfterLocked(m.cfg.IdleReclaim)
+	}
+}
+
+func (m *Manager) scheduleIdleReclaimAfterLocked(delay time.Duration) {
+	if m.closed {
+		return
+	}
+	if delay <= 0 {
+		delay = time.Millisecond
+	}
+	m.idleEpoch++
+	epoch := m.idleEpoch
+	m.idleTimer = time.AfterFunc(delay, func() {
+		m.reclaimIdleMemory(epoch)
+	})
+}
+
+func (m *Manager) reclaimIdleMemory(epoch uint64) {
+	m.mu.Lock()
+	if m.closed || epoch != m.idleEpoch {
+		m.mu.Unlock()
+		return
+	}
+	m.idleTimer = nil
+	remaining := m.cfg.IdleReclaim - time.Since(m.lastActivity)
+	if remaining > 0 {
+		m.scheduleIdleReclaimAfterLocked(remaining)
+		m.mu.Unlock()
+		return
+	}
+	if len(m.tasks) > 0 {
+		m.scheduleIdleReclaimAfterLocked(time.Second)
+		m.mu.Unlock()
+		return
+	}
+	for _, session := range m.sessions {
+		if session.inflight > 0 {
+			m.scheduleIdleReclaimAfterLocked(time.Second)
+			m.mu.Unlock()
+			return
+		}
+	}
+	for _, session := range m.sessions {
+		session.scheduleSet = false
+		session.scheduledFloor = 0
+		session.scheduledNear = 0
+		session.scheduledEnd = 0
+	}
+	streamBytes := m.store.clearMemory()
+	readerBytes := int64(0)
+	if clearer, ok := m.reader.(interface{ ClearReadCache() int64 }); ok {
+		readerBytes = clearer.ClearReadCache()
+	}
+	m.mu.Unlock()
+	select {
+	case m.freeOS <- reclaimRequest{streamBytes: streamBytes, readerBytes: readerBytes}:
+	case <-m.ctx.Done():
+	}
+}
+
+func (m *Manager) osReclaimWorker() {
+	defer m.wg.Done()
+	for {
+		select {
+		case request := <-m.freeOS:
+			runtime.GC()
+			debug.FreeOSMemory()
+			var mem runtime.MemStats
+			runtime.ReadMemStats(&mem)
+			log.Printf("stream idle memory reclaimed stream_cache_bytes=%d reader_cache_bytes=%d idle=%s heap_alloc=%d heap_inuse=%d heap_idle=%d heap_released=%d sys=%d", request.streamBytes, request.readerBytes, m.cfg.IdleReclaim, mem.HeapAlloc, mem.HeapInuse, mem.HeapIdle, mem.HeapReleased, mem.Sys)
+		case <-m.ctx.Done():
+			return
+		}
+	}
 }
 
 func (m *Manager) cancelSessionTasksLocked(version string, currentEpoch int64) {
