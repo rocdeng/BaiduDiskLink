@@ -156,6 +156,55 @@ func TestAPIClientList(t *testing.T) {
 	}
 }
 
+func TestAPIClientListRefreshesExpiredAccessToken(t *testing.T) {
+	listCalls := 0
+	refreshCalls := 0
+	client := NewAPIClient("expired-access", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.String(), "grant_type=refresh_token") {
+				refreshCalls++
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"access_token":"new-access","refresh_token":"new-refresh"}`)), Header: make(http.Header)}, nil
+			}
+			listCalls++
+			if got := r.URL.Query().Get("access_token"); got == "expired-access" {
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"errno":-6,"errmsg":"authentication failed"}`)), Header: make(http.Header)}, nil
+			}
+			body := `{"list":[{"fs_id":1,"server_filename":"Movie","path":"/Videos/Movie","isdir":1}],"errno":0}`
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		}},
+	})
+
+	entries, err := client.List("/Videos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ServerName != "Movie" {
+		t.Fatalf("unexpected entries: %#v", entries)
+	}
+	if listCalls != 2 || refreshCalls != 1 {
+		t.Fatalf("unexpected calls: list=%d refresh=%d", listCalls, refreshCalls)
+	}
+}
+
+func TestAPIClientListReportsReauthorizationWhenRefreshTokenExpired(t *testing.T) {
+	client := NewAPIClient("expired-access", "expired-refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.String(), "grant_type=refresh_token") {
+				return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(`{"error":"invalid_grant","error_description":"refresh token expired"}`)), Header: make(http.Header)}, nil
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"error_code":111,"error_msg":"Access token expired"}`)), Header: make(http.Header)}, nil
+		}},
+	})
+
+	_, err := client.List("/Videos")
+	if !errors.Is(err, ErrAuthExpired) {
+		t.Fatalf("expected ErrAuthExpired, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "重新登录") {
+		t.Fatalf("expected reauthorization hint, got %v", err)
+	}
+}
+
 func TestAPIClientDownloadLinkAndReadRange(t *testing.T) {
 	var downloadHit bool
 	var headHit bool

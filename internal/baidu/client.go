@@ -37,8 +37,17 @@ type apiListResponse struct {
 	HasMore   int            `json:"has_more"`
 	Next      int            `json:"next_mark"`
 	ErrorCode int            `json:"error_code"`
+	Errno     int            `json:"errno"`
 	ErrorMsg  string         `json:"error_msg"`
+	ErrMsg    string         `json:"errmsg"`
+	Error     string         `json:"error"`
+	ErrorDesc string         `json:"error_description"`
 }
+
+var (
+	ErrAuthExpired         = errors.New("baidu authentication expired")
+	errAccessTokenRejected = errors.New("baidu access token rejected")
+)
 
 type apiListEntry struct {
 	FSID        int64  `json:"fs_id"`
@@ -154,6 +163,25 @@ func NewAPIClientWithHTTPClients(accessToken, refreshToken, clientID, clientSecr
 }
 
 func (c *APIClient) List(path string) ([]RemoteEntry, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		entries, err := c.list(path)
+		if !errors.Is(err, errAccessTokenRejected) {
+			return entries, err
+		}
+		if attempt > 0 {
+			return nil, reauthorizeError("刷新后的 access token 仍被百度拒绝")
+		}
+		if err := c.RefreshAuth(); err != nil {
+			if errors.Is(err, ErrAuthExpired) {
+				return nil, err
+			}
+			return nil, fmt.Errorf("baidu access token expired and automatic refresh failed: %w", err)
+		}
+	}
+	return nil, errors.New("baidu list authentication retry exhausted")
+}
+
+func (c *APIClient) list(path string) ([]RemoteEntry, error) {
 	var out []RemoteEntry
 	mark := 0
 	for {
@@ -169,8 +197,8 @@ func (c *APIClient) List(path string) ([]RemoteEntry, error) {
 		if err := c.getJSON(c.apiBaseURL+"/rest/2.0/xpan/file?"+values.Encode(), &resp); err != nil {
 			return nil, err
 		}
-		if resp.ErrorCode != 0 && resp.ErrorCode != 109 {
-			return nil, fmt.Errorf("baidu list failed: %s", resp.ErrorMsg)
+		if err := resp.err(); err != nil {
+			return nil, err
 		}
 		for _, item := range resp.Entries {
 			out = append(out, RemoteEntry{
@@ -190,6 +218,47 @@ func (c *APIClient) List(path string) ([]RemoteEntry, error) {
 		mark = resp.Next
 	}
 	return out, nil
+}
+
+func (r apiListResponse) err() error {
+	code := r.ErrorCode
+	if code == 0 {
+		code = r.Errno
+	}
+	if code == 0 || code == 109 {
+		return nil
+	}
+	message := firstNonEmpty(r.ErrorMsg, r.ErrMsg, r.ErrorDesc, r.Error)
+	if message == "" {
+		message = fmt.Sprintf("code=%d", code)
+	}
+	if isAccessTokenError(code, message) {
+		return fmt.Errorf("%w: code=%d message=%s", errAccessTokenRejected, code, message)
+	}
+	return fmt.Errorf("baidu list failed: code=%d message=%s", code, message)
+}
+
+func isAccessTokenError(code int, message string) bool {
+	switch code {
+	case -6, 110, 111:
+		return true
+	}
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "invalid_token") ||
+		(strings.Contains(lower, "access token") && (strings.Contains(lower, "invalid") || strings.Contains(lower, "expired")))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func reauthorizeError(reason string) error {
+	return fmt.Errorf("%w: %s；请重启 BaiduDiskLink，并打开日志中的 OAuth 授权链接重新登录", ErrAuthExpired, reason)
 }
 
 func (c *APIClient) Stat(path string) (RemoteEntry, error) {
@@ -446,7 +515,7 @@ func (c *APIClient) RefreshAuth() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.refreshToken == "" {
-		return errors.New("refresh token is required")
+		return reauthorizeError("缺少 refresh token，无法自动刷新登录")
 	}
 	values := url.Values{}
 	values.Set("grant_type", "refresh_token")
@@ -466,15 +535,29 @@ func (c *APIClient) RefreshAuth() error {
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("refresh failed: %s", strings.TrimSpace(string(body)))
-	}
 	var out struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
+		Error        string `json:"error"`
+		ErrorDesc    string `json:"error_description"`
+		ErrorCode    int    `json:"error_code"`
+		ErrorMsg     string `json:"error_msg"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf("refresh token request failed: status=%d", resp.StatusCode)
+		}
 		return err
+	}
+	if out.Error != "" || out.ErrorCode != 0 {
+		message := firstNonEmpty(out.ErrorDesc, out.ErrorMsg, out.Error)
+		if out.Error == "invalid_grant" || out.Error == "invalid_token" || isAccessTokenError(out.ErrorCode, message) {
+			return reauthorizeError("refresh token 已失效或被撤销")
+		}
+		return fmt.Errorf("refresh token rejected: status=%d error=%s code=%d message=%s", resp.StatusCode, out.Error, out.ErrorCode, message)
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("refresh token request failed: status=%d", resp.StatusCode)
 	}
 	if out.AccessToken == "" {
 		return errors.New("missing access token")

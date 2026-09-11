@@ -78,6 +78,7 @@ type App struct {
 	closeErr      error
 	mu            sync.Mutex
 	refreshCancel context.CancelFunc
+	authNoticeSet bool
 }
 
 type oauthFlow interface {
@@ -294,7 +295,11 @@ func (a *App) run(ctx context.Context) error {
 		if err := a.remoteHealthCheck(); err == nil {
 			return a.mountAndWait(ctx)
 		} else {
-			log.Printf("stored token is not usable, starting oauth flow: %v", err)
+			if errors.Is(err, baidu.ErrAuthExpired) {
+				log.Printf("百度登录已失效，正在启动重新授权流程；请打开下方 OAuth 授权链接重新登录: %v", err)
+			} else {
+				log.Printf("stored token is not usable, starting oauth flow: %v", err)
+			}
 		}
 	} else {
 		log.Printf("stored token is not available, starting oauth flow: %v", err)
@@ -405,14 +410,33 @@ func (a *App) startRefreshLoop(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
-				if err := a.filesystem.RefreshRootOnly(context.Background()); err != nil {
-					log.Printf("periodic refresh failed: %v", err)
-				}
+				a.logPeriodicRefreshResult(a.filesystem.RefreshRootOnly(context.Background()))
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
+}
+
+func (a *App) logPeriodicRefreshResult(err error) {
+	if err == nil {
+		a.mu.Lock()
+		a.authNoticeSet = false
+		a.mu.Unlock()
+		return
+	}
+	if !errors.Is(err, baidu.ErrAuthExpired) {
+		log.Printf("periodic refresh failed: %v", err)
+		return
+	}
+	a.mu.Lock()
+	if a.authNoticeSet {
+		a.mu.Unlock()
+		return
+	}
+	a.authNoticeSet = true
+	a.mu.Unlock()
+	log.Printf("百度登录已失效，无法访问百度网盘；已保留上次成功的目录缓存。请重启 BaiduDiskLink，并打开启动日志中的 OAuth 授权链接重新登录: %v", err)
 }
 
 func (a *App) shutdownOAuth() error {

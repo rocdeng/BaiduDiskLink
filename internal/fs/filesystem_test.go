@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -513,6 +514,35 @@ func TestRefreshRootClearsExistingChildrenWhenRemoteIsEmpty(t *testing.T) {
 	}
 	if fs.negative != nil && fs.negative.IsMissing("/") {
 		t.Fatal("existing empty root was marked missing")
+	}
+}
+
+func TestRefreshRootPreservesExistingChildrenWhenAuthenticationExpires(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "1", Parent: "0", Path: "/Videos", Name: "Videos", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "2", Parent: "1", Path: "/Videos/Movie", Name: "Movie", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	client := &listErrorClient{err: fmt.Errorf("%w: refresh token expired", baidu.ErrAuthExpired)}
+	fs := NewFilesystem(dbStore, remote.NewReader(client), nil, "/Videos")
+
+	if err := fs.refreshRoot(context.Background()); !errors.Is(err, baidu.ErrAuthExpired) {
+		t.Fatalf("expected authentication error, got %v", err)
+	}
+	children, err := dbStore.ListChildren("/Videos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || children[0].Name != "Movie" {
+		t.Fatalf("expected cached children to remain, got %#v", children)
 	}
 }
 

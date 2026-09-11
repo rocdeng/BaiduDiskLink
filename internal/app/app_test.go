@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -540,6 +541,26 @@ func TestRunSkipsOAuthWhenStoredTokenIsUsable(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("run did not exit")
+	}
+}
+
+func TestPeriodicRefreshAuthenticationHintIsRateLimitedUntilRecovery(t *testing.T) {
+	previousWriter := log.Writer()
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	defer log.SetOutput(previousWriter)
+
+	a := &App{}
+	a.logPeriodicRefreshResult(baidu.ErrAuthExpired)
+	a.logPeriodicRefreshResult(baidu.ErrAuthExpired)
+	if got := strings.Count(output.String(), "请重启 BaiduDiskLink"); got != 1 {
+		t.Fatalf("expected one reauthorization hint, got %d: %s", got, output.String())
+	}
+
+	a.logPeriodicRefreshResult(nil)
+	a.logPeriodicRefreshResult(baidu.ErrAuthExpired)
+	if got := strings.Count(output.String(), "请重启 BaiduDiskLink"); got != 2 {
+		t.Fatalf("expected a new hint after recovery, got %d: %s", got, output.String())
 	}
 }
 
