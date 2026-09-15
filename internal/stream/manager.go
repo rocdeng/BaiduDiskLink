@@ -57,6 +57,8 @@ func DefaultConfig() Config {
 	}
 }
 
+const dlinkRefreshCooldown = 2 * time.Minute
+
 type reclaimRequest struct {
 	streamBytes int64
 	readerBytes int64
@@ -112,6 +114,7 @@ type session struct {
 	scheduledEnd   int64
 	hedges         int64
 	dlinkRefreshes int64
+	dlinkRefreshed time.Time
 }
 
 type summaryRequest struct {
@@ -988,8 +991,7 @@ func (m *Manager) startHedge(task *task) {
 	if s := m.sessions[task.key.version]; s != nil {
 		s.hedges++
 		s.slowStreak++
-		if s.slowStreak >= 3 {
-			s.slowStreak = 0
+		if m.shouldRefreshDlinkLocked(s, time.Now()) {
 			s.dlinkRefreshes++
 			invalidate = true
 		}
@@ -1000,7 +1002,9 @@ func (m *Manager) startHedge(task *task) {
 	if invalidate {
 		if invalidator, ok := m.reader.(downloadLinkInvalidator); ok {
 			invalidator.InvalidateDownloadLink(task.file.FSID)
-			log.Printf("stream dlink invalidated fsid=%q reason=consecutive-slow-foreground", task.file.FSID)
+			if m.cfg.Diagnostics {
+				log.Printf("stream dlink invalidated fsid=%q reason=consecutive-slow-foreground", task.file.FSID)
+			}
 		}
 	}
 	go func() {
@@ -1012,6 +1016,18 @@ func (m *Manager) startHedge(task *task) {
 		}
 		m.publishHedge(task, data)
 	}()
+}
+
+func (m *Manager) shouldRefreshDlinkLocked(s *session, now time.Time) bool {
+	if s == nil || s.slowStreak < 3 {
+		return false
+	}
+	s.slowStreak = 0
+	if !s.dlinkRefreshed.IsZero() && now.Sub(s.dlinkRefreshed) < dlinkRefreshCooldown {
+		return false
+	}
+	s.dlinkRefreshed = now
+	return true
 }
 
 func (m *Manager) publishHedge(task *task, data []byte) bool {

@@ -410,7 +410,12 @@ func (a *App) startRefreshLoop(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
-				a.logPeriodicRefreshResult(a.filesystem.RefreshRootOnly(context.Background()))
+				if err := a.filesystem.RefreshRootOnly(context.Background()); err != nil {
+					a.logPeriodicRefreshResult(err)
+					continue
+				}
+				a.logPeriodicRefreshResult(nil)
+				log.Printf("本轮扫描结束，下轮扫描时间 %s", time.Now().Add(time.Minute).Format("15:04:05"))
 			case <-ctx.Done():
 				return
 			}

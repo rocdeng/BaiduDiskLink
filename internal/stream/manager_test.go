@@ -136,6 +136,37 @@ func TestDefaultConfigUsesOneMiBChunksAndLegacyReadThresholds(t *testing.T) {
 	}
 }
 
+func TestDlinkRefreshCooldownSuppressesRepeatedInvalidation(t *testing.T) {
+	manager := &Manager{cfg: DefaultConfig()}
+	session := &session{}
+	now := time.Unix(100, 0)
+
+	for index := 0; index < 2; index++ {
+		session.slowStreak++
+		if manager.shouldRefreshDlinkLocked(session, now) {
+			t.Fatal("dlink should not refresh before three slow hedges")
+		}
+	}
+	session.slowStreak++
+	if !manager.shouldRefreshDlinkLocked(session, now) {
+		t.Fatal("expected dlink refresh after three slow hedges")
+	}
+
+	for index := 0; index < 3; index++ {
+		session.slowStreak++
+	}
+	if manager.shouldRefreshDlinkLocked(session, now.Add(dlinkRefreshCooldown-time.Nanosecond)) {
+		t.Fatal("dlink refresh should be suppressed during cooldown")
+	}
+
+	for index := 0; index < 3; index++ {
+		session.slowStreak++
+	}
+	if !manager.shouldRefreshDlinkLocked(session, now.Add(dlinkRefreshCooldown)) {
+		t.Fatal("expected dlink refresh after cooldown")
+	}
+}
+
 func TestManagerReclaimsMemoryAfterTenMinuteIdleWindow(t *testing.T) {
 	manager := testManager(t, newControlledReader(), func(cfg *Config) {
 		cfg.IdleReclaim = 20 * time.Millisecond
@@ -691,6 +722,11 @@ func TestManagerHedgesSlowForegroundChunkOnlyOnce(t *testing.T) {
 }
 
 func TestManagerInvalidatesLinkAfterConsecutiveSlowForegroundChunks(t *testing.T) {
+	previousWriter := log.Writer()
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	defer log.SetOutput(previousWriter)
+
 	reader := newControlledReader()
 	first := make(chan struct{})
 	second := make(chan struct{})
@@ -721,6 +757,9 @@ func TestManagerInvalidatesLinkAfterConsecutiveSlowForegroundChunks(t *testing.T
 	reader.mu.Unlock()
 	if invalidated != 1 {
 		t.Fatalf("expected one dlink invalidation, got %d", invalidated)
+	}
+	if strings.Contains(output.String(), "stream dlink invalidated") {
+		t.Fatal("dlink invalidation should be hidden when diagnostics are disabled")
 	}
 }
 
