@@ -2,34 +2,50 @@ package baidu
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"baidudisklink/internal/redact"
 )
 
-import "context"
-
-import "net"
-
 type APIClient struct {
-	mu             sync.Mutex
-	accessToken    string
-	refreshToken   string
+	// mu 只保护内存状态，绝不在持有期间发起网络请求。
+	mu           sync.Mutex
+	accessToken  string
+	refreshToken string
+	tokenVersion uint64
+	links        map[string]DownloadLink
+	linkFlights  map[string]*linkCall
+
+	// authMu 串行化 token 刷新，避免并发失败时 refresh_token 被连续轮换。
+	authMu sync.Mutex
+
 	clientID       string
 	clientSecret   string
 	tokenURL       string
 	apiBaseURL     string
 	metadataClient *http.Client
+	linkClient     *http.Client
 	downloadClient *http.Client
 	onTokenUpdate  func(accessToken, refreshToken string) error
-	links          map[string]DownloadLink
+}
+
+// linkCall 合并同一 fsid 的并发直链解析（singleflight）。
+type linkCall struct {
+	done chan struct{}
+	link DownloadLink
+	err  error
 }
 
 type apiListResponse struct {
@@ -47,6 +63,9 @@ type apiListResponse struct {
 var (
 	ErrAuthExpired         = errors.New("baidu authentication expired")
 	errAccessTokenRejected = errors.New("baidu access token rejected")
+	// ErrDownloadStalled 表示连接在 downloadIdleTimeout 内没有收到任何新字节。
+	// 错误文本包含 timeout，便于上层按传输错误分类重试。
+	ErrDownloadStalled = errors.New("download stalled: idle timeout")
 )
 
 type apiListEntry struct {
@@ -65,6 +84,7 @@ type apiFileMetaResponse struct {
 	List      []apiFileMeta `json:"list"`
 	ErrorCode int           `json:"errno"`
 	ErrorMsg  string        `json:"error_msg"`
+	ErrMsg    string        `json:"errmsg"`
 }
 
 type apiFileManagerResponse struct {
@@ -87,8 +107,9 @@ type apiFileMeta struct {
 
 func NewMetadataHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: newHTTPTransport(2, 15*time.Second),
+		Timeout: 30 * time.Second,
+		// list、filemetas 都访问 pan.baidu.com；保留少量并发，避免直链解析排在目录刷新后面。
+		Transport: newHTTPTransport(4, 15*time.Second),
 	}
 }
 
@@ -99,7 +120,7 @@ func NewDownloadHTTPClient(concurrency int) *http.Client {
 	}
 	return &http.Client{
 		Timeout:   downloadClientTimeout,
-		Transport: newHTTPTransport(perHost, 30*time.Second),
+		Transport: newHTTPTransport(perHost, downloadHeaderTimeout),
 	}
 }
 
@@ -121,6 +142,15 @@ func newHTTPTransport(perHost int, responseHeaderTimeout time.Duration) *http.Tr
 var (
 	downloadRangeTimeout  = 60 * time.Second
 	downloadClientTimeout = 75 * time.Second
+	downloadHeaderTimeout = 15 * time.Second
+	// downloadIdleTimeout：响应体连续这么久没有新字节就判定连接停滞，中止并交给上层重试。
+	downloadIdleTimeout = 8 * time.Second
+)
+
+const (
+	downloadLinkTTL = 10 * time.Minute
+	// downloadLinkRefreshAhead：直链剩余有效期低于该值时后台提前刷新，前台继续使用旧链接。
+	downloadLinkRefreshAhead = 2 * time.Minute
 )
 
 func NewAPIClient(accessToken, refreshToken, clientID, clientSecret string, httpClient *http.Client) *APIClient {
@@ -148,6 +178,11 @@ func NewAPIClientWithHTTPClients(accessToken, refreshToken, clientID, clientSecr
 	if tokenURL == "" {
 		tokenURL = "https://openapi.baidu.com/oauth/2.0/token"
 	}
+	// 直链解析需要拿到 302 的 Location，不跟随跳转；复用元数据 transport。
+	linkClient := *metadataClient
+	linkClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	return &APIClient{
 		accessToken:    accessToken,
 		refreshToken:   refreshToken,
@@ -156,22 +191,25 @@ func NewAPIClientWithHTTPClients(accessToken, refreshToken, clientID, clientSecr
 		tokenURL:       tokenURL,
 		apiBaseURL:     apiBaseURL,
 		metadataClient: metadataClient,
+		linkClient:     &linkClient,
 		downloadClient: downloadClient,
 		onTokenUpdate:  onTokenUpdate,
 		links:          make(map[string]DownloadLink),
+		linkFlights:    make(map[string]*linkCall),
 	}
 }
 
 func (c *APIClient) List(path string) ([]RemoteEntry, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		entries, err := c.list(path)
+		token, version := c.tokenState()
+		entries, err := c.list(path, token)
 		if !errors.Is(err, errAccessTokenRejected) {
 			return entries, err
 		}
 		if attempt > 0 {
 			return nil, reauthorizeError("刷新后的 access token 仍被百度拒绝")
 		}
-		if err := c.RefreshAuth(); err != nil {
+		if err := c.refreshAuthIfUnchanged(version); err != nil {
 			if errors.Is(err, ErrAuthExpired) {
 				return nil, err
 			}
@@ -181,13 +219,13 @@ func (c *APIClient) List(path string) ([]RemoteEntry, error) {
 	return nil, errors.New("baidu list authentication retry exhausted")
 }
 
-func (c *APIClient) list(path string) ([]RemoteEntry, error) {
+func (c *APIClient) list(path, token string) ([]RemoteEntry, error) {
 	var out []RemoteEntry
 	mark := 0
 	for {
 		values := url.Values{}
 		values.Set("method", "list")
-		values.Set("access_token", c.token())
+		values.Set("access_token", token)
 		values.Set("dir", path)
 		values.Set("limit", "200")
 		if mark > 0 {
@@ -284,13 +322,87 @@ func (c *APIClient) Stat(path string) (RemoteEntry, error) {
 	return metaToRemote(entries[0]), nil
 }
 
+// GetDownloadLink 返回 fsid 的直链：
+//   - 缓存有效：直接返回；如临近过期，后台异步刷新（不阻塞前台）。
+//   - 缓存缺失：同一 fsid 的并发调用只解析一次。
 func (c *APIClient) GetDownloadLink(fsid string) (DownloadLink, error) {
 	if link, ok := c.cachedDownloadLink(fsid); ok {
+		if !link.ExpiresAt.IsZero() && time.Until(link.ExpiresAt) < downloadLinkRefreshAhead {
+			c.refreshDownloadLinkAsync(fsid)
+		}
 		return link, nil
 	}
+	call, owner := c.beginLinkCall(fsid)
+	if !owner {
+		<-call.done
+		return call.link, call.err
+	}
+	link, err := c.fetchDownloadLink(fsid)
+	c.finishLinkCall(fsid, call, link, err)
+	return link, err
+}
+
+func (c *APIClient) refreshDownloadLinkAsync(fsid string) {
+	call, owner := c.beginLinkCall(fsid)
+	if !owner {
+		return
+	}
+	go func() {
+		link, err := c.fetchDownloadLink(fsid)
+		if err != nil {
+			log.Printf("background dlink refresh failed fsid=%q: %v", fsid, err)
+		}
+		c.finishLinkCall(fsid, call, link, err)
+	}()
+}
+
+func (c *APIClient) beginLinkCall(fsid string) (*linkCall, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if call := c.linkFlights[fsid]; call != nil {
+		return call, false
+	}
+	call := &linkCall{done: make(chan struct{})}
+	c.linkFlights[fsid] = call
+	return call, true
+}
+
+func (c *APIClient) finishLinkCall(fsid string, call *linkCall, link DownloadLink, err error) {
+	c.mu.Lock()
+	// 解析期间若被 InvalidateDownloadLink 作废，结果只交给已在等待的调用方，不写回缓存。
+	if c.linkFlights[fsid] == call {
+		delete(c.linkFlights, fsid)
+		if err == nil {
+			c.links[fsid] = link
+		}
+	}
+	call.link = link
+	call.err = err
+	close(call.done)
+	c.mu.Unlock()
+}
+
+func (c *APIClient) fetchDownloadLink(fsid string) (DownloadLink, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		token, version := c.tokenState()
+		link, err := c.fetchDownloadLinkOnce(fsid, token)
+		if !errors.Is(err, errAccessTokenRejected) {
+			return link, err
+		}
+		if attempt > 0 {
+			return DownloadLink{}, reauthorizeError("刷新后的 access token 仍被百度拒绝")
+		}
+		if err := c.refreshAuthIfUnchanged(version); err != nil {
+			return DownloadLink{}, err
+		}
+	}
+	return DownloadLink{}, errors.New("baidu dlink authentication retry exhausted")
+}
+
+func (c *APIClient) fetchDownloadLinkOnce(fsid, token string) (DownloadLink, error) {
 	values := url.Values{}
 	values.Set("method", "filemetas")
-	values.Set("access_token", c.token())
+	values.Set("access_token", token)
 	values.Set("fsids", fmt.Sprintf("[%s]", fsid))
 	values.Set("dlink", "1")
 	var resp apiFileMetaResponse
@@ -298,7 +410,11 @@ func (c *APIClient) GetDownloadLink(fsid string) (DownloadLink, error) {
 		return DownloadLink{}, err
 	}
 	if resp.ErrorCode != 0 {
-		return DownloadLink{}, fmt.Errorf("baidu dlink failed: %s", resp.ErrorMsg)
+		message := firstNonEmpty(resp.ErrorMsg, resp.ErrMsg)
+		if isAccessTokenError(resp.ErrorCode, message) {
+			return DownloadLink{}, fmt.Errorf("%w: code=%d message=%s", errAccessTokenRejected, resp.ErrorCode, message)
+		}
+		return DownloadLink{}, fmt.Errorf("baidu dlink failed: code=%d message=%s", resp.ErrorCode, message)
 	}
 	entries := resp.Entries
 	if len(entries) == 0 {
@@ -311,13 +427,11 @@ func (c *APIClient) GetDownloadLink(fsid string) (DownloadLink, error) {
 	if link == "" {
 		return DownloadLink{}, errors.New("missing download link")
 	}
-	finalURL, err := c.resolveDownloadURL(link)
+	finalURL, err := c.resolveDownloadURL(link, token)
 	if err != nil {
 		return DownloadLink{}, err
 	}
-	out := DownloadLink{URL: finalURL, ExpiresAt: time.Now().Add(10 * time.Minute)}
-	c.cacheDownloadLink(fsid, out)
-	return out, nil
+	return DownloadLink{URL: finalURL, ExpiresAt: time.Now().Add(downloadLinkTTL)}, nil
 }
 
 func (c *APIClient) InvalidateDownloadLink(fsid string) {
@@ -326,6 +440,8 @@ func (c *APIClient) InvalidateDownloadLink(fsid string) {
 	}
 	c.mu.Lock()
 	delete(c.links, fsid)
+	// 正在进行的解析可能拿到同一个坏节点，让后续调用重新发起解析。
+	delete(c.linkFlights, fsid)
 	c.mu.Unlock()
 }
 
@@ -407,30 +523,39 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	if err != nil {
 		return 0, err
 	}
-	downloadCtx := ctx
-	cancel := func() {}
+	// stallCtx 由停滞看门狗取消；其上再叠加整体超时。
+	stallCtx, cancelStall := context.WithCancelCause(ctx)
+	defer cancelStall(nil)
+	downloadCtx := stallCtx
 	if downloadRangeTimeout > 0 {
-		downloadCtx, cancel = context.WithTimeout(ctx, downloadRangeTimeout)
+		var cancel context.CancelFunc
+		downloadCtx, cancel = context.WithTimeout(stallCtx, downloadRangeTimeout)
+		defer cancel()
 	}
-	defer cancel()
 	req, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, link.URL, nil)
 	if err != nil {
-		return 0, err
+		return 0, redact.Error(err)
 	}
 	end := offset + int64(len(dst)) - 1
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
 	req.Header.Set("User-Agent", "pan.baidu.com")
 	resp, err := c.downloadClient.Do(req)
 	if err != nil {
-		if ctxErr := downloadCtx.Err(); ctxErr != nil {
-			c.downloadClient.CloseIdleConnections()
-			return 0, fmt.Errorf("download range timed out or canceled: %w", ctxErr)
+		err = redact.Error(err)
+		if downloadCtx.Err() != nil {
+			// 被取消的请求由 transport 自行关闭对应连接，不再清空整个连接池。
+			return 0, fmt.Errorf("download range timed out or canceled: %w", err)
 		}
 		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPartialContent {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone:
+			// CDN 签名/直链失效：作废直链，下次重新解析；不是 OAuth token 的问题。
+			c.InvalidateDownloadLink(fsid)
+		}
 		return 0, fmt.Errorf("download range failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	start, rangeEnd, total, err := parseContentRange(resp.Header.Get("Content-Range"))
@@ -446,15 +571,22 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	if rangeEnd < end && !(total >= 0 && rangeEnd == total-1) {
 		return 0, fmt.Errorf("download content range ends at %d before requested end %d: %w", rangeEnd, end, io.ErrUnexpectedEOF)
 	}
+	var watchdog *time.Timer
+	if downloadIdleTimeout > 0 {
+		watchdog = time.AfterFunc(downloadIdleTimeout, func() { cancelStall(ErrDownloadStalled) })
+		defer watchdog.Stop()
+	}
 	want := int(rangeEnd - start + 1)
 	n := 0
 	for n < want {
 		readN, readErr := resp.Body.Read(dst[n:want])
 		n += readN
+		if readN > 0 && watchdog != nil {
+			watchdog.Reset(downloadIdleTimeout)
+		}
 		if readErr != nil {
-			if ctxErr := downloadCtx.Err(); ctxErr != nil {
-				c.downloadClient.CloseIdleConnections()
-				return n, fmt.Errorf("download range body timeout after %d of %d bytes: %w", n, want, ctxErr)
+			if ctxErr := downloadContextError(downloadCtx, n, want); ctxErr != nil {
+				return n, ctxErr
 			}
 			if errors.Is(readErr, io.EOF) && n == want {
 				break
@@ -472,38 +604,43 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 	if extraN, extraErr := resp.Body.Read(extra[:]); extraN > 0 {
 		return n, fmt.Errorf("download range exceeded declared length %d", want)
 	} else if extraErr != nil && !errors.Is(extraErr, io.EOF) {
-		if ctxErr := downloadCtx.Err(); ctxErr != nil {
-			c.downloadClient.CloseIdleConnections()
-			return n, fmt.Errorf("download range body timeout after %d of %d bytes: %w", n, want, ctxErr)
+		if ctxErr := downloadContextError(downloadCtx, n, want); ctxErr != nil {
+			return n, ctxErr
 		}
 		return n, extraErr
 	}
 	return n, nil
 }
 
-func (c *APIClient) resolveDownloadURL(link string) (string, error) {
+func downloadContextError(ctx context.Context, n, want int) error {
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return nil
+	}
+	if errors.Is(context.Cause(ctx), ErrDownloadStalled) {
+		return fmt.Errorf("download range stalled after %d of %d bytes: %w", n, want, ErrDownloadStalled)
+	}
+	return fmt.Errorf("download range body timeout after %d of %d bytes: %w", n, want, ctxErr)
+}
+
+func (c *APIClient) resolveDownloadURL(link, token string) (string, error) {
 	req, err := http.NewRequest(http.MethodHead, link, nil)
 	if err != nil {
-		return "", err
+		return "", redact.Error(err)
 	}
 	req.Header.Set("User-Agent", "pan.baidu.com")
 	q := req.URL.Query()
-	q.Set("access_token", c.token())
+	q.Set("access_token", token)
 	req.URL.RawQuery = q.Encode()
 
-	client := *c.metadataClient
-	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	resp, err := client.Do(req)
+	resp, err := c.linkClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", redact.Error(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", fmt.Errorf("download head failed: %s", strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("download head failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	if location := resp.Header.Get("Location"); location != "" {
 		return location, nil
@@ -511,27 +648,44 @@ func (c *APIClient) resolveDownloadURL(link string) (string, error) {
 	return link, nil
 }
 
+// RefreshAuth 强制刷新 access token。
 func (c *APIClient) RefreshAuth() error {
+	_, version := c.tokenState()
+	return c.refreshAuthIfUnchanged(version)
+}
+
+// refreshAuthIfUnchanged 仅当 token 版本仍是调用方观察到的版本时才刷新；
+// 其他 goroutine 已经刷新过时直接返回，避免重复轮换 refresh_token。
+func (c *APIClient) refreshAuthIfUnchanged(seenVersion uint64) error {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.refreshToken == "" {
+	if c.tokenVersion != seenVersion {
+		c.mu.Unlock()
+		return nil
+	}
+	refreshToken := c.refreshToken
+	c.mu.Unlock()
+
+	if refreshToken == "" {
 		return reauthorizeError("缺少 refresh token，无法自动刷新登录")
 	}
 	values := url.Values{}
 	values.Set("grant_type", "refresh_token")
-	values.Set("refresh_token", c.refreshToken)
+	values.Set("refresh_token", refreshToken)
 	values.Set("client_id", c.clientID)
 	values.Set("client_secret", c.clientSecret)
 	req, err := http.NewRequest(http.MethodGet, c.tokenURL+"?"+values.Encode(), nil)
 	if err != nil {
-		return err
+		return redact.Error(err)
 	}
 	resp, err := c.metadataClient.Do(req)
 	if err != nil {
-		return err
+		return redact.Error(err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return err
 	}
@@ -562,13 +716,20 @@ func (c *APIClient) RefreshAuth() error {
 	if out.AccessToken == "" {
 		return errors.New("missing access token")
 	}
+
+	c.mu.Lock()
 	c.accessToken = out.AccessToken
 	if out.RefreshToken != "" {
 		c.refreshToken = out.RefreshToken
 	}
+	c.tokenVersion++
 	c.links = make(map[string]DownloadLink)
+	c.linkFlights = make(map[string]*linkCall)
+	accessToken, newRefresh := c.accessToken, c.refreshToken
+	c.mu.Unlock()
+
 	if c.onTokenUpdate != nil {
-		if err := c.onTokenUpdate(c.accessToken, c.refreshToken); err != nil {
+		if err := c.onTokenUpdate(accessToken, newRefresh); err != nil {
 			return err
 		}
 	}
@@ -576,9 +737,14 @@ func (c *APIClient) RefreshAuth() error {
 }
 
 func (c *APIClient) token() string {
+	token, _ := c.tokenState()
+	return token
+}
+
+func (c *APIClient) tokenState() (string, uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.accessToken
+	return c.accessToken, c.tokenVersion
 }
 
 func (c *APIClient) cachedDownloadLink(fsid string) (DownloadLink, bool) {
@@ -595,16 +761,10 @@ func (c *APIClient) cachedDownloadLink(fsid string) (DownloadLink, bool) {
 	return link, true
 }
 
-func (c *APIClient) cacheDownloadLink(fsid string, link DownloadLink) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.links[fsid] = link
-}
-
 func (c *APIClient) getJSON(rawurl string, out any) error {
 	req, err := http.NewRequest(http.MethodGet, rawurl, nil)
 	if err != nil {
-		return err
+		return redact.Error(err)
 	}
 	return c.doJSON(req, out)
 }
@@ -612,17 +772,24 @@ func (c *APIClient) getJSON(rawurl string, out any) error {
 func (c *APIClient) doJSON(req *http.Request, out any) error {
 	resp, err := c.metadataClient.Do(req)
 	if err != nil {
-		return err
+		return redact.Error(err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("baidu api failed: %s", bytes.TrimSpace(body))
+		return fmt.Errorf("baidu api failed: status=%d body=%s", resp.StatusCode, bytes.TrimSpace(limitBytes(body, 512)))
 	}
 	return json.Unmarshal(body, out)
+}
+
+func limitBytes(data []byte, max int) []byte {
+	if len(data) > max {
+		return data[:max]
+	}
+	return data
 }
 
 func metaToRemote(m apiFileMeta) RemoteEntry {

@@ -16,6 +16,7 @@ import "context"
 type Reader struct {
 	mu          sync.RWMutex
 	client      baidu.Client
+	clientGen   uint64
 	links       map[string]cachedLink
 	cached      map[cacheKey]cachedRead
 	cacheByFSID map[string]map[cacheKey]struct{}
@@ -131,6 +132,7 @@ func (r *Reader) SetClient(client baidu.Client) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.client = client
+	r.clientGen++
 	r.links = make(map[string]cachedLink)
 	r.clearReadCacheLocked()
 }
@@ -269,7 +271,8 @@ func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length
 			return nil, ctx.Err()
 		}
 		if ClassifyDownloadError(err) == DownloadErrorAuth {
-			_ = client.RefreshAuth()
+			// CDN 401/403 多为直链签名失效：作废直链重新解析；token 失效由 API 层识别并刷新。
+			r.InvalidateDownloadLink(fsid)
 		}
 	}
 	return nil, lastErr
@@ -293,7 +296,8 @@ func (r *Reader) ReadStreamRange(ctx context.Context, fsid string, offset, lengt
 	}
 	if err != nil {
 		if ClassifyDownloadError(err) == DownloadErrorAuth {
-			_ = client.RefreshAuth()
+			// CDN 401/403 多为直链签名失效：作废直链重新解析；token 失效由 API 层识别并刷新。
+			r.InvalidateDownloadLink(fsid)
 		}
 		return nil, err
 	}
@@ -474,7 +478,8 @@ func (r *Reader) readSequential(ctx context.Context, client baidu.Client, fsid s
 			return nil, ctx.Err()
 		}
 		if ClassifyDownloadError(err) == DownloadErrorAuth {
-			_ = client.RefreshAuth()
+			// CDN 401/403 多为直链签名失效：作废直链重新解析；token 失效由 API 层识别并刷新。
+			r.InvalidateDownloadLink(fsid)
 		}
 	}
 	r.finishInflight(fsid, fetchOffset, inflight, nil, lastErr)
@@ -657,7 +662,8 @@ func (r *Reader) readChunk(ctx context.Context, client baidu.Client, fsid string
 			return nil, ctx.Err()
 		}
 		if ClassifyDownloadError(err) == DownloadErrorAuth {
-			_ = client.RefreshAuth()
+			// CDN 401/403 多为直链签名失效：作废直链重新解析；token 失效由 API 层识别并刷新。
+			r.InvalidateDownloadLink(fsid)
 		}
 	}
 	r.finishInflight(fsid, offset, inflight, nil, lastErr)
@@ -665,11 +671,14 @@ func (r *Reader) readChunk(ctx context.Context, client baidu.Client, fsid string
 }
 
 func (r *Reader) downloadLink(fsid string, client baidu.Client) (baidu.DownloadLink, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cached, ok := r.links[fsid]; ok && time.Now().Before(cached.expiresAt) {
+	r.mu.RLock()
+	cached, ok := r.links[fsid]
+	generation := r.clientGen
+	r.mu.RUnlock()
+	if ok && time.Now().Before(cached.expiresAt) {
 		return cached.link, nil
 	}
+	// 网络请求不持有 r.mu，避免阻塞同一 Reader 上的缓存读取与其他文件的读请求。
 	link, err := client.GetDownloadLink(fsid)
 	if err != nil {
 		return baidu.DownloadLink{}, err
@@ -678,7 +687,12 @@ func (r *Reader) downloadLink(fsid string, client baidu.Client) (baidu.DownloadL
 	if expiresAt.IsZero() {
 		expiresAt = time.Now().Add(10 * time.Minute)
 	}
-	r.links[fsid] = cachedLink{link: link, expiresAt: expiresAt}
+	r.mu.Lock()
+	// SetClient 期间换了客户端时不写回旧客户端的直链。
+	if r.clientGen == generation {
+		r.links[fsid] = cachedLink{link: link, expiresAt: expiresAt}
+	}
+	r.mu.Unlock()
 	return link, nil
 }
 

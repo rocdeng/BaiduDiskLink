@@ -16,6 +16,8 @@ type File struct {
 	FSID string
 	Size int64
 	MTM  int64
+	// version 由 Manager.Open 预先计算并缓存，避免读路径上每个分片都重新拼接字符串。
+	version string
 }
 
 type chunkKey struct {
@@ -82,6 +84,13 @@ func fileVersion(file File) string {
 }
 
 func chunkVersion(file File, chunkSize int64) string {
+	if file.version != "" {
+		return file.version
+	}
+	return computeChunkVersion(file, chunkSize)
+}
+
+func computeChunkVersion(file File, chunkSize int64) string {
 	return fileVersion(file) + "-chunk-" + strconv.FormatInt(chunkSize, 10)
 }
 

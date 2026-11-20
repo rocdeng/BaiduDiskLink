@@ -14,6 +14,9 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
+
+	"baidudisklink/internal/redact"
 )
 
 type OAuthResult struct {
@@ -65,7 +68,15 @@ func (s *OAuthServer) Start(addr string) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", s.handleCallback)
-	s.server = &http.Server{Addr: addr, Handler: mux}
+	s.server = &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -189,7 +200,8 @@ func ExchangeToken(cfg OAuthConfig, code string, client *http.Client) (Token, er
 	}
 	resp, err := client.Get(endpoint)
 	if err != nil {
-		return Token{}, err
+		// endpoint 中包含 code 与 client_secret，返回前脱敏。
+		return Token{}, redact.Error(err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)

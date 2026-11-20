@@ -66,7 +66,7 @@ func TestNewDownloadHTTPClientConfiguresConnectionPool(t *testing.T) {
 	if transport.MaxConnsPerHost != 12 || transport.MaxIdleConnsPerHost != 12 {
 		t.Fatalf("unexpected per-host limits: active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
 	}
-	if !transport.DisableCompression || transport.ResponseHeaderTimeout != 30*time.Second {
+	if !transport.DisableCompression || transport.ResponseHeaderTimeout != downloadHeaderTimeout {
 		t.Fatalf("unexpected download transport: %#v", transport)
 	}
 }
@@ -114,7 +114,7 @@ func TestAPIClientSeparatesMetadataAndDownloadClients(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("abc")), Header: header}, nil
 	}}}
 	client := NewAPIClientWithHTTPClients("token", "refresh", "client", "secret", "", "", metadataClient, downloadClient, nil)
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	if _, err := client.List("/"); err != nil {
 		t.Fatal(err)
@@ -129,7 +129,7 @@ func TestAPIClientSeparatesMetadataAndDownloadClients(t *testing.T) {
 
 func TestAPIClientInvalidateDownloadLink(t *testing.T) {
 	client := NewAPIClient("token", "refresh", "client", "secret", nil)
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 	client.InvalidateDownloadLink("1")
 	if _, ok := client.cachedDownloadLink("1"); ok {
 		t.Fatal("download link cache was not invalidated")
@@ -264,7 +264,7 @@ func TestAPIClientReadRangeReadsDirectlyIntoDestination(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(body), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, dst)
 	if err != nil {
@@ -288,7 +288,7 @@ func TestAPIClientReadRangePreservesFinalBodyError(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(body), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
 	if n != 3 || !errors.Is(err, finalErr) {
@@ -312,7 +312,7 @@ func TestAPIClientReadRangeTimesOutStalledBody(t *testing.T) {
 	defer server.Close()
 
 	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{Timeout: time.Second})
-	client.links["1"] = DownloadLink{URL: server.URL, ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: server.URL, ExpiresAt: time.Now().Add(time.Hour)}
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
 	if err == nil {
 		t.Fatal("expected stalled body to time out")
@@ -334,7 +334,7 @@ func TestAPIClientReadRangeAcceptsEOFWithCompleteFinalRead(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(body), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	dst := make([]byte, 3)
 	n, err := client.ReadRange(context.Background(), "1", 0, dst)
@@ -351,7 +351,7 @@ func TestAPIClientReadRangeRejectsTruncatedBody(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("ab")), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
 	if err == nil {
@@ -367,7 +367,7 @@ func TestAPIClientReadRangeMapsEmptyBodyToUnexpectedEOF(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("")), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
 	if n != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -383,7 +383,7 @@ func TestAPIClientReadRangeRejectsShortRangeBeforeEOF(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("ab")), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -399,7 +399,7 @@ func TestAPIClientReadRangeRejectsRangePastRequest(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("abcde")), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
 	if err == nil {

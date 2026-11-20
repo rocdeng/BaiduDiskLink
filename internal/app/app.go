@@ -35,7 +35,10 @@ type Config struct {
 	MetaDBPath          string
 	FuseGroupName       string
 	FuseTraceReads      bool
+	FuseDefaultPerms    bool
 	EnableDelete        bool
+	MetadataTTLSeconds  int
+	RootRefreshSeconds  int
 	DownloadConcurrency int
 	DownloadChunkSize   int64
 	StreamChunkSize     int64
@@ -209,8 +212,9 @@ func New(cfg Config) (*App, error) {
 		},
 		mountFunc: func(mountPath string, root *fs.Filesystem) (*fakeMountServer, error) {
 			server, err := fs.Mount(mountPath, root, fs.MountOptions{
-				AllowOther: true,
-				GIDs:       fuseGIDs,
+				AllowOther:         true,
+				GIDs:               fuseGIDs,
+				DefaultPermissions: cfg.FuseDefaultPerms,
 			})
 			if err != nil {
 				return nil, err
@@ -272,9 +276,11 @@ func sqliteDSN(path string) string {
 		return ""
 	}
 	if strings.Contains(path, "?") {
-		return path + "&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+		return path + "&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 	}
-	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	// _txlock=immediate：事务开始即拿写锁。WAL 下“先读后写”的延迟事务在并发写入时会直接返回
+	// SQLITE_BUSY（不走 busy_timeout），导致并发目录刷新失败。
+	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 }
 
 func (a *App) Run() error {
@@ -367,6 +373,9 @@ func (a *App) mountAndWait(ctx context.Context) error {
 	a.filesystem = fs.NewFilesystemWithStream(a.store, a.remote, a.stream, a.fuseGIDs, a.cfg.RemoteRootPath)
 	a.filesystem.SetTraceReads(a.cfg.FuseTraceReads)
 	a.filesystem.SetDeleteEnabled(a.cfg.EnableDelete)
+	if a.cfg.MetadataTTLSeconds > 0 {
+		a.filesystem.SetMetadataTTL(time.Duration(a.cfg.MetadataTTLSeconds) * time.Second)
+	}
 	if err := a.filesystem.RefreshRootOnly(context.Background()); err != nil {
 		return fmt.Errorf("preload mount root: %w", err)
 	}
@@ -404,8 +413,12 @@ func (a *App) startRefreshLoop(ctx context.Context) {
 	if a == nil || a.filesystem == nil {
 		return
 	}
+	interval := time.Minute
+	if a.cfg.RootRefreshSeconds > 0 {
+		interval = time.Duration(a.cfg.RootRefreshSeconds) * time.Second
+	}
 	go func() {
-		ticker := time.NewTicker(time.Minute)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -415,7 +428,7 @@ func (a *App) startRefreshLoop(ctx context.Context) {
 					continue
 				}
 				a.logPeriodicRefreshResult(nil)
-				log.Printf("本轮扫描结束，下轮扫描时间 %s", time.Now().Add(time.Minute).Format("15:04:05"))
+				log.Printf("本轮扫描结束，下轮扫描时间 %s", time.Now().Add(interval).Format("15:04:05"))
 			case <-ctx.Done():
 				return
 			}

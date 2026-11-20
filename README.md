@@ -384,6 +384,13 @@ DSM 上普通 Linux 权限和 DSM 共享目录权限不是一回事。最稳的�
 3. 让 `BAIDUDISKLINK_HOST_MOUNT_PATH` 指向这个共享目录
 4. 如果还需要 Linux 组权限，设置 `BAIDUDISKLINK_FUSE_GROUP_NAME`
 
+默认情况下内核**不检查**挂载文件的权限位，`ls -la` 显示的 `0640`/组只是展示，任何能访问挂载目录的本地用户都能读取。如果需要真正的组隔离，设置 `BAIDUDISKLINK_FUSE_DEFAULT_PERMISSIONS=1`：
+
+- 未设置 `BAIDUDISKLINK_FUSE_GROUP_NAME`：目录 `0755`、文件 `0644`，所有本地用户可读。
+- 设置了 `BAIDUDISKLINK_FUSE_GROUP_NAME`：目录 `0750`、文件 `0640`，只有 root 和该组成员可读。开启前请确认 Emby 服务用户在这个组里，否则 Emby 会读不到文件。
+- 同时开启 `BAIDUDISKLINK_ENABLE_DELETE` 时，目录会额外加上写权限（有组时 `0770`，无组时 `0777`），否则内核会拒绝删除。
+
+目录缓存默认 5 分钟（`BAIDUDISKLINK_METADATA_TTL_SECONDS`）。过期后先返回旧的目录内容，后台再刷新，不会因为百度接口变慢阻塞播放器打开文件。
 不要把源码目录直接当成最终挂载目录，也不要把挂载点放进一个没有 DSM 共享目录语义的普通路径里。这样即使 `ls -la` 看起来权限没问题，DSM 套件用户也可能访问不到。
 
 ## 常见问题

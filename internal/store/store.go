@@ -193,6 +193,35 @@ func (s *Store) GetByPath(path string) (*Entry, error) {
 	return &e, nil
 }
 
+// GetChild 按 (parent_fsid, name) 精确查找单个子项，供 FUSE Lookup 使用，避免整目录扫描。
+func (s *Store) GetChild(parentFSID, name string) (*Entry, error) {
+	if s == nil {
+		return nil, errors.New("store is nil")
+	}
+	if s.db == nil {
+		return nil, errors.New("db is required")
+	}
+	row := s.db.QueryRow(`
+		select id, fsid, parent_fsid, path, name, size, is_dir, mtime, md5, last_sync_at, expires_at, negative
+		from entries
+		where parent_fsid = ? and name = ?
+		order by id desc
+		limit 1
+	`, parentFSID, name)
+	var e Entry
+	var isDir int
+	var negative int
+	if err := row.Scan(&e.ID, &e.FSID, &e.Parent, &e.Path, &e.Name, &e.Size, &isDir, &e.MTM, &e.MD5, &e.LastSyncAt, &e.ExpiresAt, &negative); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	e.IsDir = isDir != 0
+	e.Negative = negative != 0
+	return &e, nil
+}
+
 func (s *Store) EnsureRoot() error {
 	if s == nil {
 		return errors.New("store is nil")
@@ -264,6 +293,9 @@ func (s *Store) ReplaceChildren(parentID string, entries []Entry) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := deleteRemovedSubtrees(tx, parentID, entries); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`delete from entries where parent_fsid = ?`, parentID); err != nil {
 		return err
 	}
@@ -280,6 +312,44 @@ func (s *Store) ReplaceChildren(parentID string, entries []Entry) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// deleteRemovedSubtrees 清理远端已删除/改名目录下残留的子孙记录，避免孤儿行无限累积。
+func deleteRemovedSubtrees(tx *sql.Tx, parentID string, entries []Entry) error {
+	keep := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir {
+			keep[entry.Path+"\x00"+entry.FSID] = struct{}{}
+		}
+	}
+	rows, err := tx.Query(`select path, fsid from entries where parent_fsid = ? and is_dir = 1`, parentID)
+	if err != nil {
+		return err
+	}
+	var removed []string
+	for rows.Next() {
+		var path, fsid string
+		if err := rows.Scan(&path, &fsid); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if _, ok := keep[path+"\x00"+fsid]; !ok && path != "" && path != "/" {
+			removed = append(removed, path)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, path := range removed {
+		prefix := strings.TrimRight(path, "/") + "/"
+		if _, err := tx.Exec(`delete from entries where substr(path, 1, ?) = ?`, len(prefix), prefix); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ExpirePath(path string) error {
@@ -303,7 +373,9 @@ func (s *Store) DeletePath(path string) error {
 	if path == "" || path == "/" {
 		return errors.New("refuse to delete root")
 	}
-	_, err := s.db.Exec(`delete from entries where path = ? or path like ?`, path, strings.TrimRight(path, "/")+"/%")
+	// 用前缀比较而不是 LIKE，避免路径中的 % 或 _ 被当作通配符误删兄弟目录。
+	prefix := strings.TrimRight(path, "/") + "/"
+	_, err := s.db.Exec(`delete from entries where path = ? or substr(path, 1, ?) = ?`, path, len(prefix), prefix)
 	return err
 }
 
@@ -327,6 +399,7 @@ func (s *Store) migrate() error {
 			negative integer not null default 0
 		);
 		create index if not exists idx_entries_parent_fsid on entries(parent_fsid);
+		create index if not exists idx_entries_parent_name on entries(parent_fsid, name);
 	`)
 	return err
 }

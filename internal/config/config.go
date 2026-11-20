@@ -12,7 +12,10 @@ type Config struct {
 	MetaDBPath          string
 	FuseGroupName       string
 	FuseTraceReads      bool
+	FuseDefaultPerms    bool
 	EnableDelete        bool
+	MetadataTTLSeconds  int
+	RootRefreshSeconds  int
 	DownloadConcurrency int
 	DownloadChunkSize   int64
 	StreamChunkSize     int64
@@ -43,7 +46,10 @@ func Load() Config {
 		MetaDBPath:          os.Getenv("BAIDUDISKLINK_META_DB_PATH"),
 		FuseGroupName:       os.Getenv("BAIDUDISKLINK_FUSE_GROUP_NAME"),
 		FuseTraceReads:      parseBool(os.Getenv("BAIDUDISKLINK_FUSE_TRACE_READS")),
+		FuseDefaultPerms:    parseBool(os.Getenv("BAIDUDISKLINK_FUSE_DEFAULT_PERMISSIONS")),
 		EnableDelete:        parseBool(os.Getenv("BAIDUDISKLINK_ENABLE_DELETE")),
+		MetadataTTLSeconds:  parseInt(os.Getenv("BAIDUDISKLINK_METADATA_TTL_SECONDS"), 300),
+		RootRefreshSeconds:  parseInt(os.Getenv("BAIDUDISKLINK_ROOT_REFRESH_SECONDS"), 60),
 		DownloadConcurrency: parseInt(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CONCURRENCY"), 1),
 		DownloadChunkSize:   parseInt64(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE"), 8<<20),
 		StreamChunkSize:     parseInt64(os.Getenv("BAIDUDISKLINK_STREAM_CHUNK_SIZE"), 1<<20),

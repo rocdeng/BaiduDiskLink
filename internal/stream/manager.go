@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,22 +75,25 @@ type Manager struct {
 	wg     sync.WaitGroup
 	diskWG sync.WaitGroup
 
-	mu           sync.Mutex
-	cond         *sync.Cond
-	queue        taskHeap
-	tasks        map[chunkKey]*task
-	sessions     map[string]*session
-	closed       bool
-	sequence     int64
-	nextHandle   uint64
-	diskWrites   chan cacheEntry
-	summaries    chan summaryRequest
-	freeOS       chan reclaimRequest
-	latencies    []time.Duration
-	latencyNext  int
-	idleTimer    *time.Timer
-	idleEpoch    uint64
-	lastActivity time.Time
+	mu          sync.Mutex
+	cond        *sync.Cond
+	queue       taskHeap
+	tasks       map[chunkKey]*task
+	sessions    map[string]*session
+	closed      bool
+	sequence    int64
+	nextHandle  uint64
+	diskWrites  chan cacheEntry
+	summaries   chan summaryRequest
+	freeOS      chan reclaimRequest
+	latencies   []time.Duration
+	latencyNext int
+	// hedgeDelayCache 仅在有新延迟样本时重新计算，避免每次前台等待都复制并排序。
+	hedgeDelayCache time.Duration
+	hedgeDelayDirty bool
+	idleTimer       *time.Timer
+	idleEpoch       uint64
+	lastActivity    time.Time
 
 	downloaded atomic.Int64
 	retries    atomic.Int64
@@ -154,25 +158,26 @@ const (
 )
 
 type task struct {
-	key         chunkKey
-	file        File
-	offset      int64
-	length      int64
-	priority    priority
-	epoch       int64
-	seq         int64
-	index       int
-	ctx         context.Context
-	cancel      context.CancelFunc
-	done        chan struct{}
-	data        []byte
-	err         error
-	started     bool
-	finished    bool
-	foreground  bool
-	hedged      bool
-	hedgeCancel context.CancelFunc
-	startedAt   time.Time
+	key        chunkKey
+	file       File
+	offset     int64
+	length     int64
+	priority   priority
+	epoch      int64
+	seq        int64
+	index      int
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	data       []byte
+	err        error
+	started    bool
+	finished   bool
+	foreground bool
+	hedges     int
+	// hedgeCancels 保存所有已发出的 hedge 请求的取消函数；任一路先完成即取消其余。
+	hedgeCancels []context.CancelFunc
+	startedAt    time.Time
 }
 
 type taskHeap []*task
@@ -295,8 +300,8 @@ func (m *Manager) Close() error {
 		if task.cancel != nil {
 			task.cancel()
 		}
-		if task.hedgeCancel != nil {
-			task.hedgeCancel()
+		for _, cancel := range task.hedgeCancels {
+			cancel()
 		}
 	}
 	m.cancel()
@@ -318,6 +323,7 @@ func (m *Manager) Open(file File) *Handle {
 		return nil
 	}
 	m.markActivityLocked(time.Now())
+	file.version = computeChunkVersion(file, m.cfg.ChunkSize)
 	s := m.sessionLocked(file)
 	s.refs++
 	s.lastAccess = m.lastActivity
@@ -409,6 +415,20 @@ func (m *Manager) readAt(ctx context.Context, handle *Handle, offset, length int
 			return nil, err
 		}
 		chunks[index-first] = data
+	}
+	if first == last {
+		// 请求落在单个分片内：分片数据创建后不再修改，直接返回子切片，省去一次分配与拷贝。
+		start := offset - first*m.cfg.ChunkSize
+		data := chunks[0]
+		if start < 0 || start+length > int64(len(data)) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		result := data[start : start+length : start+length]
+		if mode == modeStream && streamRead {
+			m.scheduleBuffer(file, offset+length, epoch)
+			m.queueSummary(file, offset+length, epoch)
+		}
+		return result, nil
 	}
 	result := make([]byte, length)
 	written := int64(0)
@@ -785,7 +805,8 @@ func (m *Manager) osReclaimWorker() {
 
 func (m *Manager) cancelSessionTasksLocked(version string, currentEpoch int64) {
 	for _, task := range m.tasks {
-		if task.key.version == version && task.epoch < currentEpoch && task.priority != priorityForeground && task.cancel != nil {
+		// 已有前台读者在等待的任务（即使最初是后台预读）不能取消，否则前台读会以 EIO 失败。
+		if task.key.version == version && task.epoch < currentEpoch && task.priority != priorityForeground && !task.foreground && task.cancel != nil {
 			task.cancel()
 		}
 	}
@@ -906,21 +927,31 @@ func (m *Manager) waitChunk(ctx context.Context, file File, index, epoch int64, 
 	if ok {
 		return data, nil
 	}
-	task := m.ensureTask(file, index, epoch, priority)
-	if task == nil {
-		return nil, errors.New("stream manager is closed")
-	}
-	if priority == priorityForeground {
-		m.markForeground(task)
-	}
-	if priority == priorityForeground && m.cfg.Hedge {
-		return m.waitForegroundWithHedge(ctx, task)
-	}
-	select {
-	case <-task.done:
-		return task.data, task.err
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	for attempt := 0; ; attempt++ {
+		task := m.ensureTask(file, index, epoch, priority)
+		if task == nil {
+			return nil, errors.New("stream manager is closed")
+		}
+		if priority == priorityForeground {
+			m.markForeground(task)
+		}
+		var data []byte
+		var err error
+		if priority == priorityForeground && m.cfg.Hedge {
+			data, err = m.waitForegroundWithHedge(ctx, task)
+		} else {
+			select {
+			case <-task.done:
+				data, err = task.data, task.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		// 复用的任务被其他会话的 seek 取消，而调用方自身未取消：重新发起一次。
+		if err != nil && errors.Is(err, context.Canceled) && ctx.Err() == nil && m.ctx.Err() == nil && attempt < 2 {
+			continue
+		}
+		return data, err
 	}
 }
 
@@ -935,17 +966,28 @@ func (m *Manager) markForeground(task *task) {
 	m.mu.Unlock()
 }
 
+// maxForegroundHedges：前台分片最多额外发出的 hedge 请求数。
+// 第二次 hedge 前会作废直链，换一个 CDN 节点，避免两路都卡在同一个拥塞节点。
+const maxForegroundHedges = 2
+
+// secondHedgeRefreshCooldown 限制第二次 hedge 触发的直链作废频率。
+const secondHedgeRefreshCooldown = 30 * time.Second
+
 func (m *Manager) waitForegroundWithHedge(ctx context.Context, task *task) ([]byte, error) {
-	timer := time.NewTimer(m.hedgeDelay())
+	delay := m.hedgeDelay()
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
-	select {
-	case <-task.done:
-		return task.data, task.err
-	case <-timer.C:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	for launched := 0; launched < maxForegroundHedges; launched++ {
+		select {
+		case <-task.done:
+			return task.data, task.err
+		case <-timer.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		m.startHedge(task, launched)
+		timer.Reset(nextHedgeDelay(delay))
 	}
-	m.startHedge(task)
 	select {
 	case <-task.done:
 		return task.data, task.err
@@ -954,10 +996,37 @@ func (m *Manager) waitForegroundWithHedge(ctx context.Context, task *task) ([]by
 	}
 }
 
+func nextHedgeDelay(first time.Duration) time.Duration {
+	next := first * 3
+	if next < time.Second {
+		next = time.Second
+	}
+	if next > 4*time.Second {
+		next = 4 * time.Second
+	}
+	return next
+}
+
 func (m *Manager) hedgeDelay() time.Duration {
 	m.mu.Lock()
+	if !m.hedgeDelayDirty && m.hedgeDelayCache > 0 {
+		delay := m.hedgeDelayCache
+		m.mu.Unlock()
+		return delay
+	}
 	samples := append([]time.Duration(nil), m.latencies...)
+	m.hedgeDelayDirty = false
 	m.mu.Unlock()
+	delay := m.computeHedgeDelay(samples)
+	m.mu.Lock()
+	if !m.hedgeDelayDirty {
+		m.hedgeDelayCache = delay
+	}
+	m.mu.Unlock()
+	return delay
+}
+
+func (m *Manager) computeHedgeDelay(samples []time.Duration) time.Duration {
 	if len(samples) == 0 {
 		return m.cfg.HedgeMinDelay
 	}
@@ -977,21 +1046,30 @@ type downloadLinkInvalidator interface {
 	InvalidateDownloadLink(fsid string)
 }
 
-func (m *Manager) startHedge(task *task) {
+// startHedge 发出该任务的第 index 个 hedge；同一任务的多个等待者对同一序号只会发一次。
+func (m *Manager) startHedge(task *task, index int) {
+	switchNode := index > 0
 	m.mu.Lock()
-	if m.closed || task.finished || task.hedged || task.ctx.Err() != nil {
+	if m.closed || task.finished || task.hedges != index || index >= maxForegroundHedges || task.ctx.Err() != nil {
 		m.mu.Unlock()
 		return
 	}
-	task.hedged = true
+	task.hedges++
 	hedgeCtx, hedgeCancel := context.WithCancel(m.ctx)
-	task.hedgeCancel = hedgeCancel
+	task.hedgeCancels = append(task.hedgeCancels, hedgeCancel)
 	m.hedges.Add(1)
 	invalidate := false
+	now := time.Now()
 	if s := m.sessions[task.key.version]; s != nil {
 		s.hedges++
-		s.slowStreak++
-		if m.shouldRefreshDlinkLocked(s, time.Now()) {
+		if !switchNode {
+			s.slowStreak++
+			if m.shouldRefreshDlinkLocked(s, now) {
+				s.dlinkRefreshes++
+				invalidate = true
+			}
+		} else if s.dlinkRefreshed.IsZero() || now.Sub(s.dlinkRefreshed) >= secondHedgeRefreshCooldown {
+			s.dlinkRefreshed = now
 			s.dlinkRefreshes++
 			invalidate = true
 		}
@@ -1003,7 +1081,11 @@ func (m *Manager) startHedge(task *task) {
 		if invalidator, ok := m.reader.(downloadLinkInvalidator); ok {
 			invalidator.InvalidateDownloadLink(task.file.FSID)
 			if m.cfg.Diagnostics {
-				log.Printf("stream dlink invalidated fsid=%q reason=consecutive-slow-foreground", task.file.FSID)
+				reason := "consecutive-slow-foreground"
+				if switchNode {
+					reason = "second-hedge"
+				}
+				log.Printf("stream dlink invalidated fsid=%q reason=%s", task.file.FSID, reason)
 			}
 		}
 	}
@@ -1039,7 +1121,10 @@ func (m *Manager) publishHedge(task *task, data []byte) bool {
 	}
 	task.finished = true
 	task.data = data
-	task.hedgeCancel = nil
+	for _, cancel := range task.hedgeCancels {
+		cancel()
+	}
+	task.hedgeCancels = nil
 	if task.cancel != nil {
 		task.cancel()
 	}
@@ -1177,9 +1262,27 @@ func (m *Manager) discardCanceledTaskLocked(task *task) {
 	m.cleanupSessionLocked(task.key.version, m.sessions[task.key.version])
 }
 
+// streamRetryBackoff：分片下载失败后的重试间隔，避免立即用同一直链打到同一节点。
+var streamRetryBackoff = 200 * time.Millisecond
+
 func (m *Manager) download(task *task) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			if !retryableStreamError(lastErr) {
+				break
+			}
+			m.retries.Add(1)
+			if streamRetryBackoff > 0 {
+				timer := time.NewTimer(streamRetryBackoff)
+				select {
+				case <-timer.C:
+				case <-task.ctx.Done():
+					timer.Stop()
+					return nil, task.ctx.Err()
+				}
+			}
+		}
 		data, err := m.reader.ReadStreamRange(task.ctx, task.file.FSID, task.offset, task.length)
 		if err == nil && int64(len(data)) == task.length {
 			m.downloaded.Add(int64(len(data)))
@@ -1192,9 +1295,17 @@ func (m *Manager) download(task *task) ([]byte, error) {
 		if task.ctx.Err() != nil {
 			return nil, task.ctx.Err()
 		}
-		m.retries.Add(1)
 	}
 	return nil, fmt.Errorf("stream chunk offset=%d length=%d: %w", task.offset, task.length, lastErr)
+}
+
+// retryableStreamError 判断分片错误是否值得重试：Range 不满足或格式非法属于确定性错误。
+func retryableStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return !strings.Contains(message, "status=416") && !strings.Contains(message, "invalid content range")
 }
 
 func (m *Manager) finishTask(task *task, data []byte, err error) {
@@ -1211,10 +1322,10 @@ func (m *Manager) finishTask(task *task, data []byte, err error) {
 		m.cond.Broadcast()
 		return
 	}
-	if task.hedgeCancel != nil {
-		task.hedgeCancel()
-		task.hedgeCancel = nil
+	for _, cancel := range task.hedgeCancels {
+		cancel()
 	}
+	task.hedgeCancels = nil
 	task.finished = true
 	task.data = data
 	task.err = err
@@ -1227,7 +1338,7 @@ func (m *Manager) finishTask(task *task, data []byte, err error) {
 	if err == nil && !task.startedAt.IsZero() {
 		m.recordLatencyLocked(time.Since(task.startedAt))
 	}
-	if task.foreground && !task.hedged {
+	if task.foreground && task.hedges == 0 {
 		if s := m.sessions[task.key.version]; s != nil {
 			s.slowStreak = 0
 		}
@@ -1246,6 +1357,7 @@ func (m *Manager) recordLatencyLocked(latency time.Duration) {
 	if latency <= 0 {
 		return
 	}
+	m.hedgeDelayDirty = true
 	if len(m.latencies) < maxSamples {
 		m.latencies = append(m.latencies, latency)
 		return

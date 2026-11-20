@@ -296,7 +296,7 @@ func TestRefreshRootDoesNotMarkChildDirectoryContentsFresh(t *testing.T) {
 	if movie.ExpiresAt != 0 {
 		t.Fatalf("expected child directory contents to remain stale, got expires_at=%d", movie.ExpiresAt)
 	}
-	if !fs.shouldRefreshDir("/Videos/Movie", nil) {
+	if state, _ := fs.freshness("/Videos/Movie"); state != dirMissing {
 		t.Fatal("expected child directory to refresh on demand")
 	}
 }
