@@ -60,6 +60,17 @@ func DefaultConfig() Config {
 
 const dlinkRefreshCooldown = 2 * time.Minute
 
+var (
+	// chunkRepairCooldown：近端窗口失败分片再次补发前的冷却间隔，避免故障期间紧循环重试。
+	chunkRepairCooldown = 2 * time.Second
+	// nearRepairWindowChunks：每次推进调度时向前巡检的近端分片数（默认 16 个分片）。
+	nearRepairWindowChunks int64 = 16
+	// lowWatermarkCheckInterval：低水位排水检测节流间隔。
+	lowWatermarkCheckInterval = 2 * time.Second
+	// lowWatermarkRefreshCooldown：低水位排水触发主动换 CDN 节点的冷却间隔。
+	lowWatermarkRefreshCooldown = 45 * time.Second
+)
+
 type reclaimRequest struct {
 	streamBytes int64
 	readerBytes int64
@@ -79,6 +90,7 @@ type Manager struct {
 	cond        *sync.Cond
 	queue       taskHeap
 	tasks       map[chunkKey]*task
+	retryAfter  map[chunkKey]time.Time
 	sessions    map[string]*session
 	closed      bool
 	sequence    int64
@@ -98,27 +110,33 @@ type Manager struct {
 	downloaded atomic.Int64
 	retries    atomic.Int64
 	hedges     atomic.Int64
+	repairs    atomic.Int64
+	slowAborts atomic.Int64
 }
 
 type session struct {
-	file           File
-	epoch          int64
-	activeHandle   uint64
-	streamAnchor   int64
-	cursor         int64
-	refs           int
-	inflight       int
-	slowStreak     int
-	lastAccess     time.Time
-	lastSummary    time.Time
-	scheduleSet    bool
-	scheduleEpoch  int64
-	scheduledFloor int64
-	scheduledNear  int64
-	scheduledEnd   int64
-	hedges         int64
-	dlinkRefreshes int64
-	dlinkRefreshed time.Time
+	file                  File
+	epoch                 int64
+	activeHandle          uint64
+	streamAnchor          int64
+	cursor                int64
+	refs                  int
+	inflight              int
+	slowStreak            int
+	lastAccess            time.Time
+	lastSummary           time.Time
+	lastSummaryDownloaded int64
+	lastLowWaterCheck     time.Time
+	lastBufferAhead       int64
+	bufferDrainStreak     int
+	scheduleSet           bool
+	scheduleEpoch         int64
+	scheduledFloor        int64
+	scheduledNear         int64
+	scheduledEnd          int64
+	hedges                int64
+	dlinkRefreshes        int64
+	dlinkRefreshed        time.Time
 }
 
 type summaryRequest struct {
@@ -187,6 +205,10 @@ func (h taskHeap) Less(i, j int) bool {
 	if h[i].priority != h[j].priority {
 		return h[i].priority < h[j].priority
 	}
+	if h[i].key.version == h[j].key.version && h[i].key.index != h[j].key.index {
+		// 同一文件同优先级下优先拉取更靠近播放头的分片，避免补发分片排到远端预取后面。
+		return h[i].key.index < h[j].key.index
+	}
 	return h[i].seq < h[j].seq
 }
 func (h taskHeap) Swap(i, j int) {
@@ -238,6 +260,24 @@ func NewManager(reader Reader, cfg Config) (*Manager, error) {
 	if cfg.MemoryCache < 0 || cfg.DiskCache < 0 {
 		return nil, errors.New("stream cache limits must be non-negative")
 	}
+	if cfg.MemoryCache > 0 && cfg.MemoryCache < cfg.TargetBuffer+cfg.BackBuffer {
+		// 避免预取窗口超出内存缓存上限导致 LRU 挤出即将播放的近端分片。
+		origTarget, origBack := cfg.TargetBuffer, cfg.BackBuffer
+		if cfg.BackBuffer > cfg.MemoryCache/4 {
+			cfg.BackBuffer = cfg.MemoryCache / 4
+		}
+		maxTarget := cfg.MemoryCache - cfg.BackBuffer
+		if maxTarget < cfg.ChunkSize {
+			maxTarget = cfg.ChunkSize
+		}
+		if cfg.TargetBuffer > maxTarget {
+			cfg.TargetBuffer = maxTarget
+		}
+		if cfg.LowWatermark > cfg.TargetBuffer {
+			cfg.LowWatermark = cfg.TargetBuffer / 2
+		}
+		log.Printf("stream memory cache (%d) smaller than target+back (%d+%d); clamped window to target=%d back=%d low_watermark=%d", cfg.MemoryCache, origTarget, origBack, cfg.TargetBuffer, cfg.BackBuffer, cfg.LowWatermark)
+	}
 	if cfg.HedgeMinDelay <= 0 {
 		cfg.HedgeMinDelay = defaults.HedgeMinDelay
 	}
@@ -265,6 +305,7 @@ func NewManager(reader Reader, cfg Config) (*Manager, error) {
 		ctx:        ctx,
 		cancel:     cancel,
 		tasks:      make(map[chunkKey]*task),
+		retryAfter: make(map[chunkKey]time.Time),
 		sessions:   make(map[string]*session),
 		diskWrites: make(chan cacheEntry, cfg.Workers*8),
 		summaries:  make(chan summaryRequest, 1),
@@ -509,23 +550,48 @@ func (m *Manager) summaryWorker() {
 
 func (m *Manager) maybeLogSummary(file File, cursor, epoch int64) {
 	now := time.Now()
+	stats := m.Stats()
 	m.mu.Lock()
 	s := m.sessions[chunkVersion(file, m.cfg.ChunkSize)]
 	if s == nil || now.Sub(s.lastSummary) < 5*time.Second {
 		m.mu.Unlock()
 		return
 	}
+	prevTime := s.lastSummary
+	prevDownloaded := s.lastSummaryDownloaded
 	s.lastSummary = now
+	s.lastSummaryDownloaded = stats.Downloaded
 	inflight := s.inflight
 	workerLimit := m.sessionWorkerLimitLocked(s)
 	sessionHedges := s.hedges
 	dlinkRefreshes := s.dlinkRefreshes
+	scheduledNear := s.scheduledNear
+	scheduleSet := s.scheduleSet
 	m.mu.Unlock()
 
+	rateMBps := 0.0
+	if !prevTime.IsZero() {
+		if elapsed := now.Sub(prevTime).Seconds(); elapsed > 0 && stats.Downloaded >= prevDownloaded {
+			rateMBps = float64(stats.Downloaded-prevDownloaded) / (1 << 20) / elapsed
+		}
+	}
+	nearHoles := 0
+	if scheduleSet && m.cfg.ChunkSize > 0 && cursor >= 0 {
+		start := cursor / m.cfg.ChunkSize
+		end := start + nearRepairWindowChunks - 1
+		if end > scheduledNear {
+			end = scheduledNear
+		}
+		version := chunkVersion(file, m.cfg.ChunkSize)
+		for index := start; index <= end; index++ {
+			if _, ok := m.store.length(chunkKey{version: version, index: index}); !ok {
+				nearHoles++
+			}
+		}
+	}
 	bufferAhead := m.BufferAhead(file, cursor)
-	stats := m.Stats()
 	memoryBytes, diskBytes := m.store.usage()
-	log.Printf("stream summary fsid=%q epoch=%d buffer_ahead=%d buffer_low=%t low_watermark=%d inflight=%d worker_limit=%d cache_memory=%d cache_disk=%d downloaded=%d retries=%d hedges=%d session_hedges=%d dlink_refreshes=%d", file.FSID, epoch, bufferAhead, bufferAhead < m.cfg.LowWatermark, m.cfg.LowWatermark, inflight, workerLimit, memoryBytes, diskBytes, stats.Downloaded, stats.Retries, stats.Hedges, sessionHedges, dlinkRefreshes)
+	log.Printf("stream summary fsid=%q epoch=%d buffer_ahead=%d buffer_low=%t low_watermark=%d rate_mbps=%.2f near_holes=%d inflight=%d worker_limit=%d cache_memory=%d cache_disk=%d downloaded=%d retries=%d hedges=%d repairs=%d slow_aborts=%d session_hedges=%d dlink_refreshes=%d", file.FSID, epoch, bufferAhead, bufferAhead < m.cfg.LowWatermark, m.cfg.LowWatermark, rateMBps, nearHoles, inflight, workerLimit, memoryBytes, diskBytes, stats.Downloaded, stats.Retries, stats.Hedges, stats.Repairs, stats.SlowAborts, sessionHedges, dlinkRefreshes)
 }
 
 func (m *Manager) sessionLocked(file File) *session {
@@ -676,6 +742,17 @@ func (m *Manager) observeHandleLocked(handle *Handle, offset, length int64) obse
 		if m.cfg.TargetBuffer > forwardSeekThreshold {
 			forwardSeekThreshold = m.cfg.TargetBuffer
 		}
+		backwardTolerance := m.cfg.ForwardGap
+		if m.cfg.BackBuffer > 0 && m.cfg.BackBuffer < backwardTolerance {
+			backwardTolerance = m.cfg.BackBuffer
+		}
+		if backwardTolerance > 4<<20 {
+			backwardTolerance = 4 << 20
+		}
+		// FUSE 并发预读乱序到达或音视频轨小幅交错回读时，保持 modeStream 且不回退高水位偏移。
+		if handle.mode == modeStream && distance < 0 && -distance <= backwardTolerance {
+			return observation{mode: modeStream, event: readEventNone, streamRead: true}
+		}
 		seek := offset != handle.lastOffset && handle.mode == modeStream && (distance < 0 || distance > forwardSeekThreshold)
 		if seek {
 			handle.forwardReads = 1
@@ -775,6 +852,7 @@ func (m *Manager) reclaimIdleMemory(epoch uint64) {
 		session.scheduledNear = 0
 		session.scheduledEnd = 0
 	}
+	m.retryAfter = make(map[chunkKey]time.Time)
 	streamBytes := m.store.clearMemory()
 	readerBytes := int64(0)
 	if clearer, ok := m.reader.(interface{ ClearReadCache() int64 }); ok {
@@ -878,6 +956,17 @@ func (m *Manager) scheduleBuffer(file File, cursor, epoch int64) {
 			m.ensureBackgroundTask(file, index, epoch, priorityAhead)
 		}
 	} else {
+		// 巡检播放头紧邻的近端窗口，自动补发此前失败出队的分片，避免形成永久空洞。
+		repairEnd := start + nearRepairWindowChunks - 1
+		if repairEnd > nearEnd {
+			repairEnd = nearEnd
+		}
+		if repairEnd > previousNear {
+			repairEnd = previousNear
+		}
+		for index := start; index <= repairEnd; index++ {
+			m.ensureRepairTask(file, index, epoch)
+		}
 		promoteStart := previousNear + 1
 		if promoteStart < start {
 			promoteStart = start
@@ -896,6 +985,7 @@ func (m *Manager) scheduleBuffer(file File, cursor, epoch int64) {
 			}
 			m.ensureBackgroundTask(file, index, epoch, priority)
 		}
+		m.maybeCheckLowWatermark(file, cursor, epoch)
 	}
 	if !reset || m.cfg.BackBuffer <= 0 || cursor <= 0 {
 		return
@@ -912,7 +1002,99 @@ func (m *Manager) ensureBackgroundTask(file File, index, epoch int64, priority p
 	if _, ok := m.store.length(key); ok {
 		return
 	}
+	if m.inRetryCooldown(key) {
+		return
+	}
 	m.ensureTask(file, index, epoch, priority)
+}
+
+func (m *Manager) ensureRepairTask(file File, index, epoch int64) {
+	key := chunkKey{version: chunkVersion(file, m.cfg.ChunkSize), index: index}
+	if _, ok := m.store.length(key); ok {
+		return
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	if existing := m.tasks[key]; existing != nil && !existing.finished && existing.ctx.Err() == nil {
+		m.mu.Unlock()
+		return
+	}
+	if until, ok := m.retryAfter[key]; ok && time.Now().Before(until) {
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+	m.repairs.Add(1)
+	m.ensureTask(file, index, epoch, priorityNear)
+}
+
+func (m *Manager) inRetryCooldown(key chunkKey) bool {
+	m.mu.Lock()
+	until, ok := m.retryAfter[key]
+	m.mu.Unlock()
+	return ok && time.Now().Before(until)
+}
+
+// maybeCheckLowWatermark 在缓冲低于低水位且持续下降（说明 CDN 速率低于消费速率）时，
+// 在后台主动失效直链切换 CDN 节点，不等前台撞墙才补救。
+func (m *Manager) maybeCheckLowWatermark(file File, cursor, epoch int64) {
+	if m == nil || m.cfg.LowWatermark <= 0 {
+		return
+	}
+	if file.Size > 0 && file.Size-cursor <= m.cfg.LowWatermark {
+		return
+	}
+	now := time.Now()
+	version := chunkVersion(file, m.cfg.ChunkSize)
+	m.mu.Lock()
+	s := m.sessions[version]
+	if s == nil || s.epoch != epoch || s.activeHandle == 0 {
+		m.mu.Unlock()
+		return
+	}
+	if !s.lastLowWaterCheck.IsZero() && now.Sub(s.lastLowWaterCheck) < lowWatermarkCheckInterval {
+		m.mu.Unlock()
+		return
+	}
+	s.lastLowWaterCheck = now
+	inflight := s.inflight
+	m.mu.Unlock()
+
+	bufferAhead := m.BufferAhead(file, cursor)
+	invalidate := false
+	m.mu.Lock()
+	s = m.sessions[version]
+	if s != nil && s.epoch == epoch {
+		if bufferAhead < m.cfg.LowWatermark && inflight > 0 {
+			if (s.lastBufferAhead > 0 && bufferAhead < s.lastBufferAhead) || (s.lastBufferAhead == 0 && bufferAhead == 0) {
+				s.bufferDrainStreak++
+			} else {
+				s.bufferDrainStreak = 0
+			}
+		} else {
+			s.bufferDrainStreak = 0
+		}
+		s.lastBufferAhead = bufferAhead
+		if s.bufferDrainStreak >= 2 && (s.dlinkRefreshed.IsZero() || now.Sub(s.dlinkRefreshed) >= lowWatermarkRefreshCooldown) {
+			s.bufferDrainStreak = 0
+			s.dlinkRefreshed = now
+			s.dlinkRefreshes++
+			invalidate = true
+		}
+	}
+	m.mu.Unlock()
+
+	if invalidate {
+		if invalidator, ok := m.reader.(downloadLinkInvalidator); ok {
+			invalidator.InvalidateDownloadLink(file.FSID)
+			if m.cfg.Diagnostics {
+				log.Printf("stream dlink invalidated fsid=%q reason=low-watermark-drain buffer_ahead=%d low_watermark=%d", file.FSID, bufferAhead, m.cfg.LowWatermark)
+			}
+		}
+	}
 }
 
 func (m *Manager) waitChunk(ctx context.Context, file File, index, epoch int64, priority priority, touchCache bool) ([]byte, error) {
@@ -1131,6 +1313,7 @@ func (m *Manager) publishHedge(task *task, data []byte) bool {
 	if m.tasks[task.key] == task {
 		delete(m.tasks, task.key)
 	}
+	delete(m.retryAfter, task.key)
 	close(task.done)
 	m.mu.Unlock()
 	m.downloaded.Add(int64(len(data)))
@@ -1334,6 +1517,18 @@ func (m *Manager) finishTask(task *task, data []byte, err error) {
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("chunk failed fsid=%q offset=%d: %v", task.file.FSID, task.offset, err)
+		if retryableStreamError(err) {
+			m.retryAfter[task.key] = time.Now().Add(chunkRepairCooldown)
+		} else {
+			m.retryAfter[task.key] = time.Now().Add(time.Hour)
+		}
+		lowerErr := strings.ToLower(err.Error())
+		if strings.Contains(lowerErr, "stalled") || strings.Contains(lowerErr, "too slow") {
+			m.slowAborts.Add(1)
+		}
+	}
+	if err == nil {
+		delete(m.retryAfter, task.key)
 	}
 	if err == nil && !task.startedAt.IsZero() {
 		m.recordLatencyLocked(time.Since(task.startedAt))
@@ -1390,13 +1585,21 @@ type Stats struct {
 	Downloaded int64
 	Retries    int64
 	Hedges     int64
+	Repairs    int64
+	SlowAborts int64
 }
 
 func (m *Manager) Stats() Stats {
 	if m == nil {
 		return Stats{}
 	}
-	return Stats{Downloaded: m.downloaded.Load(), Retries: m.retries.Load(), Hedges: m.hedges.Load()}
+	return Stats{
+		Downloaded: m.downloaded.Load(),
+		Retries:    m.retries.Load(),
+		Hedges:     m.hedges.Load(),
+		Repairs:    m.repairs.Load(),
+		SlowAborts: m.slowAborts.Load(),
+	}
 }
 
 func (m *Manager) LowWatermark() int64 {

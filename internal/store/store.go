@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,9 @@ type Entry struct {
 
 type Store struct {
 	db *sql.DB
+	// writeMu 串行化进程内所有写库操作，避免多连接并发刷新目录时因读锁升级写锁触发 SQLITE_BUSY；
+	// 读操作在 WAL 模式下无需持有该锁，保持并发。
+	writeMu sync.Mutex
 }
 
 func New(db *sql.DB) *Store {
@@ -79,6 +83,8 @@ func (s *Store) upsertEntries(entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -104,6 +110,8 @@ func (s *Store) UpsertEntry(e Entry) error {
 	if s.db == nil {
 		return errors.New("db is required")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.Exec(`
 		insert into entries
 		(fsid, parent_fsid, path, name, size, is_dir, mtime, md5, last_sync_at, expires_at, negative)
@@ -229,6 +237,8 @@ func (s *Store) EnsureRoot() error {
 	if s.db == nil {
 		return errors.New("db is required")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.Exec(`
 		insert into entries (fsid, parent_fsid, path, name, is_dir, last_sync_at, expires_at)
 		values ('0', '', '/', '', 1, ?, ?)
@@ -288,6 +298,8 @@ func (s *Store) ReplaceChildren(parentID string, entries []Entry) error {
 	if s == nil || s.db == nil {
 		return errors.New("db is required")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -359,6 +371,8 @@ func (s *Store) ExpirePath(path string) error {
 	if s.db == nil {
 		return errors.New("db is required")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.Exec(`update entries set expires_at = 0 where path = ?`, path)
 	return err
 }
@@ -373,6 +387,8 @@ func (s *Store) DeletePath(path string) error {
 	if path == "" || path == "/" {
 		return errors.New("refuse to delete root")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	// 用前缀比较而不是 LIKE，避免路径中的 % 或 _ 被当作通配符误删兄弟目录。
 	prefix := strings.TrimRight(path, "/") + "/"
 	_, err := s.db.Exec(`delete from entries where path = ? or substr(path, 1, ?) = ?`, path, len(prefix), prefix)
@@ -383,6 +399,8 @@ func (s *Store) migrate() error {
 	if s.db == nil {
 		return errors.New("db is required")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.Exec(`
 		create table if not exists entries (
 			id integer primary key autoincrement,

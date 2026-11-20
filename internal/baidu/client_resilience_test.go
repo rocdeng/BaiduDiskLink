@@ -173,3 +173,55 @@ func TestTransportErrorsDoNotExposeCredentials(t *testing.T) {
 		}
 	}
 }
+
+type tricklingReader struct {
+	delay time.Duration
+	left  int
+}
+
+func (r *tricklingReader) Read(p []byte) (int, error) {
+	if r.left <= 0 {
+		return 0, io.EOF
+	}
+	time.Sleep(r.delay)
+	p[0] = 'x'
+	r.left--
+	return 1, nil
+}
+
+func (r *tricklingReader) Close() error { return nil }
+
+func TestReadRangeAbortsTricklingSlowConnection(t *testing.T) {
+	oldGrace := downloadSlowGrace
+	oldMinRate := downloadMinBytesPerSec
+	oldIdle := downloadIdleTimeout
+	downloadSlowGrace = 40 * time.Millisecond
+	downloadMinBytesPerSec = 1024 // 1 KiB/s
+	downloadIdleTimeout = 5 * time.Second
+	defer func() {
+		downloadSlowGrace = oldGrace
+		downloadMinBytesPerSec = oldMinRate
+		downloadIdleTimeout = oldIdle
+	}()
+
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("Content-Range", "bytes 0-1023/1024")
+		return &http.Response{
+			StatusCode: http.StatusPartialContent,
+			Header:     header,
+			Body:       &tricklingReader{delay: 15 * time.Millisecond, left: 1024},
+		}, nil
+	}}})
+	client.links["1"] = DownloadLink{URL: "https://cdn.example.invalid/slow", ExpiresAt: time.Now().Add(time.Hour)}
+
+	started := time.Now()
+	_, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 1024))
+	if !errors.Is(err, ErrDownloadTooSlow) {
+		t.Fatalf("expected ErrDownloadTooSlow, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("slow trickling connection was not aborted promptly: %s", elapsed)
+	}
+}
+

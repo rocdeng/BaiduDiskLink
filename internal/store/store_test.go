@@ -2,6 +2,9 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
+	"path/filepath"
+	"sync"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -292,5 +295,48 @@ func TestDeletePathRemovesEntrySubtree(t *testing.T) {
 	}
 	if got, err := s.GetByPath("/Videos"); err != nil || got == nil {
 		t.Fatalf("expected parent preserved, got %#v err=%v", got, err)
+	}
+}
+
+func TestConcurrentReplaceChildrenAvoidsSQLiteBusy(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "meta.db")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(50)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s, err := Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 16
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers*4)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			parentID := fmt.Sprintf("dir-%d", id)
+			for round := 0; round < 4; round++ {
+				entries := []Entry{
+					{FSID: fmt.Sprintf("%d-%d-1", id, round), Parent: parentID, Path: fmt.Sprintf("/TV/%d/ep1.mkv", id), Name: "ep1.mkv", Size: 100},
+					{FSID: fmt.Sprintf("%d-%d-2", id, round), Parent: parentID, Path: fmt.Sprintf("/TV/%d/sub", id), Name: "sub", IsDir: true},
+				}
+				if err := s.ReplaceChildren(parentID, entries); err != nil {
+					errCh <- err
+					return
+				}
+				if err := s.UpsertEntry(Entry{FSID: parentID, Parent: "0", Path: fmt.Sprintf("/TV/%d", id), Name: fmt.Sprintf("%d", id), IsDir: true}); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent store write failed: %v", err)
 	}
 }

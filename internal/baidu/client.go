@@ -66,6 +66,9 @@ var (
 	// ErrDownloadStalled 表示连接在 downloadIdleTimeout 内没有收到任何新字节。
 	// 错误文本包含 timeout，便于上层按传输错误分类重试。
 	ErrDownloadStalled = errors.New("download stalled: idle timeout")
+	// ErrDownloadTooSlow 表示连接虽未完全断流，但持续低于最低有效速率（慢速吊命连接）。
+	// 错误文本包含 timeout，便于上层按传输错误分类重试。
+	ErrDownloadTooSlow = errors.New("download too slow: rate timeout")
 )
 
 type apiListEntry struct {
@@ -145,6 +148,10 @@ var (
 	downloadHeaderTimeout = 15 * time.Second
 	// downloadIdleTimeout：响应体连续这么久没有新字节就判定连接停滞，中止并交给上层重试。
 	downloadIdleTimeout = 8 * time.Second
+	// downloadSlowGrace：开始读响应体后经过该宽限期才评估平均速率，给 TCP 慢启动留足余量。
+	downloadSlowGrace = 4 * time.Second
+	// downloadMinBytesPerSec：宽限期后若平均速率低于该阈值则判定为慢速吊命连接并中止重试。
+	downloadMinBytesPerSec int64 = 128 << 10
 )
 
 const (
@@ -577,12 +584,22 @@ func (c *APIClient) ReadRange(ctx context.Context, fsid string, offset int64, ds
 		defer watchdog.Stop()
 	}
 	want := int(rangeEnd - start + 1)
+	bodyStart := time.Now()
 	n := 0
 	for n < want {
 		readN, readErr := resp.Body.Read(dst[n:want])
 		n += readN
 		if readN > 0 && watchdog != nil {
 			watchdog.Reset(downloadIdleTimeout)
+		}
+		if readN > 0 && n < want && downloadSlowGrace > 0 && downloadMinBytesPerSec > 0 {
+			if elapsed := time.Since(bodyStart); elapsed >= downloadSlowGrace {
+				minBytes := int64(elapsed.Seconds() * float64(downloadMinBytesPerSec))
+				if int64(n) < minBytes {
+					cancelStall(ErrDownloadTooSlow)
+					return n, downloadContextError(downloadCtx, n, want)
+				}
+			}
 		}
 		if readErr != nil {
 			if ctxErr := downloadContextError(downloadCtx, n, want); ctxErr != nil {
@@ -619,6 +636,9 @@ func downloadContextError(ctx context.Context, n, want int) error {
 	}
 	if errors.Is(context.Cause(ctx), ErrDownloadStalled) {
 		return fmt.Errorf("download range stalled after %d of %d bytes: %w", n, want, ErrDownloadStalled)
+	}
+	if errors.Is(context.Cause(ctx), ErrDownloadTooSlow) {
+		return fmt.Errorf("download range too slow after %d of %d bytes: %w", n, want, ErrDownloadTooSlow)
 	}
 	return fmt.Errorf("download range body timeout after %d of %d bytes: %w", n, want, ctxErr)
 }
