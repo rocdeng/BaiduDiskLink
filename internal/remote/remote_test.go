@@ -2,6 +2,7 @@ package remote
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ type stubClient struct {
 	readRelease   chan struct{}
 	failRead      bool
 	shortRead     bool
+	invalidated   int
 }
 
 func (s *stubClient) List(path string) ([]baidu.RemoteEntry, error) { return nil, nil }
@@ -55,6 +57,11 @@ func (s *stubClient) ReadRange(ctx context.Context, fsid string, offset int64, d
 }
 func (s *stubClient) Delete(paths []string) error { return nil }
 func (s *stubClient) RefreshAuth() error          { return nil }
+func (s *stubClient) InvalidateDownloadLink(string) {
+	s.mu.Lock()
+	s.invalidated++
+	s.mu.Unlock()
+}
 
 func sameBackingArray(a, b []byte) bool {
 	return len(a) > 0 && len(b) > 0 && &a[0] == &b[0]
@@ -98,6 +105,18 @@ func TestReadCacheMaintainsFSIDIndex(t *testing.T) {
 	}
 }
 
+func TestClearReadCacheReportsReclaimedBytes(t *testing.T) {
+	r := NewReader(&stubClient{})
+	r.storeCached("one", 0, []byte("1234"))
+	r.storeCached("two", 0, []byte("5678"))
+	if reclaimed := r.ClearReadCache(); reclaimed != 8 {
+		t.Fatalf("unexpected reclaimed bytes: %d", reclaimed)
+	}
+	if r.cacheBytes != 0 || len(r.cached) != 0 || len(r.cacheByFSID) != 0 || len(r.cacheOrder) != 0 {
+		t.Fatalf("read cache was not cleared: bytes=%d cached=%d fsids=%d order=%d", r.cacheBytes, len(r.cached), len(r.cacheByFSID), len(r.cacheOrder))
+	}
+}
+
 func TestPrefetchPopulatesCache(t *testing.T) {
 	client := &stubClient{}
 	r := NewReader(client)
@@ -115,6 +134,77 @@ func TestPrefetchPopulatesCache(t *testing.T) {
 	client.mu.Unlock()
 	if after != before {
 		t.Fatalf("foreground read missed prefetched cache: before=%d after=%d", before, after)
+	}
+}
+
+func TestPrefetchUsesConfiguredDownloadConcurrency(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	r.SetDownloadOptions(2, 4)
+	if err := r.Prefetch(context.Background(), "1", 0, 8); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	readCalls := client.readCalls
+	client.mu.Unlock()
+	if readCalls != 2 {
+		t.Fatalf("expected two concurrent chunks, got %d backend reads", readCalls)
+	}
+}
+
+func TestPrefetchPublishesFastChunkBeforeSlowSibling(t *testing.T) {
+	client := newChunkBlockingClient(4)
+	r := NewReader(client)
+	r.SetDownloadOptions(2, 4)
+
+	prefetchDone := make(chan error, 1)
+	go func() {
+		prefetchDone <- r.Prefetch(context.Background(), "1", 0, 8)
+	}()
+	client.waitStarted(t, 0)
+	client.waitStarted(t, 4)
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := r.ReadRange(context.Background(), "1", 0, 4)
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground read waited for an unrelated slow prefetch chunk")
+	}
+
+	close(client.release)
+	if err := <-prefetchDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := client.readCount(0); got != 1 {
+		t.Fatalf("completed chunk was downloaded %d times", got)
+	}
+}
+
+func TestPrefetchKeepsSingleConnectionRangeExact(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	offset := int64((8 << 20) - 2)
+	if err := r.Prefetch(context.Background(), "1", offset, 4); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	before := client.readCalls
+	client.mu.Unlock()
+	if _, err := r.ReadExactRange(context.Background(), "1", offset, 4); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	after := client.readCalls
+	client.mu.Unlock()
+	if after != before {
+		t.Fatalf("exact foreground read missed unaligned prefetch: before=%d after=%d", before, after)
 	}
 }
 
@@ -216,6 +306,33 @@ func TestReadExactRangeDoesNotPrefetch(t *testing.T) {
 	}
 }
 
+func TestReadExactRangeRejectsShortRead(t *testing.T) {
+	client := &stubClient{shortRead: true}
+	r := NewReader(client)
+	if _, err := r.ReadExactRange(context.Background(), "fsid-1", 1024, 4096); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected short exact read error, got %v", err)
+	}
+}
+
+func TestReadRangeCompletesRequestCrossingAlignedWindow(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	offset := int64((8 << 20) - (64 << 10))
+	got, err := r.ReadRange(context.Background(), "fsid-1", offset, 192<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 192<<10 {
+		t.Fatalf("expected complete cross-window read, got %d bytes", len(got))
+	}
+	client.mu.Lock()
+	readCalls := client.readCalls
+	client.mu.Unlock()
+	if readCalls != 2 {
+		t.Fatalf("expected aligned read plus exact remainder, got %d backend reads", readCalls)
+	}
+}
+
 func TestReadRangeCachesDownloadLinkAndRetries(t *testing.T) {
 	client := &stubClient{failRead: true}
 	r := NewReader(client)
@@ -228,6 +345,57 @@ func TestReadRangeCachesDownloadLinkAndRetries(t *testing.T) {
 	}
 	if client.readCalls != 2 {
 		t.Fatalf("expected two read attempts, got %d", client.readCalls)
+	}
+}
+
+func TestReadStreamRangeBypassesReaderCache(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	r.storeCached("fsid-1", 0, []byte("cached"))
+	data, err := r.ReadStreamRange(context.Background(), "fsid-1", 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	readCalls := client.readCalls
+	client.mu.Unlock()
+	if len(data) != 6 || readCalls != 1 {
+		t.Fatalf("stream range len=%d backend_reads=%d", len(data), readCalls)
+	}
+}
+
+func TestInvalidateDownloadLinkClearsBothReaderAndClientCaches(t *testing.T) {
+	client := &stubClient{}
+	r := NewReader(client)
+	if _, err := r.downloadLink("fsid-1", client); err != nil {
+		t.Fatal(err)
+	}
+	r.InvalidateDownloadLink("fsid-1")
+	r.mu.RLock()
+	_, cached := r.links["fsid-1"]
+	r.mu.RUnlock()
+	client.mu.Lock()
+	invalidated := client.invalidated
+	client.mu.Unlock()
+	if cached || invalidated != 1 {
+		t.Fatalf("invalidate cached=%v client_calls=%d", cached, invalidated)
+	}
+}
+
+func TestClassifyDownloadError(t *testing.T) {
+	tests := []struct {
+		err  error
+		want DownloadErrorKind
+	}{
+		{fmt.Errorf("download range failed: status=403"), DownloadErrorAuth},
+		{fmt.Errorf("download range failed: status=416"), DownloadErrorRange},
+		{fmt.Errorf("connection reset by peer"), DownloadErrorTransport},
+		{io.ErrUnexpectedEOF, DownloadErrorEOF},
+	}
+	for _, test := range tests {
+		if got := ClassifyDownloadError(test.err); got != test.want {
+			t.Fatalf("classify %v: got %d want %d", test.err, got, test.want)
+		}
 	}
 }
 
@@ -343,4 +511,73 @@ func TestReadRangeCancelsInflightWaiter(t *testing.T) {
 	if err := <-ownerDone; err != nil {
 		t.Fatal(err)
 	}
+}
+
+type chunkBlockingClient struct {
+	mu          sync.Mutex
+	blockOffset int64
+	started     chan int64
+	release     chan struct{}
+	reads       map[int64]int
+}
+
+func newChunkBlockingClient(blockOffset int64) *chunkBlockingClient {
+	return &chunkBlockingClient{
+		blockOffset: blockOffset,
+		started:     make(chan int64, 8),
+		release:     make(chan struct{}),
+		reads:       make(map[int64]int),
+	}
+}
+
+func (c *chunkBlockingClient) List(string) ([]baidu.RemoteEntry, error) { return nil, nil }
+func (c *chunkBlockingClient) Stat(string) (baidu.RemoteEntry, error) {
+	return baidu.RemoteEntry{}, nil
+}
+func (c *chunkBlockingClient) GetDownloadLink(string) (baidu.DownloadLink, error) {
+	return baidu.DownloadLink{URL: "https://example.invalid", ExpiresAt: time.Now().Add(time.Minute)}, nil
+}
+func (c *chunkBlockingClient) Delete([]string) error { return nil }
+func (c *chunkBlockingClient) RefreshAuth() error    { return nil }
+func (c *chunkBlockingClient) ReadRange(ctx context.Context, _ string, offset int64, dst []byte) (int, error) {
+	c.mu.Lock()
+	c.reads[offset]++
+	c.mu.Unlock()
+	select {
+	case c.started <- offset:
+	default:
+	}
+	if offset == c.blockOffset {
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	for i := range dst {
+		dst[i] = byte(offset + int64(i))
+	}
+	return len(dst), nil
+}
+
+func (c *chunkBlockingClient) waitStarted(t *testing.T, want int64) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case got := <-c.started:
+			if got == want {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for chunk %d", want)
+		}
+	}
+}
+
+func (c *chunkBlockingClient) readCount(offset int64) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads[offset]
 }

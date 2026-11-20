@@ -10,11 +10,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"os/user"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"baidudisklink/internal/auth"
@@ -22,6 +25,7 @@ import (
 	"baidudisklink/internal/fs"
 	"baidudisklink/internal/remote"
 	"baidudisklink/internal/store"
+	"baidudisklink/internal/stream"
 )
 
 type Config struct {
@@ -31,9 +35,21 @@ type Config struct {
 	MetaDBPath          string
 	FuseGroupName       string
 	FuseTraceReads      bool
+	FuseDefaultPerms    bool
 	EnableDelete        bool
+	MetadataTTLSeconds  int
+	RootRefreshSeconds  int
 	DownloadConcurrency int
 	DownloadChunkSize   int64
+	StreamChunkSize     int64
+	StreamWorkers       int
+	StreamLowWatermark  int64
+	StreamTargetBuffer  int64
+	StreamBackBuffer    int64
+	StreamMemoryCache   int64
+	StreamDiskCache     int64
+	StreamCachePath     string
+	StreamHedge         bool
 	ClientID            string
 	ClientSecret        string
 	RedirectURI         string
@@ -51,6 +67,7 @@ type App struct {
 	auth            *auth.Manager
 	store           *store.Store
 	remote          *remote.Reader
+	stream          *stream.Manager
 	oauth           oauthFlow
 	tokenHTTPClient *http.Client
 	clientFactory   func(auth.Token) baidu.Client
@@ -60,6 +77,11 @@ type App struct {
 		Wait()
 		Unmount() error
 	}
+	closeOnce     sync.Once
+	closeErr      error
+	mu            sync.Mutex
+	refreshCancel context.CancelFunc
+	authNoticeSet bool
 }
 
 type oauthFlow interface {
@@ -145,6 +167,27 @@ func New(cfg Config) (*App, error) {
 	mgr := auth.NewManager(tokenStore)
 	remoteReader := remote.NewReader(&baidu.StaticClient{})
 	remoteReader.SetDownloadOptions(cfg.DownloadConcurrency, cfg.DownloadChunkSize)
+	streamManager, err := stream.NewManager(remoteReader, stream.Config{
+		ChunkSize:      cfg.StreamChunkSize,
+		Workers:        cfg.StreamWorkers,
+		LowWatermark:   cfg.StreamLowWatermark,
+		TargetBuffer:   cfg.StreamTargetBuffer,
+		BackBuffer:     cfg.StreamBackBuffer,
+		MemoryCache:    cfg.StreamMemoryCache,
+		DiskCache:      cfg.StreamDiskCache,
+		CachePath:      cfg.StreamCachePath,
+		Hedge:          cfg.StreamHedge,
+		Diagnostics:    cfg.FuseTraceReads,
+		SessionWorkers: cfg.StreamWorkers - 2,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if cfg.StreamCachePath != "" && cfg.StreamDiskCache > 0 {
+		log.Printf("stream cache memory=%d disk=%d path=%q", cfg.StreamMemoryCache, cfg.StreamDiskCache, cfg.StreamCachePath)
+	} else {
+		log.Printf("stream cache memory=%d disk=disabled", cfg.StreamMemoryCache)
+	}
 
 	return &App{
 		cfg:      cfg,
@@ -152,6 +195,7 @@ func New(cfg Config) (*App, error) {
 		auth:     mgr,
 		store:    metaStore,
 		remote:   remoteReader,
+		stream:   streamManager,
 		oauth: auth.NewOAuthServer(auth.OAuthConfig{
 			ClientID:         cfg.ClientID,
 			ClientSecret:     cfg.ClientSecret,
@@ -162,12 +206,15 @@ func New(cfg Config) (*App, error) {
 			AuthorizeBaseURL: cfg.AuthorizeBaseURL,
 		}, mgr),
 		clientFactory: func(token auth.Token) baidu.Client {
-			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(cfg.DownloadConcurrency), nil)
+			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, cfg.ClientID, cfg.ClientSecret, cfg.APIBaseURL, cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(cfg.StreamWorkers), func(accessToken, refreshToken string) error {
+				return mgr.SaveToken(auth.Token{AccessToken: accessToken, RefreshToken: refreshToken})
+			})
 		},
 		mountFunc: func(mountPath string, root *fs.Filesystem) (*fakeMountServer, error) {
 			server, err := fs.Mount(mountPath, root, fs.MountOptions{
-				AllowOther: true,
-				GIDs:       fuseGIDs,
+				AllowOther:         true,
+				GIDs:               fuseGIDs,
+				DefaultPermissions: cfg.FuseDefaultPerms,
 			})
 			if err != nil {
 				return nil, err
@@ -229,12 +276,21 @@ func sqliteDSN(path string) string {
 		return ""
 	}
 	if strings.Contains(path, "?") {
-		return path + "&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+		return path + "&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 	}
-	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	// _txlock=immediate：事务开始即拿写锁。WAL 下“先读后写”的延迟事务在并发写入时会直接返回
+	// SQLITE_BUSY（不走 busy_timeout），导致并发目录刷新失败。
+	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 }
 
 func (a *App) Run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	defer a.Close()
+	return a.run(ctx)
+}
+
+func (a *App) run(ctx context.Context) error {
 	if a == nil {
 		return errors.New("app is nil")
 	}
@@ -243,9 +299,13 @@ func (a *App) Run() error {
 	}
 	if err := a.bindRemoteClient(); err == nil {
 		if err := a.remoteHealthCheck(); err == nil {
-			return a.mountAndWait()
+			return a.mountAndWait(ctx)
 		} else {
-			log.Printf("stored token is not usable, starting oauth flow: %v", err)
+			if errors.Is(err, baidu.ErrAuthExpired) {
+				log.Printf("百度登录已失效，正在启动重新授权流程；请打开下方 OAuth 授权链接重新登录: %v", err)
+			} else {
+				log.Printf("stored token is not usable, starting oauth flow: %v", err)
+			}
 		}
 	} else {
 		log.Printf("stored token is not available, starting oauth flow: %v", err)
@@ -265,11 +325,28 @@ func (a *App) Run() error {
 	if err := a.oauth.Start(listenAddr); err != nil {
 		return err
 	}
-	defer func() {
-		_ = a.oauth.Shutdown(context.Background())
+	resultCh := make(chan struct {
+		result auth.OAuthResult
+		err    error
+	}, 1)
+	go func() {
+		result, waitErr := a.oauth.Wait()
+		resultCh <- struct {
+			result auth.OAuthResult
+			err    error
+		}{result: result, err: waitErr}
 	}()
-	result, err := a.oauth.Wait()
-	if err != nil {
+	var result auth.OAuthResult
+	select {
+	case outcome := <-resultCh:
+		if outcome.err != nil {
+			return outcome.err
+		}
+		result = outcome.result
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := a.shutdownOAuth(); err != nil {
 		return err
 	}
 	if err := a.saveOAuthToken(result.Code); err != nil {
@@ -278,7 +355,7 @@ func (a *App) Run() error {
 	if err := a.bindRemoteClient(); err != nil {
 		return err
 	}
-	return a.mountAndWait()
+	return a.mountAndWait(ctx)
 }
 
 func (a *App) remoteHealthCheck() error {
@@ -289,46 +366,158 @@ func (a *App) remoteHealthCheck() error {
 	return err
 }
 
-func (a *App) mountAndWait() error {
+func (a *App) mountAndWait(ctx context.Context) error {
 	if a == nil {
 		return errors.New("app is nil")
 	}
-	a.filesystem = fs.NewFilesystem(a.store, a.remote, a.fuseGIDs, a.cfg.RemoteRootPath)
+	a.filesystem = fs.NewFilesystemWithStream(a.store, a.remote, a.stream, a.fuseGIDs, a.cfg.RemoteRootPath)
 	a.filesystem.SetTraceReads(a.cfg.FuseTraceReads)
 	a.filesystem.SetDeleteEnabled(a.cfg.EnableDelete)
+	if a.cfg.MetadataTTLSeconds > 0 {
+		a.filesystem.SetMetadataTTL(time.Duration(a.cfg.MetadataTTLSeconds) * time.Second)
+	}
+	if err := a.filesystem.RefreshRootOnly(context.Background()); err != nil {
+		return fmt.Errorf("preload mount root: %w", err)
+	}
 	server, err := a.mountFunc(a.cfg.MountPath, a.filesystem)
 	if err != nil {
 		return err
 	}
-	stopRefresh := make(chan struct{})
-	defer close(stopRefresh)
-	a.startRefreshLoop(stopRefresh)
+	refreshCtx, stopRefresh := context.WithCancel(ctx)
+	a.startRefreshLoop(refreshCtx)
+	a.mu.Lock()
 	a.server = server
-	defer func() {
-		_ = a.server.Unmount()
+	a.refreshCancel = stopRefresh
+	a.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = a.unmountServer(server)
+		case <-done:
+		}
 	}()
-	a.server.Wait()
+	server.Wait()
+	close(done)
+	stopRefresh()
+	_ = a.unmountServer(server)
+	a.mu.Lock()
+	if a.refreshCancel != nil {
+		a.refreshCancel = nil
+	}
+	a.mu.Unlock()
 	return nil
 }
 
-func (a *App) startRefreshLoop(stop <-chan struct{}) {
+func (a *App) startRefreshLoop(ctx context.Context) {
 	if a == nil || a.filesystem == nil {
 		return
 	}
+	interval := time.Minute
+	if a.cfg.RootRefreshSeconds > 0 {
+		interval = time.Duration(a.cfg.RootRefreshSeconds) * time.Second
+	}
 	go func() {
-		ticker := time.NewTicker(time.Minute)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				if err := a.filesystem.RefreshRootOnly(context.Background()); err != nil {
-					log.Printf("periodic refresh failed: %v", err)
+					a.logPeriodicRefreshResult(err)
+					continue
 				}
-			case <-stop:
+				a.logPeriodicRefreshResult(nil)
+				log.Printf("本轮扫描结束，下轮扫描时间 %s", time.Now().Add(interval).Format("15:04:05"))
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
+}
+
+func (a *App) logPeriodicRefreshResult(err error) {
+	if err == nil {
+		a.mu.Lock()
+		a.authNoticeSet = false
+		a.mu.Unlock()
+		return
+	}
+	if !errors.Is(err, baidu.ErrAuthExpired) {
+		log.Printf("periodic refresh failed: %v", err)
+		return
+	}
+	a.mu.Lock()
+	if a.authNoticeSet {
+		a.mu.Unlock()
+		return
+	}
+	a.authNoticeSet = true
+	a.mu.Unlock()
+	log.Printf("百度登录已失效，无法访问百度网盘；已保留上次成功的目录缓存。请重启 BaiduDiskLink，并打开启动日志中的 OAuth 授权链接重新登录: %v", err)
+}
+
+func (a *App) shutdownOAuth() error {
+	if a == nil || a.oauth == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return a.oauth.Shutdown(ctx)
+}
+
+func (a *App) unmountServer(server interface {
+	Wait()
+	Unmount() error
+}) error {
+	if a == nil || server == nil {
+		return nil
+	}
+	a.mu.Lock()
+	if a.server != server {
+		a.mu.Unlock()
+		return nil
+	}
+	a.server = nil
+	a.mu.Unlock()
+	return server.Unmount()
+}
+
+func (a *App) Close() error {
+	if a == nil {
+		return nil
+	}
+	a.closeOnce.Do(func() {
+		var errs []error
+		if err := a.shutdownOAuth(); err != nil {
+			errs = append(errs, err)
+		}
+		a.mu.Lock()
+		server := a.server
+		stopRefresh := a.refreshCancel
+		a.refreshCancel = nil
+		a.mu.Unlock()
+		if stopRefresh != nil {
+			stopRefresh()
+		}
+		if server != nil {
+			if err := a.unmountServer(server); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if a.stream != nil {
+			if err := a.stream.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if a.store != nil {
+			if err := a.store.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		a.closeErr = errors.Join(errs...)
+	})
+	return a.closeErr
 }
 
 func (a *App) saveOAuthToken(code string) error {
@@ -381,7 +570,7 @@ func (a *App) bindRemoteClient() error {
 	}
 	if a.clientFactory == nil {
 		a.clientFactory = func(token auth.Token) baidu.Client {
-			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, a.cfg.ClientID, a.cfg.ClientSecret, a.cfg.APIBaseURL, a.cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(a.cfg.DownloadConcurrency), func(accessToken, refreshToken string) error {
+			return baidu.NewAPIClientWithHTTPClients(token.AccessToken, token.RefreshToken, a.cfg.ClientID, a.cfg.ClientSecret, a.cfg.APIBaseURL, a.cfg.TokenBaseURL, baidu.NewMetadataHTTPClient(), baidu.NewDownloadHTTPClient(a.cfg.StreamWorkers), func(accessToken, refreshToken string) error {
 				return a.auth.SaveToken(auth.Token{AccessToken: accessToken, RefreshToken: refreshToken})
 			})
 		}

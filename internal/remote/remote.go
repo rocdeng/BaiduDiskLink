@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import "context"
 type Reader struct {
 	mu          sync.RWMutex
 	client      baidu.Client
+	clientGen   uint64
 	links       map[string]cachedLink
 	cached      map[cacheKey]cachedRead
 	cacheByFSID map[string]map[cacheKey]struct{}
@@ -24,6 +26,36 @@ type Reader struct {
 	inflight    map[cacheKey]*inflightRead
 	concurrency int
 	chunkSize   int64
+}
+
+type DownloadErrorKind uint8
+
+const (
+	DownloadErrorOther DownloadErrorKind = iota
+	DownloadErrorTransport
+	DownloadErrorAuth
+	DownloadErrorRange
+	DownloadErrorEOF
+)
+
+func ClassifyDownloadError(err error) DownloadErrorKind {
+	if err == nil {
+		return DownloadErrorOther
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return DownloadErrorEOF
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "status=401") || strings.Contains(message, "status=403") || strings.Contains(message, "unauthorized") || strings.Contains(message, "forbidden") {
+		return DownloadErrorAuth
+	}
+	if strings.Contains(message, "status=416") || strings.Contains(message, "content range") {
+		return DownloadErrorRange
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || strings.Contains(message, "timeout") || strings.Contains(message, "connection reset") {
+		return DownloadErrorTransport
+	}
+	return DownloadErrorOther
 }
 
 type cacheKey struct {
@@ -60,7 +92,7 @@ func NewReader(client baidu.Client) *Reader {
 		inflight:    make(map[cacheKey]*inflightRead),
 		cacheLimit:  64 << 20,
 		concurrency: 1,
-		chunkSize:   4 << 20,
+		chunkSize:   8 << 20,
 	}
 }
 
@@ -72,13 +104,25 @@ func (r *Reader) SetDownloadOptions(concurrency int, chunkSize int64) {
 		concurrency = 1
 	}
 	if chunkSize <= 0 {
-		chunkSize = 4 << 20
+		chunkSize = 8 << 20
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.concurrency = concurrency
 	r.chunkSize = chunkSize
 	r.clearReadCacheLocked()
+}
+
+func (r *Reader) ChunkSize() int64 {
+	if r == nil {
+		return 8 << 20
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.chunkSize <= 0 {
+		return 8 << 20
+	}
+	return r.chunkSize
 }
 
 func (r *Reader) SetClient(client baidu.Client) {
@@ -88,8 +132,22 @@ func (r *Reader) SetClient(client baidu.Client) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.client = client
+	r.clientGen++
 	r.links = make(map[string]cachedLink)
 	r.clearReadCacheLocked()
+}
+
+func (r *Reader) InvalidateDownloadLink(fsid string) {
+	if r == nil || fsid == "" {
+		return
+	}
+	r.mu.Lock()
+	delete(r.links, fsid)
+	client := r.client
+	r.mu.Unlock()
+	if invalidator, ok := client.(interface{ InvalidateDownloadLink(string) }); ok {
+		invalidator.InvalidateDownloadLink(fsid)
+	}
 }
 
 func (r *Reader) List(path string) ([]baidu.RemoteEntry, error) {
@@ -125,7 +183,23 @@ func (r *Reader) ReadRange(ctx context.Context, fsid string, offset, length int6
 	if data, ok := r.readCached(fsid, offset, length); ok {
 		return data, nil
 	}
-	return r.readWithOptions(ctx, client, fsid, offset, length)
+	data, err := r.readWithOptions(ctx, client, fsid, offset, length)
+	if err != nil || int64(len(data)) >= length {
+		return data, err
+	}
+	missingOffset := offset + int64(len(data))
+	missingLength := length - int64(len(data))
+	missing, err := r.ReadExactRange(ctx, fsid, missingOffset, missingLength)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]byte, len(data)+len(missing))
+	copy(result, data)
+	copy(result[len(data):], missing)
+	if int64(len(result)) != length {
+		return nil, fmt.Errorf("read range at %d returned %d of %d bytes: %w", offset, len(result), length, io.ErrUnexpectedEOF)
+	}
+	return result, nil
 }
 
 func (r *Reader) Prefetch(ctx context.Context, fsid string, offset, length int64) error {
@@ -141,10 +215,25 @@ func (r *Reader) Prefetch(ctx context.Context, fsid string, offset, length int64
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	client := r.currentClient()
+	if client == nil {
+		return nil
+	}
+	if _, err := r.downloadLink(fsid, client); err != nil {
+		return err
+	}
 	if _, ok := r.readCached(fsid, offset, length); ok {
 		return nil
 	}
-	_, err := r.ReadExactRange(ctx, fsid, offset, length)
+	r.mu.RLock()
+	concurrency := r.concurrency
+	chunkSize := r.chunkSize
+	r.mu.RUnlock()
+	if concurrency <= 1 || length <= chunkSize {
+		_, err := r.ReadExactRange(ctx, fsid, offset, length)
+		return err
+	}
+	_, err := r.readConcurrent(ctx, client, fsid, offset, length, chunkSize, concurrency)
 	return err
 }
 
@@ -169,6 +258,9 @@ func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		n, err := client.ReadRange(ctx, fsid, offset, data)
+		if err == nil && n != len(data) {
+			err = fmt.Errorf("read exact range at %d returned %d of %d bytes: %w", offset, n, len(data), io.ErrUnexpectedEOF)
+		}
 		if err == nil {
 			data = data[:n]
 			r.storeCached(fsid, offset, data)
@@ -178,9 +270,38 @@ func (r *Reader) ReadExactRange(ctx context.Context, fsid string, offset, length
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		_ = client.RefreshAuth()
+		if ClassifyDownloadError(err) == DownloadErrorAuth {
+			// CDN 401/403 多为直链签名失效：作废直链重新解析；token 失效由 API 层识别并刷新。
+			r.InvalidateDownloadLink(fsid)
+		}
 	}
 	return nil, lastErr
+}
+
+func (r *Reader) ReadStreamRange(ctx context.Context, fsid string, offset, length int64) ([]byte, error) {
+	if length < 0 {
+		return nil, errors.New("length must be non-negative")
+	}
+	if fsid == "" {
+		return nil, errors.New("fsid is required")
+	}
+	client := r.currentClient()
+	if r == nil || client == nil {
+		return make([]byte, length), nil
+	}
+	data := make([]byte, length)
+	n, err := client.ReadRange(ctx, fsid, offset, data)
+	if err == nil && n != len(data) {
+		err = fmt.Errorf("stream range at %d returned %d of %d bytes: %w", offset, n, len(data), io.ErrUnexpectedEOF)
+	}
+	if err != nil {
+		if ClassifyDownloadError(err) == DownloadErrorAuth {
+			// CDN 401/403 多为直链签名失效：作废直链重新解析；token 失效由 API 层识别并刷新。
+			r.InvalidateDownloadLink(fsid)
+		}
+		return nil, err
+	}
+	return data[:n], nil
 }
 
 func (r *Reader) readCached(fsid string, offset, length int64) ([]byte, bool) {
@@ -281,11 +402,26 @@ func (r *Reader) storeCachedLocked(fsid string, offset int64, data []byte) {
 }
 
 func (r *Reader) clearReadCacheLocked() {
+	r.clearCachedReadsLocked()
+	r.inflight = make(map[cacheKey]*inflightRead)
+}
+
+func (r *Reader) clearCachedReadsLocked() {
 	r.cached = make(map[cacheKey]cachedRead)
 	r.cacheByFSID = make(map[string]map[cacheKey]struct{})
 	r.cacheOrder = nil
 	r.cacheBytes = 0
-	r.inflight = make(map[cacheKey]*inflightRead)
+}
+
+func (r *Reader) ClearReadCache() int64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	reclaimed := r.cacheBytes
+	r.clearCachedReadsLocked()
+	return reclaimed
 }
 
 func (r *Reader) readWithOptions(ctx context.Context, client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
@@ -341,7 +477,10 @@ func (r *Reader) readSequential(ctx context.Context, client baidu.Client, fsid s
 			r.finishInflight(fsid, fetchOffset, inflight, nil, ctx.Err())
 			return nil, ctx.Err()
 		}
-		_ = client.RefreshAuth()
+		if ClassifyDownloadError(err) == DownloadErrorAuth {
+			// CDN 401/403 多为直链签名失效：作废直链重新解析；token 失效由 API 层识别并刷新。
+			r.InvalidateDownloadLink(fsid)
+		}
 	}
 	r.finishInflight(fsid, fetchOffset, inflight, nil, lastErr)
 	return nil, lastErr
@@ -416,7 +555,7 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 		return []byte{}, nil
 	}
 	if chunkSize <= 0 {
-		chunkSize = 4 << 20
+		chunkSize = 8 << 20
 	}
 	total := int((length + chunkSize - 1) / chunkSize)
 	if total <= 1 {
@@ -449,21 +588,7 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 					end = length
 				}
 				dst := buf[begin:end]
-				var err error
-				for attempt := 0; attempt < 2; attempt++ {
-					var n int
-					n, err = client.ReadRange(ctx, fsid, start, dst)
-					if err == nil && n != len(dst) {
-						err = fmt.Errorf("read chunk at %d returned %d of %d bytes: %w", start, n, len(dst), io.ErrUnexpectedEOF)
-					}
-					if err == nil {
-						break
-					}
-					if ctx.Err() != nil {
-						break
-					}
-					_ = client.RefreshAuth()
-				}
+				chunk, err := r.readChunk(ctx, client, fsid, start, int64(len(dst)))
 				if err != nil {
 					errMu.Lock()
 					if firstErr == nil {
@@ -473,6 +598,7 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 					errMu.Unlock()
 					return
 				}
+				copy(dst, chunk)
 			}
 		}
 	}
@@ -495,16 +621,64 @@ func (r *Reader) readConcurrent(ctx context.Context, client baidu.Client, fsid s
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	r.storeCached(fsid, offset, buf)
 	return buf, nil
 }
 
+func (r *Reader) readChunk(ctx context.Context, client baidu.Client, fsid string, offset, length int64) ([]byte, error) {
+	if data, ok := r.readCached(fsid, offset, length); ok {
+		return data, nil
+	}
+	if data, err, waited := r.waitInflight(ctx, fsid, offset, offset, length); waited {
+		return data, err
+	}
+	inflight, owner := r.beginInflight(fsid, offset)
+	if !owner {
+		select {
+		case <-inflight.done:
+			if inflight.err != nil {
+				return nil, inflight.err
+			}
+			return sliceForWindow(inflight.data, offset, offset, length), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	data := make([]byte, length)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		n, err := client.ReadRange(ctx, fsid, offset, data)
+		if err == nil && n != len(data) {
+			err = fmt.Errorf("read chunk at %d returned %d of %d bytes: %w", offset, n, len(data), io.ErrUnexpectedEOF)
+		}
+		if err == nil {
+			data = data[:n]
+			r.finishInflight(fsid, offset, inflight, data, nil)
+			r.storeCached(fsid, offset, data)
+			return data, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			r.finishInflight(fsid, offset, inflight, nil, ctx.Err())
+			return nil, ctx.Err()
+		}
+		if ClassifyDownloadError(err) == DownloadErrorAuth {
+			// CDN 401/403 多为直链签名失效：作废直链重新解析；token 失效由 API 层识别并刷新。
+			r.InvalidateDownloadLink(fsid)
+		}
+	}
+	r.finishInflight(fsid, offset, inflight, nil, lastErr)
+	return nil, lastErr
+}
+
 func (r *Reader) downloadLink(fsid string, client baidu.Client) (baidu.DownloadLink, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cached, ok := r.links[fsid]; ok && time.Now().Before(cached.expiresAt) {
+	r.mu.RLock()
+	cached, ok := r.links[fsid]
+	generation := r.clientGen
+	r.mu.RUnlock()
+	if ok && time.Now().Before(cached.expiresAt) {
 		return cached.link, nil
 	}
+	// 网络请求不持有 r.mu，避免阻塞同一 Reader 上的缓存读取与其他文件的读请求。
 	link, err := client.GetDownloadLink(fsid)
 	if err != nil {
 		return baidu.DownloadLink{}, err
@@ -513,7 +687,12 @@ func (r *Reader) downloadLink(fsid string, client baidu.Client) (baidu.DownloadL
 	if expiresAt.IsZero() {
 		expiresAt = time.Now().Add(10 * time.Minute)
 	}
-	r.links[fsid] = cachedLink{link: link, expiresAt: expiresAt}
+	r.mu.Lock()
+	// SetClient 期间换了客户端时不写回旧客户端的直链。
+	if r.clientGen == generation {
+		r.links[fsid] = cachedLink{link: link, expiresAt: expiresAt}
+	}
+	r.mu.Unlock()
 	return link, nil
 }
 

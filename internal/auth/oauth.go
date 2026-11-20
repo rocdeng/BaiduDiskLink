@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -12,6 +14,9 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
+
+	"baidudisklink/internal/redact"
 )
 
 type OAuthResult struct {
@@ -24,14 +29,30 @@ type OAuthServer struct {
 	server *http.Server
 	once   sync.Once
 	result chan OAuthResult
+	done   chan struct{}
 }
 
 func NewOAuthServer(cfg OAuthConfig, mgr *Manager) *OAuthServer {
+	randomState := newOAuthState()
+	if cfg.State == "" {
+		cfg.State = randomState
+	} else {
+		cfg.State += "-" + randomState
+	}
 	return &OAuthServer{
 		cfg:    cfg,
 		mgr:    mgr,
 		result: make(chan OAuthResult, 1),
+		done:   make(chan struct{}),
 	}
+}
+
+func newOAuthState() string {
+	data := make([]byte, 32)
+	if _, err := rand.Read(data); err != nil {
+		panic(fmt.Sprintf("generate oauth state: %v", err))
+	}
+	return hex.EncodeToString(data)
 }
 
 func (s *OAuthServer) AuthorizeURL() (string, error) {
@@ -47,7 +68,15 @@ func (s *OAuthServer) Start(addr string) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", s.handleCallback)
-	s.server = &http.Server{Addr: addr, Handler: mux}
+	s.server = &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -62,21 +91,30 @@ func (s *OAuthServer) Wait() (OAuthResult, error) {
 	if s == nil {
 		return OAuthResult{}, errors.New("oauth server is nil")
 	}
-	result, ok := <-s.result
-	if !ok {
+	select {
+	case result := <-s.result:
+		return result, nil
+	case <-s.done:
 		return OAuthResult{}, errors.New("oauth server closed")
 	}
-	return result, nil
 }
 
 func (s *OAuthServer) Shutdown(ctx context.Context) error {
-	if s == nil || s.server == nil {
+	if s == nil {
+		return nil
+	}
+	s.once.Do(func() { close(s.done) })
+	if s.server == nil {
 		return nil
 	}
 	return s.server.Shutdown(ctx)
 }
 
 func (s *OAuthServer) handleCallback(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("state") != s.cfg.State {
+		http.Error(w, "state mismatch", http.StatusBadRequest)
+		return
+	}
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		http.Error(w, "missing code", http.StatusBadRequest)
@@ -84,6 +122,9 @@ func (s *OAuthServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	select {
 	case s.result <- OAuthResult{Code: code}:
+	case <-s.done:
+		http.Error(w, "oauth server closed", http.StatusGone)
+		return
 	default:
 	}
 	_, _ = fmt.Fprintln(w, "authorization received")
@@ -159,7 +200,8 @@ func ExchangeToken(cfg OAuthConfig, code string, client *http.Client) (Token, er
 	}
 	resp, err := client.Get(endpoint)
 	if err != nil {
-		return Token{}, err
+		// endpoint 中包含 code 与 client_secret，返回前脱敏。
+		return Token{}, redact.Error(err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)

@@ -3,9 +3,12 @@ package fs
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"log"
+	"math"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,12 +20,14 @@ import (
 	"baidudisklink/internal/cache"
 	"baidudisklink/internal/remote"
 	"baidudisklink/internal/store"
+	"baidudisklink/internal/stream"
 )
 
 type Filesystem struct {
 	goFs.Inode
 	store        *store.Store
 	remote       *remote.Reader
+	stream       *stream.Manager
 	negative     *cache.NegativeCache
 	ttl          time.Duration
 	primaryGID   uint32
@@ -31,11 +36,45 @@ type Filesystem struct {
 	refreshMu    chan struct{}
 	traceReads   bool
 	enableDelete bool
+	readDiagMu   sync.Mutex
+	readDiag     map[string]*readDiagnosticWindow
+	startedAt    time.Time
+	// flights 按目录路径合并并发刷新：同一目录同一时刻只调用一次百度 List。
+	flightMu sync.Mutex
+	flights  map[string]*refreshFlight
 }
 
-const fuseReadWindowSize int64 = 16 << 20
+type refreshFlight struct {
+	done chan struct{}
+	err  error
+}
+
+// DefaultMetadataTTL：目录内容缓存的新鲜期。过期后先返回旧数据并在后台刷新，不阻塞 FUSE 调用。
+const DefaultMetadataTTL = 5 * time.Minute
+
+const (
+	slowFuseReadThreshold  = 300 * time.Millisecond
+	readDiagnosticInterval = 5 * time.Second
+)
+
+type readDiagnosticWindow struct {
+	startedAt      time.Time
+	path           string
+	fsid           string
+	strategy       string
+	slowReads      int
+	canceledReads  int
+	requestedBytes int64
+	returnedBytes  int64
+	maxElapsed     time.Duration
+	maxOffset      int64
+}
 
 func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath string) *Filesystem {
+	return NewFilesystemWithStream(st, r, nil, gids, rootPath)
+}
+
+func NewFilesystemWithStream(st *store.Store, r *remote.Reader, streamManager *stream.Manager, gids []uint32, rootPath string) *Filesystem {
 	out := make(map[uint32]struct{}, len(gids))
 	var primary uint32
 	for _, gid := range gids {
@@ -47,7 +86,28 @@ func NewFilesystem(st *store.Store, r *remote.Reader, gids []uint32, rootPath st
 	if rootPath == "" {
 		rootPath = "/"
 	}
-	return &Filesystem{store: st, remote: r, ttl: time.Minute, primaryGID: primary, gids: out, rootPath: rootPath, refreshMu: make(chan struct{}, 1)}
+	return &Filesystem{
+		store:      st,
+		remote:     r,
+		stream:     streamManager,
+		negative:   cache.NewNegativeCache(30 * time.Second),
+		ttl:        DefaultMetadataTTL,
+		primaryGID: primary,
+		gids:       out,
+		rootPath:   rootPath,
+		refreshMu:  make(chan struct{}, 1),
+		readDiag:   make(map[string]*readDiagnosticWindow),
+		startedAt:  time.Now(),
+		flights:    make(map[string]*refreshFlight),
+	}
+}
+
+// SetMetadataTTL 设置目录缓存新鲜期；必须在挂载前调用。
+func (f *Filesystem) SetMetadataTTL(ttl time.Duration) {
+	if f == nil || ttl <= 0 {
+		return
+	}
+	f.ttl = ttl
 }
 
 func (f *Filesystem) SetTraceReads(enabled bool) {
@@ -64,14 +124,82 @@ func (f *Filesystem) SetDeleteEnabled(enabled bool) {
 	f.enableDelete = enabled
 }
 
+func (f *Filesystem) recordSlowRead(path, fsid string, offset int64, requested, returned int, elapsed time.Duration, strategy string) {
+	if f == nil || !f.traceReads {
+		return
+	}
+	f.recordReadDiagnostic(time.Now(), path, fsid, offset, requested, returned, elapsed, strategy, true)
+}
+
+func (f *Filesystem) recordCanceledRead(path, fsid string, offset int64, requested int) {
+	if f == nil || !f.traceReads {
+		return
+	}
+	f.recordReadDiagnostic(time.Now(), path, fsid, offset, requested, 0, 0, "", false)
+}
+
+func (f *Filesystem) recordReadDiagnostic(now time.Time, path, fsid string, offset int64, requested, returned int, elapsed time.Duration, strategy string, slow bool) {
+	if f == nil || fsid == "" {
+		return
+	}
+	f.readDiagMu.Lock()
+	if f.readDiag == nil {
+		f.readDiag = make(map[string]*readDiagnosticWindow)
+	}
+	window := f.readDiag[fsid]
+	if window == nil {
+		window = &readDiagnosticWindow{startedAt: now, path: path, fsid: fsid}
+		f.readDiag[fsid] = window
+	}
+	var flushed *readDiagnosticWindow
+	if now.Sub(window.startedAt) >= readDiagnosticInterval {
+		copy := *window
+		flushed = &copy
+		*window = readDiagnosticWindow{startedAt: now, path: path, fsid: fsid}
+	}
+	if path != "" {
+		window.path = path
+	}
+	if strategy != "" {
+		window.strategy = strategy
+	}
+	if slow {
+		window.slowReads++
+		window.requestedBytes += int64(requested)
+		window.returnedBytes += int64(returned)
+		if elapsed > window.maxElapsed {
+			window.maxElapsed = elapsed
+			window.maxOffset = offset
+		}
+	} else {
+		window.canceledReads++
+		window.requestedBytes += int64(requested)
+		window.maxOffset = offset
+	}
+	f.readDiagMu.Unlock()
+	if flushed != nil {
+		logReadDiagnostic(*flushed)
+	}
+}
+
+func logReadDiagnostic(window readDiagnosticWindow) {
+	if window.slowReads == 0 && window.canceledReads == 0 {
+		return
+	}
+	log.Printf("fuse read summary path=%q fsid=%q window=%s slow_reads=%d canceled_reads=%d requested=%d returned=%d max_elapsed=%s max_offset=%d strategy=%s", window.path, window.fsid, readDiagnosticInterval, window.slowReads, window.canceledReads, window.requestedBytes, window.returnedBytes, window.maxElapsed, window.maxOffset, window.strategy)
+}
+
 func (f *Filesystem) OnAdd(ctx context.Context) {
 	if f == nil {
 		return
 	}
 	f.populate(ctx)
-	if err := f.RefreshAll(ctx); err != nil {
-		log.Printf("refresh all on mount failed: %v", err)
-	}
+	// 挂载前 app 已同步刷新根目录；其余已知目录放到后台，避免拖慢挂载。
+	go func() {
+		if err := f.RefreshAll(context.Background()); err != nil {
+			log.Printf("refresh all on mount failed: %v", err)
+		}
+	}()
 }
 
 func (f *Filesystem) tryRefreshToken() bool {
@@ -99,7 +227,8 @@ func (f *Filesystem) releaseRefreshToken() {
 func (f *Filesystem) Getattr(ctx context.Context, fh goFs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = syscall.S_IFDIR | f.dirMode()
 	out.Gid = f.primaryGID
-	out.Mtime = uint64(time.Now().Unix())
+	// 固定为启动时间，避免每次 stat 都“变化”触发媒体库实时监控误报。
+	out.Mtime = uint64(f.startedAt.Unix())
 	out.Atime = out.Mtime
 	out.Ctime = out.Mtime
 	out.Size = 0
@@ -122,18 +251,12 @@ func (f *Filesystem) Readdir(ctx context.Context) (goFs.DirStream, syscall.Errno
 	if f == nil || f.store == nil {
 		return goFs.NewListDirStream(nil), 0
 	}
+	if err := f.ensureDirLoaded(f.rootPath, "0", true); err != nil {
+		return nil, syscall.EIO
+	}
 	children, err := f.store.ListChildren(f.rootPath)
 	if err != nil {
 		return nil, syscall.EIO
-	}
-	if f.shouldRefreshRoot(children) {
-		if err := f.refreshRoot(ctx); err != nil {
-			return nil, syscall.EIO
-		}
-		children, err = f.store.ListChildren(f.rootPath)
-		if err != nil {
-			return nil, syscall.EIO
-		}
 	}
 	return goFs.NewListDirStream(dirEntries(children)), 0
 }
@@ -145,28 +268,101 @@ func (f *Filesystem) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	if f.negative != nil && f.negative.IsMissing(JoinPath(f.rootPath, name)) {
 		return nil, syscall.ENOENT
 	}
-	children, err := f.store.ListChildren(f.rootPath)
+	if err := f.ensureDirLoaded(f.rootPath, "0", true); err != nil {
+		return nil, syscall.EIO
+	}
+	child, err := f.store.GetChild("0", name)
 	if err != nil {
 		return nil, syscall.EIO
 	}
-	if f.shouldRefreshRoot(children) {
-		if err := f.refreshRoot(ctx); err != nil {
-			f.markMissing(JoinPath(f.rootPath, name))
-			return nil, syscall.ENOENT
-		}
-		children, err = f.store.ListChildren(f.rootPath)
-		if err != nil {
-			return nil, syscall.EIO
-		}
+	if child == nil {
+		f.markMissing(JoinPath(f.rootPath, name))
+		return nil, syscall.ENOENT
 	}
-	for _, child := range children {
-		if child.Name != name {
-			continue
-		}
-		return f.newEntryInode(ctx, child, out), 0
+	return f.lookupInode(ctx, &f.Inode, *child, out), 0
+}
+
+type dirFreshness uint8
+
+const (
+	dirFresh dirFreshness = iota
+	// dirStale：内容加载过但已过新鲜期，可先返回旧数据。
+	dirStale
+	// dirMissing：从未加载或被强制过期，必须同步加载。
+	dirMissing
+)
+
+func (f *Filesystem) freshness(dirPath string) (dirFreshness, error) {
+	if f == nil || f.remote == nil {
+		return dirFresh, nil
 	}
-	f.markMissing(JoinPath(f.rootPath, name))
-	return nil, syscall.ENOENT
+	if f.ttl <= 0 {
+		return dirMissing, nil
+	}
+	current, err := f.store.GetByPath(dirPath)
+	if err != nil {
+		return dirMissing, err
+	}
+	if current == nil || current.ExpiresAt == 0 {
+		return dirMissing, nil
+	}
+	if time.Now().Unix() >= current.ExpiresAt {
+		return dirStale, nil
+	}
+	return dirFresh, nil
+}
+
+// ensureDirLoaded 实现 stale-while-revalidate：
+// 未加载过的目录同步拉取；已过期的目录立即返回旧数据，后台异步刷新。
+func (f *Filesystem) ensureDirLoaded(dirPath, fsid string, isRoot bool) error {
+	state, err := f.freshness(dirPath)
+	if err != nil {
+		return err
+	}
+	refresh := func() error {
+		if isRoot {
+			return f.refreshRoot(context.Background())
+		}
+		return f.refreshDir(context.Background(), dirPath, fsid)
+	}
+	switch state {
+	case dirMissing:
+		return f.refreshCoalesced(dirPath, refresh, true)
+	case dirStale:
+		go func() {
+			if err := f.refreshCoalesced(dirPath, refresh, false); err != nil {
+				log.Printf("background refresh %q failed: %v", dirPath, err)
+			}
+		}()
+	}
+	return nil
+}
+
+// refreshCoalesced 合并同一目录的并发刷新。wait=false 时若已有刷新在进行则直接返回。
+func (f *Filesystem) refreshCoalesced(key string, refresh func() error, wait bool) error {
+	f.flightMu.Lock()
+	if flight := f.flights[key]; flight != nil {
+		f.flightMu.Unlock()
+		if !wait {
+			return nil
+		}
+		<-flight.done
+		return flight.err
+	}
+	if f.flights == nil {
+		f.flights = make(map[string]*refreshFlight)
+	}
+	flight := &refreshFlight{done: make(chan struct{})}
+	f.flights[key] = flight
+	f.flightMu.Unlock()
+
+	flight.err = refresh()
+
+	f.flightMu.Lock()
+	delete(f.flights, key)
+	f.flightMu.Unlock()
+	close(flight.done)
+	return flight.err
 }
 
 func (f *Filesystem) refreshRoot(ctx context.Context) error {
@@ -178,10 +374,6 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 		return err
 	}
 	log.Printf("refresh root %q loaded %d entries", f.rootPath, len(entries))
-	if len(entries) == 0 {
-		f.markMissing(f.rootPath)
-		return nil
-	}
 	mapped := make([]store.Entry, 0, len(entries))
 	for _, entry := range entries {
 		relPath := trimRootPrefix(f.rootPath, entry.Path)
@@ -204,6 +396,7 @@ func (f *Filesystem) refreshRoot(ctx context.Context) error {
 			LastSyncAt: time.Now().Unix(),
 		})
 	}
+	f.preserveChildDirExpiry("0", mapped)
 	if err := f.store.ReplaceChildren("0", mapped); err != nil {
 		return err
 	}
@@ -263,8 +456,11 @@ func (f *Filesystem) refreshKnownDirectories(ctx context.Context, current string
 			continue
 		}
 		if f.remote != nil {
-			if err := f.refreshDir(ctx, child.Path, child.FSID); err != nil {
-				return err
+			refresh := func() error { return f.refreshDir(ctx, child.Path, child.FSID) }
+			if err := f.refreshCoalesced(child.Path, refresh, true); err != nil {
+				// 单个目录失败不影响其余目录的后台刷新。
+				log.Printf("refresh dir %q failed: %v", child.Path, err)
+				continue
 			}
 		}
 		if err := f.refreshKnownDirectories(ctx, child.Path, visited); err != nil {
@@ -296,20 +492,56 @@ func (f *Filesystem) newEntryInode(ctx context.Context, e store.Entry, out *fuse
 	if f == nil {
 		return nil
 	}
-	stable := goFs.StableAttr{}
-	mode := uint32(syscall.S_IFREG)
-	if e.IsDir {
-		mode = syscall.S_IFDIR
-	}
-	stable.Mode = mode
+	stable := stableAttrFor(e)
 	node := &entryNode{
 		Filesystem: f,
 		entry:      e,
 	}
 	if out != nil {
-		f.fillEntryOut(e, mode, out)
+		f.fillEntryOut(e, stable.Mode, out)
 	}
 	return f.NewPersistentInode(ctx, node, stable)
+}
+
+// lookupInode 为 Lookup 返回子节点：
+//   - inode 号由 fsid 推导、Gen 由 size/mtime 推导，同一未变化文件始终对应同一个 inode，
+//     go-fuse 会自动复用已存在的节点，内核页缓存（FOPEN_KEEP_CACHE）因此能命中；
+//   - 使用非持久 inode，内核 FORGET 后即可回收，避免反复扫库导致 inode 无限增长；
+//   - 文件内容变化（Gen 变化）时，解除旧节点的持久标记，让其可被回收。
+func (f *Filesystem) lookupInode(ctx context.Context, parent *goFs.Inode, e store.Entry, out *fuse.EntryOut) *goFs.Inode {
+	stable := stableAttrFor(e)
+	f.fillEntryOut(e, stable.Mode, out)
+	if existing := parent.GetChild(e.Name); existing != nil {
+		if existing.StableAttr() == stable {
+			return existing
+		}
+		existing.ForgetPersistent()
+	}
+	return parent.NewInode(ctx, &entryNode{Filesystem: f, entry: e}, stable)
+}
+
+// stableAttrFor 根据元数据生成稳定的 inode 标识。
+func stableAttrFor(e store.Entry) goFs.StableAttr {
+	mode := uint32(syscall.S_IFREG)
+	if e.IsDir {
+		mode = syscall.S_IFDIR
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(e.FSID))
+	ino := hash.Sum64()
+	if parsed, err := strconv.ParseUint(e.FSID, 10, 64); err == nil && parsed < math.MaxUint64-2 {
+		ino = parsed + 2
+	}
+	// 0、1（根）与 ^0 是 go-fuse 保留值。
+	if ino <= 1 || ino == math.MaxUint64 {
+		ino = 2
+	}
+	gen := uint64(e.Size)*1_000_003 ^ uint64(e.MTM)
+	if e.IsDir {
+		// 目录的 mtime 会随刷新保留，不参与 Gen，避免目录节点频繁失效。
+		gen = 0
+	}
+	return goFs.StableAttr{Mode: mode, Ino: ino, Gen: gen}
 }
 
 func (f *Filesystem) fillEntryOut(e store.Entry, mode uint32, out *fuse.EntryOut) {
@@ -390,18 +622,14 @@ func (n *entryNode) Readdir(ctx context.Context) (goFs.DirStream, syscall.Errno)
 	if n == nil || n.Filesystem == nil || n.Filesystem.store == nil {
 		return goFs.NewListDirStream(nil), 0
 	}
+	if n.entry.IsDir {
+		if err := n.Filesystem.ensureDirLoaded(n.entry.Path, n.entry.FSID, false); err != nil {
+			return nil, syscall.EIO
+		}
+	}
 	children, err := n.Filesystem.store.ListChildren(n.entry.Path)
 	if err != nil {
 		return nil, syscall.EIO
-	}
-	if n.Filesystem.shouldRefreshDir(n.entry.Path, children) && n.Filesystem.remote != nil && n.entry.IsDir {
-		if err := n.Filesystem.refreshDir(ctx, n.entry.Path, n.entry.FSID); err != nil {
-			return nil, syscall.EIO
-		}
-		children, err = n.Filesystem.store.ListChildren(n.entry.Path)
-		if err != nil {
-			return nil, syscall.EIO
-		}
 	}
 	return goFs.NewListDirStream(dirEntries(children)), 0
 }
@@ -410,35 +638,25 @@ func (n *entryNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	if n == nil || n.Filesystem == nil || n.Filesystem.store == nil {
 		return nil, syscall.ENOENT
 	}
-	children, err := n.Filesystem.store.ListChildren(n.entry.Path)
+	childPath := JoinPath(n.entry.Path, name)
+	if n.Filesystem.negative != nil && n.Filesystem.negative.IsMissing(childPath) {
+		return nil, syscall.ENOENT
+	}
+	if !n.entry.IsDir {
+		return nil, syscall.ENOTDIR
+	}
+	if err := n.Filesystem.ensureDirLoaded(n.entry.Path, n.entry.FSID, false); err != nil {
+		return nil, syscall.EIO
+	}
+	child, err := n.Filesystem.store.GetChild(n.entry.FSID, name)
 	if err != nil {
 		return nil, syscall.EIO
 	}
-	if n.Filesystem.shouldRefreshDir(n.entry.Path, children) && n.Filesystem.remote != nil && n.entry.IsDir {
-		if err := n.Filesystem.refreshDir(ctx, n.entry.Path, n.entry.FSID); err != nil {
-			return nil, syscall.ENOENT
-		}
-		children, err = n.Filesystem.store.ListChildren(n.entry.Path)
-		if err != nil {
-			return nil, syscall.EIO
-		}
+	if child == nil {
+		n.Filesystem.markMissing(childPath)
+		return nil, syscall.ENOENT
 	}
-	for _, child := range children {
-		if child.Name != name {
-			continue
-		}
-		mode := uint32(syscall.S_IFREG)
-		if child.IsDir {
-			mode = syscall.S_IFDIR
-		}
-		n.Filesystem.fillEntryOut(child, mode, out)
-		inode := n.NewPersistentInode(ctx, &entryNode{
-			Filesystem: n.Filesystem,
-			entry:      child,
-		}, goFs.StableAttr{Mode: mode})
-		return inode, 0
-	}
-	return nil, syscall.ENOENT
+	return n.Filesystem.lookupInode(ctx, &n.Inode, *child, out), 0
 }
 
 func (n *entryNode) Unlink(ctx context.Context, name string) syscall.Errno {
@@ -495,6 +713,7 @@ func (f *Filesystem) deleteChild(ctx context.Context, parentPath string, name st
 		log.Printf("delete metadata failed path=%q fsid=%q: %v", target.Path, target.FSID, err)
 		return syscall.EIO
 	}
+	f.markMissing(target.Path)
 	log.Printf("fuse delete path=%q fsid=%q", target.Path, target.FSID)
 	return 0
 }
@@ -508,10 +727,6 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 		return err
 	}
 	log.Printf("refresh dir %q loaded %d entries", dirPath, len(entries))
-	if len(entries) == 0 {
-		f.markMissing(dirPath)
-		return nil
-	}
 	mapped := make([]store.Entry, 0, len(entries))
 	for _, entry := range entries {
 		mapped = append(mapped, store.Entry{
@@ -527,6 +742,7 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 			LastSyncAt: time.Now().Unix(),
 		})
 	}
+	f.preserveChildDirExpiry(fsid, mapped)
 	if err := f.store.ReplaceChildren(fsid, mapped); err != nil {
 		return err
 	}
@@ -545,6 +761,29 @@ func (f *Filesystem) refreshDir(ctx context.Context, dirPath string, fsid string
 		LastSyncAt: time.Now().Unix(),
 		ExpiresAt:  time.Now().Add(f.ttl).Unix(),
 	})
+}
+
+// preserveChildDirExpiry：父目录刷新会重写子目录行；沿用子目录原有的 expires_at，
+// 否则每次父目录刷新都会把所有已加载的子目录打回“未加载”，迫使下一次 Lookup 同步调用百度 API。
+func (f *Filesystem) preserveChildDirExpiry(parentFSID string, mapped []store.Entry) {
+	existing, err := f.store.GetChildrenByParent(parentFSID)
+	if err != nil || len(existing) == 0 {
+		return
+	}
+	expiry := make(map[string]int64, len(existing))
+	for _, entry := range existing {
+		if entry.IsDir && entry.ExpiresAt > 0 {
+			expiry[entry.Path+"\x00"+entry.FSID] = entry.ExpiresAt
+		}
+	}
+	for index := range mapped {
+		if !mapped[index].IsDir {
+			continue
+		}
+		if expiresAt, ok := expiry[mapped[index].Path+"\x00"+mapped[index].FSID]; ok {
+			mapped[index].ExpiresAt = expiresAt
+		}
+	}
 }
 
 func (f *Filesystem) childExpiresAt(isDir bool) int64 {
@@ -583,12 +822,35 @@ func (n *entryNode) Read(ctx context.Context, fh goFs.FileHandle, dest []byte, o
 		return fuse.ReadResultData(nil), 0
 	}
 	if handle, ok := fh.(*entryFileHandle); ok {
-		data, err := handle.read(ctx, n.Filesystem.remote, n.entry, off, int64(len(dest)))
+		startedAt := time.Now()
+		var data []byte
+		var err error
+		if streamHandle := handle.stream(); streamHandle != nil {
+			data, err = streamHandle.ReadAt(ctx, off, int64(len(dest)))
+			handle.setStrategy("stream-manager")
+		} else {
+			data, err = n.Filesystem.remote.ReadRange(ctx, n.entry.FSID, off, int64(len(dest)))
+			handle.setStrategy("remote-range")
+		}
+		elapsed := time.Since(startedAt)
+		strategy := handle.strategy()
+		if elapsed >= slowFuseReadThreshold {
+			n.Filesystem.recordSlowRead(n.entry.Path, n.entry.FSID, off, len(dest), len(data), elapsed, strategy)
+		}
 		if err != nil {
-			log.Printf("fuse read failed path=%q fsid=%q offset=%d length=%d: %v", n.entry.Path, n.entry.FSID, off, len(dest), err)
+			if errors.Is(err, context.Canceled) {
+				n.Filesystem.recordCanceledRead(n.entry.Path, n.entry.FSID, off, len(dest))
+				if ctx.Err() != nil {
+					// 内核因调用进程收到信号而中断了请求：返回 EINTR 让内核/调用方重试，
+					// 返回 EIO 会让预读页被标记为错误，播放器随即读到 I/O error。
+					return nil, syscall.EINTR
+				}
+			} else {
+				log.Printf("fuse read failed path=%q fsid=%q offset=%d length=%d: %v", n.entry.Path, n.entry.FSID, off, len(dest), err)
+			}
 			return nil, syscall.EIO
 		}
-		n.traceRead(off, len(dest), len(data), handle.lastStrategy)
+		n.traceRead(off, len(dest), len(data), strategy)
 		return fuse.ReadResultData(data), 0
 	}
 	if n.entry.Size > 0 && len(dest) > 0 {
@@ -610,7 +872,17 @@ func (n *entryNode) traceRead(off int64, requested, returned int, strategy strin
 	if n == nil || n.Filesystem == nil || !n.Filesystem.traceReads {
 		return
 	}
+	if !shouldTraceRead(off, strategy, requested, returned) {
+		return
+	}
 	log.Printf("fuse read path=%q fsid=%q offset=%d requested=%d returned=%d strategy=%s", n.entry.Path, n.entry.FSID, off, requested, returned, strategy)
+}
+
+func shouldTraceRead(off int64, strategy string, requested, returned int) bool {
+	if returned != requested {
+		return true
+	}
+	return strategy == "stream-event"
 }
 
 func (n *entryNode) Opendir(ctx context.Context) syscall.Errno {
@@ -621,38 +893,15 @@ func (n *entryNode) Open(ctx context.Context, openFlags uint32) (fh goFs.FileHan
 	if n.entry.IsDir {
 		return nil, 0, syscall.EISDIR
 	}
-	return &entryFileHandle{windowSize: fuseReadWindowSize, lastRead: -1}, fuse.FOPEN_KEEP_CACHE, 0
-}
-
-func (f *Filesystem) shouldRefreshRoot(children []store.Entry) bool {
-	return f.shouldRefresh(f.rootPath, children)
-}
-
-func (f *Filesystem) shouldRefreshDir(path string, children []store.Entry) bool {
-	return f.shouldRefresh(path, children)
-}
-
-func (f *Filesystem) shouldRefresh(path string, children []store.Entry) bool {
-	if f == nil || f.remote == nil {
-		return false
+	if n.Filesystem != nil && n.Filesystem.stream != nil {
+		file := streamFile(n.entry)
+		streamHandle := n.Filesystem.stream.Open(file)
+		if streamHandle == nil {
+			return nil, 0, syscall.EIO
+		}
+		return &entryFileHandle{streamHandle: streamHandle}, fuse.FOPEN_KEEP_CACHE, 0
 	}
-	if f.ttl <= 0 {
-		return true
-	}
-	if path == "" {
-		path = f.rootPath
-	}
-	current, err := f.store.GetByPath(path)
-	if err != nil || current == nil {
-		return true
-	}
-	if current.ExpiresAt == 0 {
-		return true
-	}
-	if time.Until(time.Unix(current.ExpiresAt, 0)) <= 0 {
-		return true
-	}
-	return false
+	return &entryFileHandle{}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 func trimRootPrefix(rootPath, fullPath string) string {
@@ -671,6 +920,9 @@ func trimRootPrefix(rootPath, fullPath string) string {
 type MountOptions struct {
 	AllowOther bool
 	GIDs       []uint32
+	// DefaultPermissions 让内核按 mode/uid/gid 检查访问权限（opt-in）。
+	// 开启后只有 root 和 FUSE_GROUP_NAME 组成员能读文件；默认关闭以保持旧版行为。
+	DefaultPermissions bool
 }
 
 func Mount(mountPath string, root *Filesystem, opts MountOptions) (*fuse.Server, error) {
@@ -680,7 +932,8 @@ func Mount(mountPath string, root *Filesystem, opts MountOptions) (*fuse.Server,
 	if root == nil {
 		return nil, errors.New("root filesystem is required")
 	}
-	timeout := time.Second
+	// 视频库元数据很少变化，适当延长内核缓存，减少播放过程中的 Lookup/Getattr 往返。
+	timeout := 10 * time.Second
 	maxIO := 1 << 20
 	mountOpts := &goFs.Options{
 		MountOptions: fuse.MountOptions{
@@ -690,6 +943,9 @@ func Mount(mountPath string, root *Filesystem, opts MountOptions) (*fuse.Server,
 		},
 		AttrTimeout:  &timeout,
 		EntryTimeout: &timeout,
+	}
+	if opts.DefaultPermissions {
+		mountOpts.MountOptions.Options = append(mountOpts.MountOptions.Options, "default_permissions")
 	}
 	if len(opts.GIDs) > 0 {
 		mountOpts.GID = opts.GIDs[0]
@@ -706,7 +962,14 @@ func JoinPath(parent, name string) string {
 
 func (f *Filesystem) dirMode() uint32 {
 	if f != nil && len(f.gids) > 0 {
+		if f.enableDelete {
+			// 内核 default_permissions 要求父目录可写才允许 unlink/rmdir。
+			return 0770
+		}
 		return 0750
+	}
+	if f != nil && f.enableDelete {
+		return 0777
 	}
 	return 0755
 }
@@ -727,101 +990,51 @@ func inodeTime(mtm int64) time.Time {
 
 type entryFileHandle struct {
 	mu           sync.Mutex
-	window       []byte
-	windowOff    int64
-	windowSize   int64
-	lastRead     int64
 	lastStrategy string
+	streamHandle *stream.Handle
 }
 
-func (h *entryFileHandle) read(ctx context.Context, remote *remote.Reader, entry store.Entry, off, length int64) ([]byte, error) {
-	if h == nil || remote == nil {
-		return nil, nil
+func (h *entryFileHandle) Release(_ context.Context) syscall.Errno {
+	if h == nil {
+		return 0
 	}
-	if length <= 0 {
-		return []byte{}, nil
+	h.mu.Lock()
+	streamHandle := h.streamHandle
+	h.streamHandle = nil
+	h.mu.Unlock()
+	if streamHandle != nil {
+		streamHandle.Release()
 	}
-	if entry.Size > 0 && off >= entry.Size {
-		return []byte{}, nil
+	return 0
+}
+
+func (h *entryFileHandle) setStrategy(strategy string) {
+	if h == nil {
+		return
 	}
-	if h.windowSize <= 0 {
-		h.windowSize = fuseReadWindowSize
+	h.mu.Lock()
+	h.lastStrategy = strategy
+	h.mu.Unlock()
+}
+
+func (h *entryFileHandle) stream() *stream.Handle {
+	if h == nil {
+		return nil
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	firstHighOffsetRead := h.lastRead < 0 && off >= h.windowSize
-	jump := firstHighOffsetRead || (h.lastRead >= 0 && off > h.lastRead+int64(len(h.window)) && off-h.lastRead > h.windowSize)
-	h.lastRead = off
-	if len(h.window) > 0 {
-		if data, ok := h.sliceWindow(off, length); ok {
-			h.lastStrategy = "handle-cache"
-			return data, nil
-		}
-	}
-	fetchLen := h.windowSize
-	if jump {
-		fetchLen = min64(length*2, h.windowSize/2)
-		if fetchLen < length {
-			fetchLen = length
-		}
-	}
-	fetchOff := off
-	if !jump {
-		fetchOff = (off / h.windowSize) * h.windowSize
-	}
-	if fetchLen < length {
-		fetchLen = length
-	}
-	if entry.Size > 0 && fetchOff+fetchLen > entry.Size {
-		fetchLen = entry.Size - fetchOff
-	}
-	var data []byte
-	var err error
-	if jump {
-		data, err = remote.ReadExactRange(ctx, entry.FSID, fetchOff, fetchLen)
-		h.lastStrategy = "seek-exact"
-	} else {
-		data, err = remote.ReadRange(ctx, entry.FSID, fetchOff, fetchLen)
-		h.lastStrategy = "window-prefetch"
-	}
-	if err != nil {
-		return nil, err
-	}
-	h.windowOff = fetchOff
-	h.window = data
-	return h.sliceWindowOrEmpty(off, length), nil
+	return h.streamHandle
 }
 
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
+func (h *entryFileHandle) strategy() string {
+	if h == nil {
+		return ""
 	}
-	return b
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastStrategy
 }
 
-func (h *entryFileHandle) sliceWindowOrEmpty(off, length int64) []byte {
-	data, ok := h.sliceWindow(off, length)
-	if !ok {
-		return []byte{}
-	}
-	return data
-}
-
-func (h *entryFileHandle) sliceWindow(off, length int64) ([]byte, bool) {
-	if h == nil || len(h.window) == 0 || length <= 0 {
-		return nil, false
-	}
-	windowEnd := h.windowOff + int64(len(h.window))
-	if off < h.windowOff || off >= windowEnd {
-		return nil, false
-	}
-	start := off - h.windowOff
-	end := start + length
-	if end > int64(len(h.window)) {
-		end = int64(len(h.window))
-	}
-	if end <= start {
-		return nil, false
-	}
-	return h.window[start:end], true
+func streamFile(entry store.Entry) stream.File {
+	return stream.File{FSID: entry.FSID, Size: entry.Size, MTM: entry.MTM}
 }

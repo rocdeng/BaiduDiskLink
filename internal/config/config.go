@@ -12,9 +12,21 @@ type Config struct {
 	MetaDBPath          string
 	FuseGroupName       string
 	FuseTraceReads      bool
+	FuseDefaultPerms    bool
 	EnableDelete        bool
+	MetadataTTLSeconds  int
+	RootRefreshSeconds  int
 	DownloadConcurrency int
 	DownloadChunkSize   int64
+	StreamChunkSize     int64
+	StreamWorkers       int
+	StreamLowWatermark  int64
+	StreamTargetBuffer  int64
+	StreamBackBuffer    int64
+	StreamMemoryCache   int64
+	StreamDiskCache     int64
+	StreamCachePath     string
+	StreamHedge         bool
 	ClientID            string
 	ClientSecret        string
 	RedirectURI         string
@@ -34,9 +46,21 @@ func Load() Config {
 		MetaDBPath:          os.Getenv("BAIDUDISKLINK_META_DB_PATH"),
 		FuseGroupName:       os.Getenv("BAIDUDISKLINK_FUSE_GROUP_NAME"),
 		FuseTraceReads:      parseBool(os.Getenv("BAIDUDISKLINK_FUSE_TRACE_READS")),
+		FuseDefaultPerms:    parseBool(os.Getenv("BAIDUDISKLINK_FUSE_DEFAULT_PERMISSIONS")),
 		EnableDelete:        parseBool(os.Getenv("BAIDUDISKLINK_ENABLE_DELETE")),
+		MetadataTTLSeconds:  parseInt(os.Getenv("BAIDUDISKLINK_METADATA_TTL_SECONDS"), 300),
+		RootRefreshSeconds:  parseInt(os.Getenv("BAIDUDISKLINK_ROOT_REFRESH_SECONDS"), 60),
 		DownloadConcurrency: parseInt(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CONCURRENCY"), 1),
-		DownloadChunkSize:   parseInt64(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE"), 4<<20),
+		DownloadChunkSize:   parseInt64(os.Getenv("BAIDUDISKLINK_DOWNLOAD_CHUNK_SIZE"), 8<<20),
+		StreamChunkSize:     parseInt64(os.Getenv("BAIDUDISKLINK_STREAM_CHUNK_SIZE"), 1<<20),
+		StreamWorkers:       parseInt(os.Getenv("BAIDUDISKLINK_STREAM_WORKERS"), 8),
+		StreamLowWatermark:  parseInt64(os.Getenv("BAIDUDISKLINK_STREAM_LOW_WATERMARK"), 128<<20),
+		StreamTargetBuffer:  parseInt64(os.Getenv("BAIDUDISKLINK_STREAM_TARGET_BUFFER"), 256<<20),
+		StreamBackBuffer:    parseInt64(os.Getenv("BAIDUDISKLINK_STREAM_BACK_BUFFER"), 32<<20),
+		StreamMemoryCache:   parseInt64(os.Getenv("BAIDUDISKLINK_STREAM_MEMORY_CACHE"), 320<<20),
+		StreamDiskCache:     parseNonNegativeInt64(os.Getenv("BAIDUDISKLINK_STREAM_DISK_CACHE"), 2<<30),
+		StreamCachePath:     os.Getenv("BAIDUDISKLINK_STREAM_CACHE_PATH"),
+		StreamHedge:         parseBoolDefault(os.Getenv("BAIDUDISKLINK_STREAM_HEDGE"), true),
 		ClientID:            os.Getenv("BAIDUDISKLINK_CLIENT_ID"),
 		ClientSecret:        os.Getenv("BAIDUDISKLINK_CLIENT_SECRET"),
 		RedirectURI:         os.Getenv("BAIDUDISKLINK_REDIRECT_URI"),
@@ -69,6 +93,16 @@ func parseInt64(value string, fallback int64) int64 {
 	return fallback
 }
 
+func parseNonNegativeInt64(value string, fallback int64) int64 {
+	if value == "" {
+		return fallback
+	}
+	if n, err := strconv.ParseInt(value, 10, 64); err == nil && n >= 0 {
+		return n
+	}
+	return fallback
+}
+
 func parseBool(value string) bool {
 	switch value {
 	case "1", "true", "TRUE", "yes", "YES", "on", "ON":
@@ -76,4 +110,11 @@ func parseBool(value string) bool {
 	default:
 		return false
 	}
+}
+
+func parseBoolDefault(value string, fallback bool) bool {
+	if value == "" {
+		return fallback
+	}
+	return parseBool(value)
 }

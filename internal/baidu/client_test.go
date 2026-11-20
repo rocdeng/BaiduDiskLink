@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -55,17 +56,17 @@ func (r *fullReadErrorReader) Read(p []byte) (int, error) {
 
 func TestNewDownloadHTTPClientConfiguresConnectionPool(t *testing.T) {
 	client := NewDownloadHTTPClient(4)
-	if client.Timeout != 0 {
-		t.Fatalf("download client must not impose whole-request timeout: %v", client.Timeout)
+	if client.Timeout != downloadClientTimeout {
+		t.Fatalf("unexpected download client timeout: %v", client.Timeout)
 	}
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("unexpected transport type %T", client.Transport)
 	}
-	if transport.MaxConnsPerHost != 4 || transport.MaxIdleConnsPerHost != 4 {
+	if transport.MaxConnsPerHost != 12 || transport.MaxIdleConnsPerHost != 12 {
 		t.Fatalf("unexpected per-host limits: active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
 	}
-	if !transport.DisableCompression || transport.ResponseHeaderTimeout != 30*time.Second {
+	if !transport.DisableCompression || transport.ResponseHeaderTimeout != downloadHeaderTimeout {
 		t.Fatalf("unexpected download transport: %#v", transport)
 	}
 }
@@ -76,8 +77,8 @@ func TestNewDownloadHTTPClientKeepsMinimumConnectionPool(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected transport type %T", client.Transport)
 	}
-	if transport.MaxConnsPerHost != 4 || transport.MaxIdleConnsPerHost != 4 {
-		t.Fatalf("expected minimum four per-host connections, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	if transport.MaxConnsPerHost != 12 || transport.MaxIdleConnsPerHost != 12 {
+		t.Fatalf("expected minimum twelve per-host connections, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
 	}
 }
 
@@ -87,8 +88,8 @@ func TestNewDownloadHTTPClientPreservesHigherConcurrency(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected transport type %T", client.Transport)
 	}
-	if transport.MaxConnsPerHost != 8 || transport.MaxIdleConnsPerHost != 8 {
-		t.Fatalf("expected configured per-host connections, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	if transport.MaxConnsPerHost != 16 || transport.MaxIdleConnsPerHost != 16 {
+		t.Fatalf("expected configured concurrency plus foreground reserve, active=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
 	}
 }
 
@@ -113,7 +114,7 @@ func TestAPIClientSeparatesMetadataAndDownloadClients(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("abc")), Header: header}, nil
 	}}}
 	client := NewAPIClientWithHTTPClients("token", "refresh", "client", "secret", "", "", metadataClient, downloadClient, nil)
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	if _, err := client.List("/"); err != nil {
 		t.Fatal(err)
@@ -123,6 +124,15 @@ func TestAPIClientSeparatesMetadataAndDownloadClients(t *testing.T) {
 	}
 	if metadataCalls != 1 || downloadCalls != 1 {
 		t.Fatalf("calls metadata=%d download=%d", metadataCalls, downloadCalls)
+	}
+}
+
+func TestAPIClientInvalidateDownloadLink(t *testing.T) {
+	client := NewAPIClient("token", "refresh", "client", "secret", nil)
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
+	client.InvalidateDownloadLink("1")
+	if _, ok := client.cachedDownloadLink("1"); ok {
+		t.Fatal("download link cache was not invalidated")
 	}
 }
 
@@ -143,6 +153,55 @@ func TestAPIClientList(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ServerName != "a.mkv" {
 		t.Fatalf("unexpected list result: %#v", got)
+	}
+}
+
+func TestAPIClientListRefreshesExpiredAccessToken(t *testing.T) {
+	listCalls := 0
+	refreshCalls := 0
+	client := NewAPIClient("expired-access", "refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.String(), "grant_type=refresh_token") {
+				refreshCalls++
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"access_token":"new-access","refresh_token":"new-refresh"}`)), Header: make(http.Header)}, nil
+			}
+			listCalls++
+			if got := r.URL.Query().Get("access_token"); got == "expired-access" {
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"errno":-6,"errmsg":"authentication failed"}`)), Header: make(http.Header)}, nil
+			}
+			body := `{"list":[{"fs_id":1,"server_filename":"Movie","path":"/Videos/Movie","isdir":1}],"errno":0}`
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		}},
+	})
+
+	entries, err := client.List("/Videos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ServerName != "Movie" {
+		t.Fatalf("unexpected entries: %#v", entries)
+	}
+	if listCalls != 2 || refreshCalls != 1 {
+		t.Fatalf("unexpected calls: list=%d refresh=%d", listCalls, refreshCalls)
+	}
+}
+
+func TestAPIClientListReportsReauthorizationWhenRefreshTokenExpired(t *testing.T) {
+	client := NewAPIClient("expired-access", "expired-refresh", "client", "secret", &http.Client{
+		Transport: mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.String(), "grant_type=refresh_token") {
+				return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(`{"error":"invalid_grant","error_description":"refresh token expired"}`)), Header: make(http.Header)}, nil
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"error_code":111,"error_msg":"Access token expired"}`)), Header: make(http.Header)}, nil
+		}},
+	})
+
+	_, err := client.List("/Videos")
+	if !errors.Is(err, ErrAuthExpired) {
+		t.Fatalf("expected ErrAuthExpired, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "重新登录") {
+		t.Fatalf("expected reauthorization hint, got %v", err)
 	}
 }
 
@@ -205,7 +264,7 @@ func TestAPIClientReadRangeReadsDirectlyIntoDestination(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(body), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, dst)
 	if err != nil {
@@ -229,11 +288,40 @@ func TestAPIClientReadRangePreservesFinalBodyError(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(body), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
 	if n != 3 || !errors.Is(err, finalErr) {
 		t.Fatalf("expected final body error after 3 bytes, got n=%d err=%v", n, err)
+	}
+}
+
+func TestAPIClientReadRangeTimesOutStalledBody(t *testing.T) {
+	oldTimeout := downloadRangeTimeout
+	downloadRangeTimeout = 50 * time.Millisecond
+	defer func() { downloadRangeTimeout = oldTimeout }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-2/3")
+		w.WriteHeader(http.StatusPartialContent)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client := NewAPIClient("token", "refresh", "client", "secret", &http.Client{Timeout: time.Second})
+	client.links["1"] = DownloadLink{URL: server.URL, ExpiresAt: time.Now().Add(time.Hour)}
+	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
+	if err == nil {
+		t.Fatal("expected stalled body to time out")
+	}
+	if n != 0 {
+		t.Fatalf("expected no bytes from stalled body, got %d", n)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
 	}
 }
 
@@ -246,7 +334,7 @@ func TestAPIClientReadRangeAcceptsEOFWithCompleteFinalRead(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(body), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	dst := make([]byte, 3)
 	n, err := client.ReadRange(context.Background(), "1", 0, dst)
@@ -263,7 +351,7 @@ func TestAPIClientReadRangeRejectsTruncatedBody(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("ab")), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
 	if err == nil {
@@ -279,7 +367,7 @@ func TestAPIClientReadRangeMapsEmptyBodyToUnexpectedEOF(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("")), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 3))
 	if n != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -295,7 +383,7 @@ func TestAPIClientReadRangeRejectsShortRangeBeforeEOF(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("ab")), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -311,7 +399,7 @@ func TestAPIClientReadRangeRejectsRangePastRequest(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusPartialContent, Body: io.NopCloser(strings.NewReader("abcde")), Header: header}, nil
 		}},
 	})
-	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Minute)}
+	client.links["1"] = DownloadLink{URL: "https://download.example.invalid/file", ExpiresAt: time.Now().Add(time.Hour)}
 
 	n, err := client.ReadRange(context.Background(), "1", 0, make([]byte, 4))
 	if err == nil {

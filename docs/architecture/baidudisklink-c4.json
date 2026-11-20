@@ -1,0 +1,614 @@
+{
+  "title": "BaiduDiskLink 完整架构",
+  "levels": [
+    {
+      "name": "01 系统上下文",
+      "elements": [
+        {
+          "id": "user",
+          "type": "person",
+          "label": "用户 / 管理员",
+          "desc": "配置 OAuth、挂载目录并进行运维测试"
+        },
+        {
+          "id": "players",
+          "type": "external",
+          "label": "媒体消费者",
+          "tech": "Emby / 网易爆米花 / Infuse",
+          "desc": "扫描媒体库、读取文件、播放与 Seek"
+        },
+        {
+          "id": "baidudisklink",
+          "type": "system",
+          "label": "BaiduDiskLink",
+          "tech": "Go + FUSE 3",
+          "desc": "把百度网盘目录映射为 DSM 本地只读文件系统",
+          "children": "02 容器与部署"
+        },
+        {
+          "id": "baiduopen",
+          "type": "external",
+          "label": "百度开放平台",
+          "tech": "OAuth 2.0 / Netdisk API",
+          "desc": "授权、Token 刷新、目录与文件元数据"
+        },
+        {
+          "id": "baiducdn",
+          "type": "external",
+          "label": "百度 CDN",
+          "tech": "HTTP Range",
+          "desc": "提供视频文件分块内容"
+        },
+        {
+          "id": "dsm",
+          "type": "external",
+          "label": "群晖 DSM",
+          "tech": "Docker / FUSE / bind mount",
+          "desc": "运行容器并向宿主机传播挂载点"
+        }
+      ],
+      "relations": [
+        {
+          "from": "user",
+          "to": "baidudisklink",
+          "label": "配置、授权、诊断命令"
+        },
+        {
+          "from": "players",
+          "to": "dsm",
+          "label": "访问 /volume2/baidu_videos"
+        },
+        {
+          "from": "dsm",
+          "to": "baidudisklink",
+          "label": "/dev/fuse + rshared 挂载传播"
+        },
+        {
+          "from": "baidudisklink",
+          "to": "baiduopen",
+          "label": "OAuth、List、Stat、dlink"
+        },
+        {
+          "from": "baidudisklink",
+          "to": "baiducdn",
+          "label": "并发 HTTP Range 下载"
+        }
+      ]
+    },
+    {
+      "name": "02 容器与部署",
+      "elements": [
+        {
+          "id": "cli",
+          "type": "container",
+          "label": "CLI 入口",
+          "tech": "cmd/baidudisklink",
+          "desc": "mount、bench、bench-fuse、bench-stream、bench-download、playback",
+          "children": "03 应用组件"
+        },
+        {
+          "id": "app",
+          "type": "container",
+          "label": "应用编排",
+          "tech": "internal/app",
+          "desc": "配置校验、依赖组装、OAuth 流程、挂载与周期刷新",
+          "children": "03 应用组件"
+        },
+        {
+          "id": "fusemount",
+          "type": "container",
+          "label": "FUSE 挂载",
+          "tech": "go-fuse/v2 + FUSE 3",
+          "desc": "容器内挂载 /mnt/baidu，向 DSM 传播"
+        },
+        {
+          "id": "persistent",
+          "type": "database",
+          "label": "持久化数据卷",
+          "tech": "/data",
+          "desc": "token.json、meta.db、stream-cache"
+        },
+        {
+          "id": "hostmount",
+          "type": "container",
+          "label": "DSM 宿主机挂载点",
+          "tech": "bind propagation: rshared",
+          "desc": "/volume2/baidu_videos，供 Emby 与播放器读取"
+        },
+        {
+          "id": "oauthport",
+          "type": "container",
+          "label": "OAuth 回调端口",
+          "tech": "HTTP :8765",
+          "desc": "接收百度授权码回调"
+        },
+        {
+          "id": "docker",
+          "type": "external",
+          "label": "Docker Compose / Container Manager",
+          "desc": "privileged、SYS_ADMIN、/dev/fuse、环境变量与卷映射"
+        },
+        {
+          "id": "app02",
+          "type": "container",
+          "label": "应用编排",
+          "tech": "internal/app",
+          "desc": "配置校验、依赖组装、OAuth 流程、挂载与周期刷新",
+          "children": "03 应用组件"
+        },
+        {
+          "id": "players02",
+          "type": "external",
+          "label": "媒体消费者",
+          "tech": "Emby / 网易爆米花 / Infuse",
+          "desc": "通过 DSM 宿主机挂载点读取视频"
+        }
+      ],
+      "relations": [
+        {
+          "from": "docker",
+          "to": "cli",
+          "label": "启动容器进程"
+        },
+        {
+          "from": "cli",
+          "to": "app02",
+          "label": "加载环境变量并执行命令"
+        },
+        {
+          "from": "app02",
+          "to": "fusemount",
+          "label": "Mount / Wait / Unmount"
+        },
+        {
+          "from": "app02",
+          "to": "persistent",
+          "label": "读写凭证、元数据和缓存"
+        },
+        {
+          "from": "app02",
+          "to": "oauthport",
+          "label": "未授权时启动本地回调"
+        },
+        {
+          "from": "fusemount",
+          "to": "hostmount",
+          "label": "rshared 挂载传播"
+        },
+        {
+          "from": "hostmount",
+          "to": "players02",
+          "label": "本地文件路径读取"
+        }
+      ]
+    },
+    {
+      "name": "03 应用组件",
+      "elements": [
+        {
+          "id": "config",
+          "type": "component",
+          "label": "配置加载",
+          "tech": "internal/config",
+          "desc": "解析 BAIDUDISKLINK_* 环境变量及默认值"
+        },
+        {
+          "id": "auth",
+          "type": "component",
+          "label": "认证管理",
+          "tech": "internal/auth",
+          "desc": "OAuth URL、回调换 Token、文件凭证存储与刷新"
+        },
+        {
+          "id": "metadata",
+          "type": "component",
+          "label": "元数据仓库",
+          "tech": "internal/store + SQLite",
+          "desc": "目录、文件属性、缓存过期与刷新"
+        },
+        {
+          "id": "negative",
+          "type": "component",
+          "label": "负缓存",
+          "tech": "internal/cache",
+          "desc": "短期缓存不存在路径，降低重复远端请求"
+        },
+        {
+          "id": "filesystem",
+          "type": "component",
+          "label": "FUSE 文件系统",
+          "tech": "internal/fs",
+          "desc": "Lookup、Getattr、Readdir、Open、Read、Release、可选删除",
+          "children": "04 播放读取链路"
+        },
+        {
+          "id": "streammgr",
+          "type": "component",
+          "label": "高码率流式引擎",
+          "tech": "internal/stream",
+          "desc": "Session、Handle、优先队列、Worker、缓冲水位、Hedge",
+          "children": "04 播放读取链路"
+        },
+        {
+          "id": "chunkstore",
+          "type": "database",
+          "label": "两级分块缓存",
+          "tech": "Memory LRU + Disk LRU",
+          "desc": "默认 320 MiB 内存 + 2 GiB 磁盘，缓存键含文件版本与块大小"
+        },
+        {
+          "id": "remote",
+          "type": "component",
+          "label": "远端读取层",
+          "tech": "internal/remote",
+          "desc": "精确 Range、旧 bench 并发读取、dlink 缓存和错误分类"
+        },
+        {
+          "id": "baiduclient",
+          "type": "component",
+          "label": "百度 API 客户端",
+          "tech": "internal/baidu",
+          "desc": "List、Stat、Delete、GetDownloadLink、ReadRange、RefreshAuth"
+        },
+        {
+          "id": "logging",
+          "type": "component",
+          "label": "可观测性",
+          "tech": "internal/logging + 聚合日志",
+          "desc": "stream summary、FUSE 慢读摘要、benchmark 指标"
+        },
+        {
+          "id": "benchtools",
+          "type": "component",
+          "label": "诊断与基准工具",
+          "tech": "internal/app",
+          "desc": "bench-download、bench、bench-fuse、bench-stream、playback"
+        },
+        {
+          "id": "app03",
+          "type": "container",
+          "label": "应用编排",
+          "tech": "internal/app",
+          "desc": "组装认证、存储、远端、流式引擎和 FUSE"
+        },
+        {
+          "id": "baiduopen03",
+          "type": "external",
+          "label": "百度开放平台与 CDN",
+          "tech": "OAuth / Netdisk API / HTTP Range",
+          "desc": "认证、元数据、dlink 与文件分块内容"
+        }
+      ],
+      "relations": [
+        {
+          "from": "config",
+          "to": "app03",
+          "label": "构造运行配置"
+        },
+        {
+          "from": "app03",
+          "to": "auth",
+          "label": "加载或获取 Token"
+        },
+        {
+          "from": "app03",
+          "to": "metadata",
+          "label": "打开 meta.db"
+        },
+        {
+          "from": "app03",
+          "to": "filesystem",
+          "label": "创建并挂载文件系统"
+        },
+        {
+          "from": "filesystem",
+          "to": "metadata",
+          "label": "目录和属性查询"
+        },
+        {
+          "from": "filesystem",
+          "to": "streammgr",
+          "label": "文件 ReadAt / Release"
+        },
+        {
+          "from": "streammgr",
+          "to": "chunkstore",
+          "label": "查询、发布、淘汰分块"
+        },
+        {
+          "from": "streammgr",
+          "to": "remote",
+          "label": "P0-P3 Range 任务"
+        },
+        {
+          "from": "remote",
+          "to": "baiduclient",
+          "label": "下载与元数据接口"
+        },
+        {
+          "from": "streammgr",
+          "to": "logging",
+          "label": "缓冲、重试、Hedge 摘要"
+        }
+      ]
+    },
+    {
+      "name": "04 播放读取链路",
+      "elements": [
+        {
+          "id": "clientread",
+          "type": "external",
+          "label": "播放器 / Emby 读取",
+          "tech": "open + read + seek",
+          "desc": "通过 DSM 本地路径发起小块、顺序或跳转读取"
+        },
+        {
+          "id": "fuseops",
+          "type": "component",
+          "label": "FUSE 语义层",
+          "tech": "internal/fs",
+          "desc": "路径映射、权限、文件大小边界和 errno"
+        },
+        {
+          "id": "handle",
+          "type": "component",
+          "label": "独立 Stream Handle",
+          "tech": "Probe / Stream / Seek",
+          "desc": "每次 Open 独立游标；多个句柄共享 Session 与缓存"
+        },
+        {
+          "id": "scheduler",
+          "type": "component",
+          "label": "优先级调度器",
+          "tech": "P0 / P1 / P2 / P3",
+          "desc": "前台块、近端 64 MiB、目标 256 MiB、后向 32 MiB"
+        },
+        {
+          "id": "workers",
+          "type": "component",
+          "label": "下载 Worker 池",
+          "tech": "默认 8 Workers",
+          "desc": "逐块领取任务，不等待同批慢块；支持取消和公平配额"
+        },
+        {
+          "id": "hedge",
+          "type": "component",
+          "label": "慢块竞速与重试",
+          "tech": "动态 P95 阈值",
+          "desc": "P0 慢块最多竞速一次，连续慢块刷新 dlink"
+        },
+        {
+          "id": "memorycache",
+          "type": "database",
+          "label": "内存热缓存",
+          "tech": "默认 320 MiB",
+          "desc": "覆盖前向窗口、后向保留与调度余量"
+        },
+        {
+          "id": "diskcache",
+          "type": "database",
+          "label": "磁盘临时缓存",
+          "tech": "默认 2 GiB / 可关闭",
+          "desc": ".part 完整后原子改名为 .chunk，按 LRU 清理"
+        },
+        {
+          "id": "exactrange",
+          "type": "component",
+          "label": "精确 Range 传输",
+          "tech": "internal/remote",
+          "desc": "按 1 MiB 调度块调用底层 ReadRange"
+        },
+        {
+          "id": "dlink",
+          "type": "component",
+          "label": "dlink 与 HTTP 客户端",
+          "tech": "internal/baidu",
+          "desc": "官方 API 获取直链，下载连接池执行 Range"
+        },
+        {
+          "id": "cdn",
+          "type": "external",
+          "label": "百度 CDN 节点",
+          "tech": "HTTP/1.1 Range",
+          "desc": "返回目标字节范围"
+        }
+      ],
+      "relations": [
+        {
+          "from": "clientread",
+          "to": "fuseops",
+          "label": "Read(offset, length)"
+        },
+        {
+          "from": "fuseops",
+          "to": "handle",
+          "label": "Handle.ReadAt"
+        },
+        {
+          "from": "handle",
+          "to": "memorycache",
+          "label": "先查热缓存"
+        },
+        {
+          "from": "handle",
+          "to": "scheduler",
+          "label": "识别模式并创建 epoch"
+        },
+        {
+          "from": "scheduler",
+          "to": "workers",
+          "label": "按优先级持续派发"
+        },
+        {
+          "from": "workers",
+          "to": "hedge",
+          "label": "前台慢块触发保护"
+        },
+        {
+          "from": "workers",
+          "to": "exactrange",
+          "label": "下载缺失块"
+        },
+        {
+          "from": "hedge",
+          "to": "exactrange",
+          "label": "竞速请求 / 重试"
+        },
+        {
+          "from": "exactrange",
+          "to": "dlink",
+          "label": "ReadRange(fsid, offset)"
+        },
+        {
+          "from": "exactrange",
+          "to": "memorycache",
+          "label": "发布不可变分块"
+        },
+        {
+          "from": "exactrange",
+          "to": "diskcache",
+          "label": "异步落盘"
+        },
+        {
+          "from": "memorycache",
+          "to": "handle",
+          "label": "唤醒前台读取"
+        },
+        {
+          "from": "handle",
+          "to": "fuseops",
+          "label": "返回请求字节"
+        },
+        {
+          "from": "fuseops",
+          "to": "clientread",
+          "label": "本地文件数据"
+        }
+      ]
+    },
+    {
+      "name": "05 元数据与认证链路",
+      "elements": [
+        {
+          "id": "admin",
+          "type": "person",
+          "label": "管理员",
+          "desc": "首次授权或凭证失效后重新授权"
+        },
+        {
+          "id": "oauthserver",
+          "type": "component",
+          "label": "本地 OAuth Server",
+          "tech": "internal/auth :8765",
+          "desc": "生成授权 URL 并接收 code"
+        },
+        {
+          "id": "baiduauth",
+          "type": "external",
+          "label": "百度授权页 / Token API",
+          "tech": "OAuth 2.0",
+          "desc": "用户登录授权并返回 access_token / refresh_token"
+        },
+        {
+          "id": "tokenfile",
+          "type": "database",
+          "label": "Token 文件",
+          "tech": "/data/token.json",
+          "desc": "本地保存凭证，远端不经第三方中转"
+        },
+        {
+          "id": "apiclient",
+          "type": "component",
+          "label": "百度元数据客户端",
+          "tech": "internal/baidu",
+          "desc": "使用 Token 调用 List、Stat、dlink 和删除接口"
+        },
+        {
+          "id": "metastore",
+          "type": "database",
+          "label": "SQLite 元数据缓存",
+          "tech": "/data/meta.db (WAL)",
+          "desc": "目录树、FSID、大小、MTM、过期状态"
+        },
+        {
+          "id": "fusedir",
+          "type": "component",
+          "label": "FUSE 目录操作",
+          "tech": "Lookup / Readdir / Getattr",
+          "desc": "优先查询 SQLite，缺失或过期时拉取远端"
+        },
+        {
+          "id": "refresh",
+          "type": "component",
+          "label": "刷新机制",
+          "tech": "懒刷新 + 每分钟根目录刷新",
+          "desc": "序列化远端刷新并更新负缓存"
+        },
+        {
+          "id": "baiduopen05",
+          "type": "external",
+          "label": "百度网盘官方 API",
+          "tech": "Netdisk API",
+          "desc": "目录列表、文件元数据和 dlink 接口"
+        }
+      ],
+      "relations": [
+        {
+          "from": "admin",
+          "to": "oauthserver",
+          "label": "打开授权 URL"
+        },
+        {
+          "from": "oauthserver",
+          "to": "baiduauth",
+          "label": "authorize / token exchange"
+        },
+        {
+          "from": "baiduauth",
+          "to": "oauthserver",
+          "label": "callback code + Token"
+        },
+        {
+          "from": "oauthserver",
+          "to": "tokenfile",
+          "label": "保存凭证"
+        },
+        {
+          "from": "tokenfile",
+          "to": "apiclient",
+          "label": "启动时加载 Token"
+        },
+        {
+          "from": "apiclient",
+          "to": "tokenfile",
+          "label": "刷新 Token 后回写"
+        },
+        {
+          "from": "fusedir",
+          "to": "metastore",
+          "label": "读取目录和属性"
+        },
+        {
+          "from": "fusedir",
+          "to": "refresh",
+          "label": "缓存缺失或过期"
+        },
+        {
+          "from": "refresh",
+          "to": "apiclient",
+          "label": "List / Stat"
+        },
+        {
+          "from": "apiclient",
+          "to": "baiduopen05",
+          "label": "官方网盘 API"
+        },
+        {
+          "from": "metastore",
+          "to": "fusedir",
+          "label": "返回本地目录视图"
+        }
+      ]
+    }
+  ]
+}

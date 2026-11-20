@@ -1,4 +1,7 @@
-FROM golang:1.24-alpine AS build
+# check=skip=SecretsUsedInArgOrEnv
+# 说明：BAIDUDISKLINK_TOKEN_PATH 只是 token 文件路径，不是凭证本身；
+# BuildKit 按变量名中的 TOKEN 误报，这里仅跳过这一项检查。
+FROM golang:1.25.11-alpine AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -8,7 +11,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/baidudisklink ./cmd/b
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates fuse3 bash
+RUN apk add --no-cache ca-certificates fuse3 bash tzdata
 WORKDIR /app
 COPY --from=build /out/baidudisklink /usr/local/bin/baidudisklink
 

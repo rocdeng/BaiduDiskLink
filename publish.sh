@@ -1,9 +1,13 @@
+#!/bin/sh
+set -eu
+
+REGISTRY=${REGISTRY:-192.168.1.5:35000}
+IMAGE=${IMAGE:-baidudisklink}
 TAG=$(git rev-parse --short HEAD)
 
-docker compose build
-docker tag baidudisklink:latest 192.168.1.5:35000/baidudisklink:$TAG
-docker tag baidudisklink:latest 192.168.1.5:35000/baidudisklink:latest
-
-docker push 192.168.1.5:35000/baidudisklink:$TAG
-docker push 192.168.1.5:35000/baidudisklink:latest
-
+docker buildx build \
+  --platform linux/amd64 \
+  --tag "$REGISTRY/$IMAGE:${TAG}" \
+  --tag "$REGISTRY/$IMAGE:latest" \
+  --push \
+  .

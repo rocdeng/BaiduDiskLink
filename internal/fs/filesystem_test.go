@@ -3,6 +3,11 @@ package fs
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -11,6 +16,7 @@ import (
 	"baidudisklink/internal/cache"
 	"baidudisklink/internal/remote"
 	"baidudisklink/internal/store"
+	"baidudisklink/internal/stream"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	_ "modernc.org/sqlite"
 )
@@ -118,71 +124,98 @@ func TestEntryReadUsesCachedWindowWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestEntryFileHandleReusesReadWindow(t *testing.T) {
-	client := &countingReadClient{}
-	remoteReader := remote.NewReader(client)
-	handle := &entryFileHandle{windowSize: 16, lastRead: -1}
-	entry := store.Entry{
-		FSID: "1",
-		Path: "/movie.mkv",
-		Size: 64,
-	}
-	first, err := handle.read(context.Background(), remoteReader, entry, 0, 8)
+func TestEntryReadUsesStreamManager(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := handle.read(context.Background(), remoteReader, entry, 8, 8)
+	client := &countingReadClient{}
+	remoteReader := remote.NewReader(client)
+	streamConfig := stream.DefaultConfig()
+	streamConfig.ChunkSize = 8
+	streamConfig.Workers = 2
+	streamConfig.SessionWorkers = 1
+	streamConfig.LowWatermark = 8
+	streamConfig.TargetBuffer = 16
+	streamConfig.MemoryCache = 32
+	streamConfig.DiskCache = 0
+	streamConfig.Hedge = false
+	streamManager, err := stream.NewManager(remoteReader, streamConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first) != 8 || len(second) != 8 {
-		t.Fatalf("unexpected read lengths: %d %d", len(first), len(second))
+	defer streamManager.Close()
+	entry := store.Entry{FSID: "1", Path: "/movie.mkv", Name: "movie.mkv", Size: 32, MTM: 1}
+	filesystem := NewFilesystemWithStream(dbStore, remoteReader, streamManager, nil, "/")
+	node := &entryNode{Filesystem: filesystem, entry: entry}
+	handle, _, errno := node.Open(context.Background(), 0)
+	if errno != 0 {
+		t.Fatalf("open failed: %v", errno)
 	}
-	if client.reads != 1 {
-		t.Fatalf("expected one remote read for same handle window, got %d", client.reads)
+	result, errno := node.Read(context.Background(), handle, make([]byte, 4), 0)
+	if errno != 0 {
+		t.Fatalf("read failed: %v", errno)
 	}
-}
-
-func TestEntryFileHandleUsesSmallerWindowAfterLargeSeek(t *testing.T) {
-	client := &countingReadClient{}
-	remoteReader := remote.NewReader(client)
-	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
-	entry := store.Entry{
-		FSID: "1",
-		Path: "/movie.mkv",
-		Size: 128 << 20,
+	data, status := result.Bytes(nil)
+	if status != 0 || len(data) != 4 {
+		t.Fatalf("unexpected stream read: %d bytes status=%v", len(data), status)
 	}
-	if _, err := handle.read(context.Background(), remoteReader, entry, 0, 4<<20); err != nil {
-		t.Fatal(err)
+	client.mu.Lock()
+	got := client.lengths[0]
+	client.mu.Unlock()
+	if got != 8 {
+		t.Fatalf("stream manager did not use configured chunk: %d", got)
 	}
-	if _, err := handle.read(context.Background(), remoteReader, entry, 80<<20, 4<<20); err != nil {
-		t.Fatal(err)
-	}
-	if client.reads != 2 {
-		t.Fatalf("expected second remote read after seek, got %d", client.reads)
-	}
-	if client.lengths[1] != 8<<20 {
-		t.Fatalf("expected smaller seek window, got %d", client.lengths[1])
+	if releaser, ok := handle.(*entryFileHandle); ok {
+		releaser.Release(context.Background())
 	}
 }
 
-func TestEntryFileHandleUsesSmallerWindowForInitialHighOffsetRead(t *testing.T) {
-	client := &countingReadClient{}
-	remoteReader := remote.NewReader(client)
-	handle := &entryFileHandle{windowSize: 16 << 20, lastRead: -1}
-	entry := store.Entry{
-		FSID: "1",
-		Path: "/movie.mkv",
-		Size: 128 << 20,
+func TestTraceReadKeepsOnlyDiagnosticEvents(t *testing.T) {
+	if shouldTraceRead(192<<10, "handle-cache", 192<<10, 192<<10) {
+		t.Fatal("routine handle cache read should be suppressed")
 	}
-	if _, err := handle.read(context.Background(), remoteReader, entry, 80<<20, 4<<20); err != nil {
-		t.Fatal(err)
+	if !shouldTraceRead(32<<20, "handle-cache", 192<<10, 12<<10) {
+		t.Fatal("short read should remain visible")
 	}
-	if client.reads != 1 {
-		t.Fatalf("expected one remote read, got %d", client.reads)
+	if shouldTraceRead(0, "stream-manager", 192<<10, 192<<10) {
+		t.Fatal("routine stream reads should be suppressed")
 	}
-	if client.lengths[0] != 8<<20 {
-		t.Fatalf("expected smaller initial seek window, got %d", client.lengths[0])
+}
+
+func TestReadDiagnosticsAggregateSlowAndCanceledReads(t *testing.T) {
+	var output strings.Builder
+	previousWriter := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(previousWriter)
+
+	filesystem := &Filesystem{traceReads: true}
+	base := time.Unix(100, 0)
+	filesystem.recordReadDiagnostic(base, "/movie.mkv", "1", 0, 192<<10, 192<<10, time.Second, "stream-manager", true)
+	filesystem.recordReadDiagnostic(base.Add(time.Second), "/movie.mkv", "1", 192<<10, 192<<10, 0, 0, "", false)
+	filesystem.recordReadDiagnostic(base.Add(readDiagnosticInterval+time.Nanosecond), "/movie.mkv", "1", 384<<10, 192<<10, 192<<10, time.Second, "stream-manager", true)
+
+	got := output.String()
+	if strings.Count(got, "fuse read summary") != 1 {
+		t.Fatalf("expected one aggregated read summary, got %q", got)
+	}
+	if !strings.Contains(got, "slow_reads=1") || !strings.Contains(got, "canceled_reads=1") {
+		t.Fatalf("summary did not include slow/canceled counts: %q", got)
+	}
+}
+
+func TestReadDiagnosticsAreDisabledWithTraceReadsOff(t *testing.T) {
+	var output strings.Builder
+	previousWriter := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(previousWriter)
+
+	filesystem := &Filesystem{}
+	filesystem.recordSlowRead("/movie.mkv", "1", 0, 192<<10, 192<<10, time.Second, "stream-manager")
+	filesystem.recordCanceledRead("/movie.mkv", "1", 192<<10, 192<<10)
+
+	if got := output.String(); got != "" {
+		t.Fatalf("diagnostic log was emitted with trace reads disabled: %q", got)
 	}
 }
 
@@ -263,7 +296,7 @@ func TestRefreshRootDoesNotMarkChildDirectoryContentsFresh(t *testing.T) {
 	if movie.ExpiresAt != 0 {
 		t.Fatalf("expected child directory contents to remain stale, got expires_at=%d", movie.ExpiresAt)
 	}
-	if !fs.shouldRefreshDir("/Videos/Movie", nil) {
+	if state, _ := fs.freshness("/Videos/Movie"); state != dirMissing {
 		t.Fatal("expected child directory to refresh on demand")
 	}
 }
@@ -454,6 +487,164 @@ func TestRefreshDirReplacesExistingChildren(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != "new.mkv" {
 		t.Fatalf("expected refreshed children to replace old ones, got %#v", got)
+	}
+}
+
+func TestRefreshRootClearsExistingChildrenWhenRemoteIsEmpty(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "1", Parent: "0", Path: "/old.mkv", Name: "old.mkv"}); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
+	if err := fs.refreshRoot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	children, err := dbStore.ListChildren("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 0 {
+		t.Fatalf("expected empty root after refresh, got %#v", children)
+	}
+	if fs.negative != nil && fs.negative.IsMissing("/") {
+		t.Fatal("existing empty root was marked missing")
+	}
+}
+
+func TestRefreshRootPreservesExistingChildrenWhenAuthenticationExpires(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "1", Parent: "0", Path: "/Videos", Name: "Videos", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "2", Parent: "1", Path: "/Videos/Movie", Name: "Movie", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	client := &listErrorClient{err: fmt.Errorf("%w: refresh token expired", baidu.ErrAuthExpired)}
+	fs := NewFilesystem(dbStore, remote.NewReader(client), nil, "/Videos")
+
+	if err := fs.refreshRoot(context.Background()); !errors.Is(err, baidu.ErrAuthExpired) {
+		t.Fatalf("expected authentication error, got %v", err)
+	}
+	children, err := dbStore.ListChildren("/Videos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || children[0].Name != "Movie" {
+		t.Fatalf("expected cached children to remain, got %#v", children)
+	}
+}
+
+func TestRefreshDirClearsExistingChildrenWhenRemoteIsEmpty(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "1", Parent: "0", Path: "/movies", Name: "movies", IsDir: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.UpsertEntry(store.Entry{FSID: "2", Parent: "1", Path: "/movies/old.mkv", Name: "old.mkv"}); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
+	if err := fs.refreshDir(context.Background(), "/movies", "1"); err != nil {
+		t.Fatal(err)
+	}
+	children, err := dbStore.ListChildren("/movies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 0 {
+		t.Fatalf("expected empty directory after refresh, got %#v", children)
+	}
+	if fs.negative != nil && fs.negative.IsMissing("/movies") {
+		t.Fatal("existing empty directory was marked missing")
+	}
+}
+
+func TestRootLookupReturnsEIOWithoutNegativeCacheOnRefreshFailure(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.ExpirePath("/"); err != nil {
+		t.Fatal(err)
+	}
+	client := &listErrorClient{err: errors.New("network unavailable")}
+	fs := NewFilesystem(dbStore, remote.NewReader(client), nil, "/")
+	if _, errno := fs.Lookup(context.Background(), "missing.mkv", nil); errno != syscall.EIO {
+		t.Fatalf("expected EIO, got %v", errno)
+	}
+	if fs.negative != nil && fs.negative.IsMissing("/missing.mkv") {
+		t.Fatal("refresh failure was cached as a missing path")
+	}
+}
+
+func TestEntryLookupReturnsEIOWithoutNegativeCacheOnRefreshFailure(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	entry := store.Entry{FSID: "1", Parent: "0", Path: "/movies", Name: "movies", IsDir: true}
+	if err := dbStore.UpsertEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	client := &listErrorClient{err: errors.New("network unavailable")}
+	fs := NewFilesystem(dbStore, remote.NewReader(client), nil, "/")
+	node := &entryNode{Filesystem: fs, entry: entry}
+	if _, errno := node.Lookup(context.Background(), "missing.mkv", nil); errno != syscall.EIO {
+		t.Fatalf("expected EIO, got %v", errno)
+	}
+	if fs.negative != nil && fs.negative.IsMissing("/movies/missing.mkv") {
+		t.Fatal("refresh failure was cached as a missing path")
+	}
+}
+
+func TestEntryLookupUsesNegativeCacheBeforeStore(t *testing.T) {
+	dbStore, err := store.Open(testDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbStore.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	entry := store.Entry{FSID: "1", Parent: "0", Path: "/movies", Name: "movies", IsDir: true, ExpiresAt: time.Now().Add(time.Minute).Unix()}
+	if err := dbStore.UpsertEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewFilesystem(dbStore, remote.NewReader(&baidu.StaticClient{}), nil, "/")
+	node := &entryNode{Filesystem: fs, entry: entry}
+	if _, errno := node.Lookup(context.Background(), "missing.mkv", nil); errno != syscall.ENOENT {
+		t.Fatalf("expected ENOENT, got %v", errno)
+	}
+	if !fs.negative.IsMissing("/movies/missing.mkv") {
+		t.Fatal("missing child was not cached")
+	}
+	if err := dbStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, errno := node.Lookup(context.Background(), "missing.mkv", nil); errno != syscall.ENOENT {
+		t.Fatalf("expected negative cache hit before closed store, got %v", errno)
 	}
 }
 
@@ -735,6 +926,9 @@ func TestRmdirDeletesRemoteDirectoryAndMetadataSubtree(t *testing.T) {
 	if got, err := dbStore.GetByPath("/Videos/Movie/test.mkv"); err != nil || got != nil {
 		t.Fatalf("expected child metadata removed, got %#v err=%v", got, err)
 	}
+	if !fs.negative.IsMissing("/Videos/Movie") {
+		t.Fatal("deleted directory was not cached as missing")
+	}
 }
 
 func testDB(t *testing.T) *sql.DB {
@@ -747,8 +941,88 @@ func testDB(t *testing.T) *sql.DB {
 }
 
 type countingReadClient struct {
+	mu      sync.Mutex
 	reads   int
+	offsets []int64
 	lengths []int64
+}
+
+type prefetchReadClient struct {
+	mu          sync.Mutex
+	reads       int
+	started     chan int64
+	blockOffset int64
+	canceled    chan struct{}
+	cancelOnce  sync.Once
+}
+
+func newPrefetchReadClient(blockOffset int64) *prefetchReadClient {
+	return &prefetchReadClient{
+		started:     make(chan int64, 16),
+		blockOffset: blockOffset,
+		canceled:    make(chan struct{}),
+	}
+}
+
+func (c *prefetchReadClient) List(string) ([]baidu.RemoteEntry, error) {
+	return nil, nil
+}
+
+func (c *prefetchReadClient) Stat(string) (baidu.RemoteEntry, error) {
+	return baidu.RemoteEntry{}, nil
+}
+
+func (c *prefetchReadClient) GetDownloadLink(string) (baidu.DownloadLink, error) {
+	return baidu.DownloadLink{}, nil
+}
+
+func (c *prefetchReadClient) Delete([]string) error {
+	return nil
+}
+
+func (c *prefetchReadClient) ReadRange(ctx context.Context, _ string, offset int64, dst []byte) (int, error) {
+	c.mu.Lock()
+	c.reads++
+	c.mu.Unlock()
+	select {
+	case c.started <- offset:
+	default:
+	}
+	if offset == c.blockOffset {
+		<-ctx.Done()
+		c.cancelOnce.Do(func() { close(c.canceled) })
+		return 0, ctx.Err()
+	}
+	for i := range dst {
+		dst[i] = 'x'
+	}
+	return len(dst), nil
+}
+
+func (c *prefetchReadClient) RefreshAuth() error {
+	return nil
+}
+
+func (c *prefetchReadClient) readCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads
+}
+
+func (c *prefetchReadClient) waitForOffset(t *testing.T, want int64) {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case got := <-c.started:
+			if got == want {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for backend offset %d", want)
+		}
+	}
 }
 
 func (c *countingReadClient) List(path string) ([]baidu.RemoteEntry, error) {
@@ -767,9 +1041,12 @@ func (c *countingReadClient) Delete(paths []string) error {
 	return nil
 }
 
-func (c *countingReadClient) ReadRange(_ context.Context, _ string, _ int64, dst []byte) (int, error) {
+func (c *countingReadClient) ReadRange(_ context.Context, _ string, offset int64, dst []byte) (int, error) {
+	c.mu.Lock()
 	c.reads++
+	c.offsets = append(c.offsets, offset)
 	c.lengths = append(c.lengths, int64(len(dst)))
+	c.mu.Unlock()
 	for i := range dst {
 		dst[i] = 'x'
 	}
@@ -783,6 +1060,21 @@ func (c *countingReadClient) RefreshAuth() error {
 type deleteRecordingClient struct {
 	deleted []string
 }
+
+type listErrorClient struct {
+	err error
+}
+
+func (c *listErrorClient) List(string) ([]baidu.RemoteEntry, error) { return nil, c.err }
+func (c *listErrorClient) Stat(string) (baidu.RemoteEntry, error)   { return baidu.RemoteEntry{}, c.err }
+func (c *listErrorClient) GetDownloadLink(string) (baidu.DownloadLink, error) {
+	return baidu.DownloadLink{}, c.err
+}
+func (c *listErrorClient) Delete([]string) error { return c.err }
+func (c *listErrorClient) ReadRange(context.Context, string, int64, []byte) (int, error) {
+	return 0, c.err
+}
+func (c *listErrorClient) RefreshAuth() error { return c.err }
 
 func (c *deleteRecordingClient) List(path string) ([]baidu.RemoteEntry, error) {
 	return nil, nil
